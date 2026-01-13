@@ -108,6 +108,13 @@ module PWN
           spinner.error('Decoding failed') if defined?(spinner)
           raise e
         ensure
+          # Toggle RDS off and on to reset the decoder
+          PWN::SDR::GQRX.cmd(
+            gqrx_sock: gqrx_sock,
+            cmd: 'U RDS 0',
+            resp_ok: 'RPRT 0'
+          )
+
           spinner.stop if defined?(spinner) && spinner
         end
 

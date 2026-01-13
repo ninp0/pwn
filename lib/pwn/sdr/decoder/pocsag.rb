@@ -63,7 +63,7 @@ module PWN
           last_resp = {}
 
           loop do
-            current_wav_size = File.size?(record_path) ||= 0
+            current_wav_size = File.size?(record_path) || 0
             pocsag_resp = {}
 
             # Only update when we have valid new data
@@ -73,7 +73,7 @@ module PWN
               new_bytes -= new_bytes % 8
               data = File.binread(record_path, new_bytes, bytes_read)
 
-              msg = "DECODED DATA"
+              msg = 'DECODED DATA'
 
               spinner.update(decoding: msg)
               last_resp = pocsag_resp.dup
@@ -95,12 +95,14 @@ module PWN
           spinner.error('Decoding failed') if defined?(spinner)
           raise e
         ensure
-          File.unlink(record_path) if File.exist?(record_path)
+          # Toggle POCSAG off and on to reset the decoder
           PWN::SDR::GQRX.cmd(
             gqrx_sock: gqrx_sock,
             cmd: 'U RECORD 0',
             resp_ok: 'RPRT 0'
           )
+
+          File.unlink(record_path)
 
           spinner.stop if defined?(spinner) && spinner
         end
