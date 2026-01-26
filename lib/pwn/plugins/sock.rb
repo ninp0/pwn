@@ -113,89 +113,151 @@ module PWN
 
       # Supported Method Parameters::
       # PWN::Plugins::Sock.check_port_in_use(
-      #   server_ip: 'optional - target host or ip to check (Defaults to 127.0.0.1)',
       #   port: 'required - target port',
+      #   server_ip: 'optional - target host or ip to check (Defaults to 127.0.0.1)',
       #   protocol: 'optional - :tcp || :udp (defaults to tcp)'
       # )
 
       public_class_method def self.check_port_in_use(opts = {})
-        server_ip = opts[:server_ip]
-        server_ip ||= '127.0.0.1'
-        port = opts[:port]
-        protocol = opts[:protocol]
-        protocol ||= :tcp
+        server_ip = opts[:server_ip] ||= '127.0.0.1'
+        port      = opts[:port]
+        protocol  = (opts[:protocol] ||= :tcp).to_s.downcase.to_sym
 
-        # TODO: Add proxy support
-
-        ct = 1
-        s = Socket.tcp(server_ip, port, connect_timeout: ct) if protocol == :tcp
-        s = Socket.udp(server_ip, port, connect_timeout: ct) if protocol == :udp
-        s.close
-
-        true
-      rescue Errno::ECONNREFUSED,
-             Errno::EHOSTUNREACH,
-             Errno::ETIMEDOUT
-        false
-      end
-
-      # Supported Method Parameters::
-      # PWN::Plugins::Sock.listen(
-      #   server_ip: 'required - target host or ip to listen',
-      #   port: 'required - target port',
-      #   protocol: 'optional - :tcp || :udp (defaults to tcp)',
-      #   tls: 'optional - boolean listen on TLS-enabled socket (defaults to false)'
-      # )
-
-      public_class_method def self.listen(opts = {})
-        server_ip = opts[:server_ip].to_s.scrub
-        port = opts[:port].to_i
-        opts[:protocol].nil? ? protocol = :tcp : protocol = opts[:protocol].to_s.downcase.to_sym
-        tls = true if opts[:tls]
-        tls ||= false
+        ct = 0.5 # connect timeout in seconds
 
         case protocol
         when :tcp
-          if tls
-            # Multi-threaded - Not working
-            sock = TCPServer.open(server_ip, port)
-            tls_context = OpenSSL::SSL::SSLContext.new
-            tls_context.set_params(verify_mode: OpenSSL::SSL::VERIFY_NONE)
-            listen_obj = OpenSSL::SSL::SSLServer.new(sock, tls_context)
-            # loop do
-            #   Thread.start(listen_obj.accept) do |client_thread|
-            #     while (client_input = client_thread.gets)
-            #       puts client_input
-            #     end
-            #     client_thread.close
-            #   end
-            # end
-          else
-            # Multi-threaded
-            listen_obj = TCPServer.open(server_ip, port)
-            loop do
-              Thread.start(listen_obj.accept) do |client_thread|
-                while (client_input = client_thread.gets)
-                  puts client_input
-                end
-                client_thread.close
-              end
-            end
-          end
+          # Use &:close intead of block
+          Socket.tcp(server_ip, port, connect_timeout: ct, &:close)
+          # Port is already in use (or no permission)
+          true
+
         when :udp
-          # Single Threaded
-          listen_obj = UDPSocket.new
-          listen_obj.bind(server_ip, port)
-          while (client_input = listen_obj.recvmsg)
-            puts client_input[0]
-          end
+          socket = UDPSocket.new
+          socket.bind(server_ip, port)
+          # Port is NOT in use (or at least we can use it)
+          false
         else
           raise "Unsupported protocol: #{protocol}"
         end
+      rescue Errno::EADDRINUSE, # address already in use
+             Errno::EACCES # permission denied
+
+        state = true if protocol == :udp
+        state = false if protocol == :tcp
+
+        state
+      rescue Errno::ECONNREFUSED, # connection refused (usually means port exists but no listener)
+             Errno::EHOSTUNREACH, # host unreachable
+             Errno::ETIMEDOUT # connection timed out
+
+        # Port is NOT in use (or at least we can use it)
+        false
+      rescue SocketError => e
+        # Usually means invalid address / interface
+        raise "Socket error while checking port #{port}: #{e.message}"
       rescue StandardError => e
-        raise e
+        warn "[!] Unexpected error while checking port: #{e.class} – #{e.message}"
+        false
       ensure
-        listen_obj = disconnect(sock_obj: listen_obj) unless listen_obj.nil?
+        socket.close if protocol == :udp && !socket.nil?
+      end
+
+      # Supported Method Parameters::
+      # listen_obj = PWN::Plugins::Sock.listen(
+      #   port: 'required - target port',
+      #   server_ip: 'optional - target host or ip to listen (Defaults to 127.0.0.1')',
+      #   protocol: 'optional - :tcp || :udp (defaults to tcp)',
+      #   tls: 'optional - boolean listen on TLS-enabled socket (defaults to false)',
+      #   detach: 'optional - boolean to detach listener to background (defaults to false)'
+      # )
+
+      public_class_method def self.listen(opts = {})
+        port = opts[:port]
+        raise 'ERROR: Missing required parameter: port' if port.nil?
+
+        server_ip = opts[:server_ip] ||= '127.0.0.1'
+        protocol = (opts[:protocol] ||= :tcp).to_s.downcase.to_sym
+        tls = opts[:tls] || false
+        detach = opts[:detach] || false
+
+        listen_obj = nil
+
+        case protocol
+        when :tcp
+          server = TCPServer.open(server_ip, port)
+
+          if tls
+            tls_context = OpenSSL::SSL::SSLContext.new
+            tls_context.set_params(verify_mode: OpenSSL::SSL::VERIFY_NONE)
+            # TODO: min_version, ciphers, etc.
+            listen_obj = OpenSSL::SSL::SSLServer.new(server, tls_context)
+          else
+            listen_obj = server
+          end
+
+          unless detach
+            # Default blocking mode - simple accept-and-handle loop
+            # puts "[*] Listening on #{server_ip}:#{port} (#{tls ? 'TLS' : 'plain'} TCP)..."
+
+            loop do
+              client = listen_obj.accept
+              Thread.new(client) do |c|
+                peer = c.peeraddr
+                puts "[+] Connection from #{peer}"
+
+                while (data = c.gets)
+                  puts "[#{peer}] #{data.strip}"
+                  # Optional: echo back
+                  # c.puts "ECHO: #{data}"
+                end
+              rescue Errno::ECONNRESET, Errno::EPIPE, IOError
+                # Client disconnected
+              ensure
+                client.close unless client.nil?
+              end
+            end
+          end
+
+        when :udp
+          listen_obj = UDPSocket.new
+          listen_obj.bind(server_ip, port)
+
+          # puts "[*] Listening on #{server_ip}:#{port} (UDP)..."
+
+          unless detach
+            # Simple single-threaded UDP receive loop
+            loop do
+              msg, addrinfo = listen_obj.recvmsg
+              next unless msg && !msg.empty?
+
+              peer = "#{addrinfo.ip_address}:#{addrinfo.ip_port}"
+              puts "[#{peer}] #{msg.inspect}"
+              # Optional: echo back
+              # listen_obj.send("ECHO: #{msg}", 0, addrinfo.ip_address, addrinfo.ip_port)
+            end
+          end
+
+        else
+          raise "Unsupported protocol: #{protocol}"
+        end
+
+        loop do
+          listening = check_port_in_use(
+            server_ip: server_ip,
+            port: port,
+            protocol: protocol
+          )
+          break if listening
+        end
+
+        listen_obj
+      rescue Interrupt
+        puts "\n[!] Caught interrupt, shutting down listener..."
+      rescue StandardError => e
+        raise
+      ensure
+        listen_obj.close unless listen_obj.nil? || detach
       end
 
       # Supported Method Parameters::
@@ -275,11 +337,12 @@ module PWN
             protocol: 'optional - :tcp || :udp (defaults to tcp)'
           )
 
-          #{self}.listen(
-            server_ip: 'required - target host or ip to listen',
+          listen_obj = #{self}.listen(
             port: 'required - target port',
+            server_ip: 'optional - target host or ip to listen (Defaults to 127.0.0.1')',
             protocol: 'optional - :tcp || :udp (defaults to tcp)',
-            tls: 'optional - boolean listen on TLS-enabled socket (defaults to false)'
+            tls: 'optional - boolean listen on TLS-enabled socket (defaults to false)',
+            detach: 'optional - boolean to detach listener to background (defaults to false)'
           )
 
           cert_obj = #{self}.get_tls_cert(

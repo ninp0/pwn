@@ -124,6 +124,7 @@ module PWN
               highlight_color
             end
 
+            default_http_ports = [80, 443]
             loop do
               # TODO: Implement repeater into the loop?  This reduces load to LLM but is slooow.
               # Repeater should analyze the reqesut/response pair and suggest
@@ -133,14 +134,19 @@ module PWN
                 sitemap = get_sitemap(burp_obj: burp_obj)
                 proxy_history = get_proxy_history(burp_obj: burp_obj)
                 proxy_history.each do |entry|
-                  next unless entry.key?(:comment) && entry[:comment].to_s.strip.empty?
-
                   request = entry[:request]
                   response = entry[:response]
-                  host = entry[:http_service][:host]
-                  port = entry[:http_service][:port]
-                  protocol = entry[:http_service][:protocol]
+                  http_service = entry[:http_service]
+                  protocol = http_service[:protocol]
+                  host = http_service[:host]
+                  port = http_service[:port]
                   next if request.nil? || response.nil? || host.nil? || port.nil? || protocol.nil?
+
+                  uri = "#{protocol}://#{host}"
+                  uri = "#{protocol}://#{host}:#{port}" unless default_http_ports.include?(port)
+                  next unless in_scope(burp_obj: burp_obj, uri: uri)
+
+                  next unless entry.key?(:comment) && entry[:comment].to_s.strip.empty?
 
                   # If sitemap comment and highlight color exists, use that instead of re-analyzing
                   sitemap_entry = nil
@@ -186,14 +192,19 @@ module PWN
                 proxy_history = get_proxy_history(burp_obj: burp_obj)
                 sitemap = get_sitemap(burp_obj: burp_obj)
                 sitemap.each do |entry|
-                  next unless entry.key?(:comment) && entry[:comment].to_s.strip.empty?
-
                   request = entry[:request]
                   response = entry[:response]
-                  host = entry[:http_service][:host]
-                  port = entry[:http_service][:port]
-                  protocol = entry[:http_service][:protocol]
+                  http_service = entry[:http_service]
+                  protocol = http_service[:protocol]
+                  host = http_service[:host]
+                  port = http_service[:port]
                   next if request.nil? || response.nil? || host.nil? || port.nil? || protocol.nil?
+
+                  uri = "#{protocol}://#{host}"
+                  uri = "#{protocol}://#{host}:#{port}" unless default_http_ports.include?(port)
+                  next unless in_scope(burp_obj: burp_obj, uri: uri)
+
+                  next unless entry.key?(:comment) && entry[:comment].to_s.strip.empty?
 
                   proxy_history_entry = nil
                   if proxy_history.any?
@@ -236,6 +247,9 @@ module PWN
               when :websocket_history
                 websocket_history = get_websocket_history(burp_obj: burp_obj)
                 websocket_history.each do |entry|
+                  uri = entry[:url]
+                  next unless in_scope(burp_obj: burp_obj, uri: uri)
+
                   next unless entry.key?(:comment) && entry[:comment].to_s.strip.empty?
 
                   web_socket_id = entry[:web_socket_id]

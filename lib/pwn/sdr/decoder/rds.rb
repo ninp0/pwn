@@ -9,7 +9,7 @@ module PWN
       # RDS Decoder Module for FM Radio Signals
       module RDS
         # Supported Method Parameters::
-        # rds_resp = PWN::SDR::GQRX.decode_rds(
+        # rds_resp = PWN::SDR::Decoder::RDS.decode(
         #   freq_obj: 'required - GQRX socket object returned from #connect method'
         # )
 
@@ -17,21 +17,21 @@ module PWN
           freq_obj = opts[:freq_obj]
           gqrx_sock = freq_obj[:gqrx_sock]
 
-          freq_obj = freq_obj.dup
+          # freq_obj = freq_obj.dup
           freq_obj.delete(:gqrx_sock)
-          skip_rds = "\n"
+          skip_freq_char = "\n"
           puts JSON.pretty_generate(freq_obj)
           puts "\n*** FM Radio RDS Decoder ***"
-          puts 'Press [ENTER] to continue...'
+          puts 'Press [ENTER] to continue to next frequency...'
 
           # Toggle RDS off and on to reset the decoder
-          PWN::SDR::GQRX.gqrx_cmd(
+          PWN::SDR::GQRX.cmd(
             gqrx_sock: gqrx_sock,
             cmd: 'U RDS 0',
             resp_ok: 'RPRT 0'
           )
 
-          PWN::SDR::GQRX.gqrx_cmd(
+          PWN::SDR::GQRX.cmd(
             gqrx_sock: gqrx_sock,
             cmd: 'U RDS 1',
             resp_ok: 'RPRT 0'
@@ -39,7 +39,7 @@ module PWN
 
           # Spinner setup with dynamic terminal width awareness
           spinner = TTY::Spinner.new(
-            '[:spinner] :decoding',
+            '[:spinner] :status',
             format: :arrow_pulse,
             clear: true,
             hide_cursor: true
@@ -58,9 +58,9 @@ module PWN
 
           loop do
             rds_resp = {
-              rds_pi: PWN::SDR::GQRX.gqrx_cmd(gqrx_sock: gqrx_sock, cmd: 'p RDS_PI').to_s.strip.chomp.delete('.'),
-              rds_ps_name: PWN::SDR::GQRX.gqrx_cmd(gqrx_sock: gqrx_sock, cmd: 'p RDS_PS_NAME').to_s.strip.chomp,
-              rds_radiotext: PWN::SDR::GQRX.gqrx_cmd(gqrx_sock: gqrx_sock, cmd: 'p RDS_RADIOTEXT').to_s.strip.chomp
+              rds_pi: PWN::SDR::GQRX.cmd(gqrx_sock: gqrx_sock, cmd: 'p RDS_PI').to_s.strip.chomp.delete('.'),
+              rds_ps_name: PWN::SDR::GQRX.cmd(gqrx_sock: gqrx_sock, cmd: 'p RDS_PS_NAME').to_s.strip.chomp,
+              rds_radiotext: PWN::SDR::GQRX.cmd(gqrx_sock: gqrx_sock, cmd: 'p RDS_RADIOTEXT').to_s.strip.chomp
             }
 
             # Only update when we have valid new data
@@ -81,14 +81,14 @@ module PWN
               prefix = "Program ID: #{rds_pi} | Station Name: #{rds_ps} | Radio Txt: "
 
               # minimum visibility
-              available_for_rt = max_title_length - prefix.length
-              available_for_rt = [available_for_rt, 10].max
+              available_for_term = max_title_length - prefix.length
+              available_for_term = [available_for_term, 10].max
 
               rt_display = rds_rt
-              rt_display = "#{rt_display[0...available_for_rt]}..." if rt_display.length > available_for_rt
+              rt_display = "#{rt_display[0...available_for_term]}..." if rt_display.length > available_for_term
 
-              msg = prefix + rt_display
-              spinner.update(decoding: msg)
+              msg = "#{prefix}#{rt_display}"
+              spinner.update(status: msg)
               last_resp = rds_resp.dup
             end
 
@@ -96,7 +96,7 @@ module PWN
             if $stdin.wait_readable(0)
               begin
                 char = $stdin.read_nonblock(1)
-                break if char == skip_rds
+                break if char == skip_freq_char
               rescue IO::WaitReadable, EOFError
                 # No-op
               end
@@ -108,6 +108,13 @@ module PWN
           spinner.error('Decoding failed') if defined?(spinner)
           raise e
         ensure
+          # Toggle RDS off and on to reset the decoder
+          PWN::SDR::GQRX.cmd(
+            gqrx_sock: gqrx_sock,
+            cmd: 'U RDS 0',
+            resp_ok: 'RPRT 0'
+          )
+
           spinner.stop if defined?(spinner) && spinner
         end
 
@@ -124,7 +131,7 @@ module PWN
         public_class_method def self.help
           puts "USAGE:
             #{self}.decode(
-              freq_obj: 'required - freq_obj returned from PWN::SDR::Receiver::GQRX.init_freq method'
+              freq_obj: 'required - freq_obj returned from PWN::SDR::GQRX.init_freq method'
             )
 
             #{self}.authors
