@@ -60,6 +60,50 @@ module PWN
         raise e
       end
 
+      # Supported Method Parameters:
+      # PWN::Plugins::FileFu.shift_file_up(
+      #   path:       'required - path to file to shift up',
+      #   bytes:      'required - number of bytes to shift up (remove from beginning)',
+      #   buffer_size: 'optional - buffer size to use when shifting (default: 256KB)'
+      # )
+
+      public_class_method def self.shift_file_up(opts = {})
+        path = opts[:path].to_s.scrub
+        raise "PWN Error: File #{path} does not exist" unless File.exist?(path)
+
+        bytes = opts[:bytes].to_i
+        raise 'PWN Error: bytes must be greater than or equal to 0' unless bytes >= 0
+
+        # Default buffer size = 256 KiB — good general-purpose value
+        buffer_size = (opts[:buffer_size] || (256 * 1024)).to_i
+        raise 'PWN Error: buffer_size must be greater than 0' unless buffer_size.positive?
+
+        # 'r+b' = read/write + binary mode
+        File.open(path, 'r+b') do |f|
+          size = f.stat.size
+          break if bytes >= size
+
+          read_pos  = bytes
+          write_pos = 0
+          buffer    = String.new(capacity: buffer_size)
+
+          while read_pos < size
+            f.seek(read_pos)
+            chunk = f.read(buffer_size, buffer) or break
+
+            bytes_read = chunk.bytesize
+
+            f.seek(write_pos)
+            f.write(buffer.byteslice(0, bytes_read))
+
+            read_pos  += bytes_read
+            write_pos += bytes_read
+          end
+
+          f.truncate(size - bytes)
+        end
+      end
+
       # Author(s):: 0day Inc. <support@0dayinc.com>
 
       public_class_method def self.authors
@@ -83,6 +127,12 @@ module PWN
           #{self}.untar_gz_file(
             tar_gz_file: 'required - path to .tar.gz file',
             destination: 'required - destination folder to save extracted contents'
+          )
+
+          #{self}.shift_file_up(
+            path: 'required - path to file to shift up',
+            bytes: 'required - number of bytes to shift up',
+            buffer_size: 'optional - buffer size to use when shifting file up (default: 256 * 1024 / i.e 256KB)'
           )
 
           #{self}.authors

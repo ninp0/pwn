@@ -17,12 +17,12 @@ module PWN
           freq_obj = opts[:freq_obj]
           gqrx_sock = freq_obj[:gqrx_sock]
 
-          freq_obj = freq_obj.dup
+          # freq_obj = freq_obj.dup
           freq_obj.delete(:gqrx_sock)
           skip_freq_char = "\n"
           puts JSON.pretty_generate(freq_obj)
           puts "\n*** FM Radio RDS Decoder ***"
-          puts 'Press [ENTER] to continue...'
+          puts 'Press [ENTER] to continue to next frequency...'
 
           # Toggle RDS off and on to reset the decoder
           PWN::SDR::GQRX.cmd(
@@ -39,7 +39,7 @@ module PWN
 
           # Spinner setup with dynamic terminal width awareness
           spinner = TTY::Spinner.new(
-            '[:spinner] :decoding',
+            '[:spinner] :status',
             format: :arrow_pulse,
             clear: true,
             hide_cursor: true
@@ -88,7 +88,7 @@ module PWN
               rt_display = "#{rt_display[0...available_for_term]}..." if rt_display.length > available_for_term
 
               msg = "#{prefix}#{rt_display}"
-              spinner.update(decoding: msg)
+              spinner.update(status: msg)
               last_resp = rds_resp.dup
             end
 

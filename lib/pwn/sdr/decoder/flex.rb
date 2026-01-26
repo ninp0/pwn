@@ -8,10 +8,10 @@ require 'io/wait'
 module PWN
   module SDR
     module Decoder
-      # POCSAG Decoder Module for Pagers
-      module POCSAG
+      # Flex Decoder Module for Pagers
+      module Flex
         # Supported Method Parameters::
-        # pocsag_resp = PWN::SDR::Decoder::POCSAG.decode(
+        # pocsag_resp = PWN::SDR::Decoder::Flex.decode(
         #   freq_obj: 'required - GQRX socket object returned from #connect method'
         # )
 
@@ -57,9 +57,8 @@ module PWN
             sox -t raw -e signed-integer -b 16 -r 48000 -c 1 - \
                 -t raw -e signed-integer -b 16 -r 22050 -c 1 - | \
             multimon-ng -t raw \
-              -a POCSAG512 \
-              -a POCSAG1200 \
-              -a POCSAG2400 \
+              -a FLEX \
+              -a FLEX_NEXT \
               -
           '
 
@@ -96,18 +95,18 @@ module PWN
 
                 while (line = buffer.slice!(/^.*\n/))
                   line = line.chomp
-                  next if line.empty? || !line.start_with?('POCSAG')
+                  next if line.empty? || !line.start_with?('FLEX')
 
                   decoded_at = Time.now.strftime('%Y-%m-%d %H:%M:%S%z')
                   dec_msg = { decoded_at: decoded_at }
                   dec_msg[:raw_inspected] = line.inspect
 
                   protocol = line[0..8]
-                  protocol = line[0..9] unless protocol == 'POCSAG512'
+                  protocol = 'FLEX' unless protocol == 'FLEX_NEXT'
                   dec_msg[:protocol] = protocol
 
                   # ────────────────────────────── Detect format ──────────────────────────────
-                  # Sometimes POCSAG is space delimited, sometimes pipe delimited
+                  # Sometimes Flex is space delimited, sometimes pipe delimited
                   # FLEX_NEXT appears to always be pipe delimited
 
                   delimiter = '|'

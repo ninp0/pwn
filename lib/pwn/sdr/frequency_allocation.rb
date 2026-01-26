@@ -417,7 +417,7 @@ module PWN
             bandwidth: '16.000',
             precision: 4
           },
-          pager: {
+          pager_all: {
             ranges: [
               # Low-power / unlicensed / CB-related (very limited POCSAG usage)
               # RCRS channels (shared data/telemetry, occasional POCSAG)
@@ -449,6 +449,35 @@ module PWN
             ],
             demodulator_mode: :FM,
             bandwidth: '25.000',
+            precision: 4
+          },
+          pager_flex: {
+            ranges: [
+              # 900 MHz exclusive paging band (mostly FLEX, but some legacy POCSAG remains)
+              # Primary nationwide commercial paging band
+              { start_freq: '929.000.000', target_freq: '932.000.000' }
+            ],
+            demodulator_mode: :FM,
+            bandwidth: '20.000',
+            precision: 4,
+            decoder: :flex
+          },
+          pager_pocsag: {
+            ranges: [
+              # High-band VHF paging — most common for public-safety POCSAG today
+              # Classic VHF paging band (152/157/158 MHz very common)
+              { start_freq: '152.000.000', target_freq: '159.000.000' },
+
+              # UHF paging bands (hospital, on-site, restaurant/coaster pagers, some public safety)
+              # UHF low — occasional private systems
+              { start_freq: '400.000.000',  target_freq: '430.000.000' },
+              # UHF high — very common for local POCSAG (incl. 450–470 & 467.xxx for on-site)
+              { start_freq: '440.000.000',  target_freq: '470.000.000' },
+              # Classic UHF paging allocation (454/459 MHz pairs — many reallocated)
+              { start_freq: '454.000.000',  target_freq: '460.000.000' }
+            ],
+            demodulator_mode: :FM,
+            bandwidth: '12.500',
             precision: 4,
             decoder: :pocsag
           },

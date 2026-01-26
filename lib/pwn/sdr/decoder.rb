@@ -7,6 +7,7 @@ module PWN
   module SDR
     # Deocder Module for SDR signals.
     module Decoder
+      autoload :Flex, 'pwn/sdr/decoder/flex'
       autoload :GSM, 'pwn/sdr/decoder/gsm'
       autoload :POCSAG, 'pwn/sdr/decoder/pocsag'
       autoload :RDS, 'pwn/sdr/decoder/rds'
