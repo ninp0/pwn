@@ -30,7 +30,8 @@ fi
 curl -sSL https://rvm.io/mpapis.asc | sudo gpg2 --import -
 curl -sSL https://rvm.io/pkuczynski.asc | sudo gpg2 --import -
 export rvmsudo_secure_path=1
-rvmsudo rvm get stable
+# Keep this command to pull master to avoid unknown ruby interpreter error when using latest version of Ruby.
+rvmsudo rvm get master
 rvm reload
 
 # Install New Version of RubyGems & Ruby
