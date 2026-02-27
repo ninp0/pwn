@@ -2,7 +2,7 @@
 
 require 'bundler/gem_tasks'
 require 'rspec/core/rake_task'
-require 'rdoc/task'
+require 'rdoc'
 require 'rubocop/rake_task'
 
 RSpec::Core::RakeTask.new(:spec)
