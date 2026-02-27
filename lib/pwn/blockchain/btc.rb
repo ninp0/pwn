@@ -182,11 +182,8 @@ module PWN
 
       public_class_method def self.get_latest_block
         latest_block = btc_rpc_call(method: 'getblockchaininfo', params: [])
-        system_role_content = 'Provide a useful summary of this latest bitcoin block returned from a bitcoin node via getblockchaininfo.'
-        ai_analysis = PWN::AI::Introspection.reflect_on(
-          request: latest_block.to_s,
-          system_role_content: system_role_content,
-          suppress_pii_warning: true
+        ai_analysis = PWN::AI::Agent::BTC.analyze(
+          request: latest_block.to_s
         )
         puts ai_analysis
 

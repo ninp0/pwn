@@ -5,6 +5,7 @@ module PWN
   # into memory only when they're needed. For more information, see:
   # http://www.rubyinside.com/ruby-techniques-revealed-autoload-1652.html
   module AI
+    autoload :Agent, 'pwn/ai/agent'
     autoload :Grok, 'pwn/ai/grok'
     autoload :Introspection, 'pwn/ai/introspection'
     autoload :Ollama, 'pwn/ai/ollama'

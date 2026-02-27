@@ -957,11 +957,9 @@ module PWN
                   prev_freq_obj[:strength_db] = best_strength_db.round(1)
                   prev_freq_obj[:iteration] = iteration_total
 
-                  system_role_content = "Analyze signal data captured by a software-defined-radio using GQRX at the following location: #{location}. Respond with just FCC information about the transmission if available.  If the frequency is unlicensed or not found in FCC records, state that clearly.  Be clear and concise in your analysis."
-                  ai_analysis = PWN::AI::Introspection.reflect_on(
+                  ai_analysis = PWN::AI::Agent::GQRX.analyze(
                     request: prev_freq_obj.to_json,
-                    system_role_content: system_role_content,
-                    suppress_pii_warning: true
+                    location: location
                   )
 
                   prev_freq_obj[:ai_analysis] = ai_analysis unless ai_analysis.nil?
