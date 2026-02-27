@@ -8,7 +8,13 @@ module PWN
     # Collection of Agentic AI Modules. These modules are designed to perform specific tasks autonomously, such as interacting with APIs, performing reconnaissance, or automating exploitation steps. Each module is designed to be used within an agentic AI framework, allowing for the creation of intelligent agents that can perform complex tasks without human intervention. The Agent module serves as a namespace for all agentic AI modules, providing a structured way to organize and access these functionalities. By using autoload, we ensure that each module is only loaded into memory when it's actually needed, optimizing resource usage and improving performance.
     module Agent
       # Agentic AI Modules
+      autoload :Assembly, 'pwn/ai/agent/assembly'
+      autoload :BTC, 'pwn/ai/agent/btc'
       autoload :BurpSuite, 'pwn/ai/agent/burp_suite'
+      autoload :HackerOne, 'pwn/ai/agent/hacker_one'
+      autoload :GQRX, 'pwn/ai/agent/gqrx'
+      autoload :SAST, 'pwn/ai/agent/sast'
+      autoload :TransparentBrowser, 'pwn/ai/agent/transparent_browser'
 
       # Display a List of Every PWN::AI Module
 

@@ -2,19 +2,19 @@
 
 require 'spec_helper'
 
-describe PWN::AI::Agent::BurpSuite do
+describe PWN::AI::Agent::TransparentBrowser do
   it 'scan method should exist' do
-    scan_response = PWN::AI::Agent::BurpSuite
+    scan_response = PWN::AI::Agent::TransparentBrowser
     expect(scan_response).to respond_to :scan
   end
 
   it 'should display information for authors' do
-    authors_response = PWN::AI::Agent::BurpSuite
+    authors_response = PWN::AI::Agent::TransparentBrowser
     expect(authors_response).to respond_to :authors
   end
 
   it 'should display information for existing help method' do
-    help_response = PWN::AI::Agent::BurpSuite
+    help_response = PWN::AI::Agent::TransparentBrowser
     expect(help_response).to respond_to :help
   end
 end

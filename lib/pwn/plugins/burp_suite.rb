@@ -53,7 +53,7 @@ module PWN
         #  spin up Thread to:
         #  1. Periodically call get_proxy_history(burp_obj: burp_obj) method
         #  2. For each entry w/ empty comment,
-        #     generate AI analysis via PWN::AI::Introspection.reflect_on
+        #     generate AI analysis via PWN::AI::Agent::BurpSuite.analyze(...)
         #     and populate the comment field for the entry.
         #  3. Update the highlight field based on EPSS score extracted from AI analysis.
         #  4. Call update_proxy_history(burp_obj: burp_obj, entry: updated_entry)

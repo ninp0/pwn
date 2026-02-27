@@ -6,7 +6,7 @@ require 'tempfile'
 
 module PWN
   module Plugins
-    # This plugin converts images to readable text
+    # This plugin provides methods for converting between hex escaped opcodes and assembly instructions using the Metasm library.
     module Assembly
       # Supported Method Parameters::
       # PWN::Plugins::Assembly.opcodes_to_asm(
@@ -25,11 +25,11 @@ module PWN
 
         raise 'ERROR: opcodes parameter is required.' if opcodes.nil?
 
-        system_role_content = "Analyze the #{endian} endian #{arch} assembly opcodes below and provide a concise summary of their functionality.  If possible, also convert the assembly to c/c++ code."
-        ai_analysis = PWN::AI::Introspection.reflect_on(
+        ai_analysis = PWN::AI::Agent.analyze(
           request: opcodes,
-          system_role_content: system_role_content,
-          suppress_pii_warning: true
+          type: :opcodes_to_asm,
+          arch: arch,
+          endian: endian
         )
 
         case arch.to_s.downcase
@@ -138,11 +138,11 @@ module PWN
 
         raise 'ERROR: asm parameter is required.' if asm.nil?
 
-        system_role_content = "Analyze the #{endian} endian #{arch} assembly instructions below and provide a concise summary of their functionality."
-        ai_analysis = PWN::AI::Introspection.reflect_on(
+        ai_analysis = PWN::AI::Agent.analyze(
           request: asm,
-          system_role_content: system_role_content,
-          suppress_pii_warning: true
+          type: :asm_to_opcodes,
+          arch: arch,
+          endian: endian
         )
 
         case arch.to_s.downcase

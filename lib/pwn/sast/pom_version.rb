@@ -83,11 +83,8 @@ module PWN
                     source_code_snippet: contents
                   }.to_json
 
-                  system_role_content = 'Your sole purpose is to analyze source code snippets and generate an Exploit Prediction Scoring System (EPSS) score between 0% - 100%.  Just generate a score unless score is >= 75% in which a PoC and code fix should also be included.'
-                  ai_analysis = PWN::AI::Introspection.reflect_on(
-                    system_role_content: system_role_content,
-                    request: request,
-                    suppress_pii_warning: true
+                  ai_analysis = PWN::AI::Agent::SAST.analyze(
+                    request: request
                   )
                   ai_analysis ||= 'N/A'
 
