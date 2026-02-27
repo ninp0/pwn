@@ -4,10 +4,10 @@ module PWN
   module AI
     module Agent
       # This module is an AI agent designed to analyze signal data captured by a software-defined-radio using GQRX. It uses the PWN::AI::Introspection.reflect_on method to analyze the signal data and provide insights based on the location where the data was captured. The agent can determine if the frequency is licensed or unlicensed based on FCC records and provide relevant information about the transmission. This module is useful for security professionals, researchers, and hobbyists interested in analyzing radio signals and understanding their context.
-      module SAST
+      module GQRX
         # Supported Method Parameters::
         # ai_analysis = PWN::AI::Agent::GQRX.analyze(
-        #   request: 'required - A string containing the source code snippet to be analyzed for SAST antipatterns and vulnerabilities.'
+        #   request: 'required - A string containing the signal data captured by GQRX that you want to analyze. This data should be in a format that can be interpreted by the AI for analysis, such as raw signal data, frequency information, or any relevant metadata associated with the capture.',
         #   location: 'required - A string containing a city, state, country, or GPS coordinates where the signal data was captured. This information will be used to provide context for the analysis and to determine if the frequency is licensed or unlicensed based on FCC records.'
         # )
 

@@ -25,7 +25,7 @@ module PWN
 
         raise 'ERROR: opcodes parameter is required.' if opcodes.nil?
 
-        ai_analysis = PWN::AI::Agent.analyze(
+        ai_analysis = PWN::AI::Agent::Assembly.analyze(
           request: opcodes,
           type: :opcodes_to_asm,
           arch: arch,
