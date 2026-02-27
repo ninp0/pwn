@@ -138,7 +138,7 @@ module PWN
 
         raise 'ERROR: asm parameter is required.' if asm.nil?
 
-        ai_analysis = PWN::AI::Agent.analyze(
+        ai_analysis = PWN::AI::Agent::Assembly.analyze(
           request: asm,
           type: :asm_to_opcodes,
           arch: arch,
