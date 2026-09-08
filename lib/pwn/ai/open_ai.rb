@@ -2,6 +2,7 @@
 
 require 'json'
 require 'base64'
+require 'rest-client'
 require 'securerandom'
 require 'digest'
 require 'uri'
@@ -821,7 +822,9 @@ module PWN
 
           raise 'OpenAI response.completed missing response' if response.empty?
 
-          response[:output] ||= output.sort_by { |index, _| index.to_i }.map(&:last)
+          # Empty arrays are truthy in Ruby; metadata-only completion frames
+          # must not discard the complete native items already received.
+          response[:output] = output.sort_by { |index, _| index.to_i }.map(&:last) if response[:output].nil? || response[:output] == []
           return response
         end
         raise 'OpenAI response stream closed before response.completed'
@@ -848,6 +851,7 @@ module PWN
         raw = {} unless raw.is_a?(Hash)
         output = Array(raw[:output] || raw['output'])
         text = (raw[:output_text] || raw['output_text']).to_s
+        text = '' if text.strip.empty?
         text_parts = []
         tool_calls = []
         output.each do |item|
@@ -867,12 +871,21 @@ module PWN
             Array(item[:content] || item['content']).each do |part|
               next unless part.is_a?(Hash)
 
-              t = part[:text] || part['text']
-              text_parts << t.to_s if (part[:type] || part['type']).to_s.include?('text') && !t.to_s.empty?
+              part_type = (part[:type] || part['type']).to_s
+              t = part_type == 'refusal' ? (part[:refusal] || part['refusal']) : (part[:text] || part['text'])
+              text_parts << t.to_s if (part_type.include?('text') || part_type == 'refusal') && !t.to_s.empty?
             end
           end
         end
         text = text_parts.join if text.empty?
+        if text.strip.empty? && tool_calls.empty?
+          # Counts only: IDs, unknown type names, text and encrypted reasoning
+          # can contain private provider/user data and must not reach logs.
+          types = output.grep(Hash).map { |item| (item[:type] || item['type']).to_s }
+          raise 'OpenAI Responses protocol error: no usable assistant text or function calls; ' \
+                "output_items=#{output.length} messages=#{types.count('message')} reasoning=#{types.count('reasoning')} " \
+                "function_calls=#{tool_calls.length}. Check provider response compatibility before submitting again."
+        end
         msg = {
           role: 'assistant',
           content: text.empty? ? nil : text,

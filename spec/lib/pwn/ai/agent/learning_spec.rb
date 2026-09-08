@@ -409,6 +409,25 @@ describe 'PWN::AI::Agent::Learning outcome decisions' do
     expect(learning.outcomes(success: false)).to be_empty
   end
 
+  it 'forwards independently checked action attribution when introspection closes the policy' do
+    @agent_cfg[:auto_introspect] = true
+    learning = PWN::AI::Agent::Learning
+    reward = PWN::AI::Agent::Reward
+    session = PWN::Sessions.create(title: 'attributed evaluation')[:id]
+    allow(PWN::AI::Agent::Curriculum).to receive(:critic).and_return(verdict: :pass)
+    allow(learning).to receive(:should_gc_stores?).and_return(false)
+    allow(learning).to receive(:reflect)
+    allow(reward).to receive(:prm)
+    receipt = { source: 'independent_verifier', verified_action_ids: ['writer'] }
+    allow(reward).to receive(:judge).and_return(
+      score: 0.9, source: :llm_orm,
+      verification: { runner_version: 1, requirements: ['write a report'],
+                      checks: [{ criterion: 'write a report', passed: true, evidence: 'fixture-digest' }], attribution: receipt }
+    )
+    expect(PWN::AI::Agent::Policy).to receive(:finish).with(hash_including(attribution: receipt))
+    learning.auto_introspect(session_id: session, request: 'write a report', final: 'Report ready.', inline: true)
+  end
+
   it 'preserves a cautious judge decision through persistence and policy training' do
     @agent_cfg[:auto_introspect] = true
     learning = PWN::AI::Agent::Learning

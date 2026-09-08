@@ -47,10 +47,10 @@ This is the live numeric controller. It does not replace planning.
 
 | Piece | What it is |
 |---|---|
-| State | request kind, task family, plan quality, answer completeness, usable-result, last action, fail bin, and engine |
+| State | request kind, task family, plan quality, answer completeness, usable-result, last action, fail bin, engine, and sanitized host-observed capability/verification scope |
 | Action | tool name, or `final` |
 | Step reward | 0; −0.01 per tool after 8 |
-| Terminal reward | `Reward.judge` × confidence (sole large R). `plan_coverage` is a tag, not the score. |
+| Terminal reward | Resolved training score mapped to −1..1 × confidence (sole large R), attributed only to independently linked actions. `plan_coverage` is a tag, not the score. |
 | Updates | Q-learning (`alpha=0.15`, `gamma=0.85`) and REINFORCE (`alpha=0.05`). Stored trajectories replay twice on warmup so a short table is not empty advice. |
 | Budget | Eight finished episodes (live or warmup-credited) unlock greedy suggestions. Until then the prompt omits them. |
 | Steer | Q-advantage in `Registry.rank` once the episode budget is met; keyword fit and CORE_TOOLS still come first. Suggested actions follow `Registry.preference_order` (`ai.agent.tool_preference`). |
@@ -80,6 +80,58 @@ providing actual boolean check results and evidence. Records are bound to the
 current session request and invalidated by subsequent tool execution. The API
 trusts the host verifier to cover the complete request; it cannot infer missing
 criteria or automatically verify arbitrary tasks. LLM judgments remain fallible.
+
+### Executed acceptance checks and artifact attribution
+
+For stronger verification, pass a host-owned `verification_contract` to
+`Loop.run`, or use `Reward.run_verification(request:, session_id:, contract:)`.
+The contract contains `root`, `requirements` (distinct verbatim clauses of the
+original request), and `checks`. Each check names its `requirement` and kind:
+
+- `file`: an in-root regular `path` whose bytes equal `expected`.
+- `json`: an in-root regular `path` whose parsed JSON equals `expected`.
+- `command`: a literal `argv`, expected `exit_code` (default zero), and optional
+  expected stdout. Requires `allow_commands: true`.
+- `http`: an exact `url` listed in `allowed_urls`, expected response bytes, and
+  expected `status` (default 200). GET only, with no redirects.
+
+Check failures are negative evidence. Missing requirements, unavailable checks,
+and timeouts stay unknown even if the LLM judge awards a high score. Later tool
+execution invalidates a runner report without falling back to presumed success.
+The runner records output digests, not raw command output or expected values.
+Artifact reads use no-follow descriptors, validate their actual location through
+Linux `/proc/self/fd`, and enforce the byte limit while reading. If descriptor
+location validation is unavailable, the check stays unknown rather than using
+an unsafe pathname fallback.
+The caller must supply the complete acceptance checklist: matching clauses to
+the original text is not semantic proof that the checklist covers every intent.
+
+Commands have a cleared environment, private HOME set to the selected root,
+bounded output and timeout, and process-group cleanup. This is **not an OS
+sandbox**: opt-in commands retain the process's filesystem/network permissions.
+Only run trusted checks, using an external sandbox for untrusted programs.
+
+At the final boundary, Loop executes the contract and publishes a verification
+event through `on_tool`. Around dispatched actions it snapshots declared
+artifact digests. Matching the final checked digest to its last observed writer
+produces an `independent_verifier` attribution receipt. This establishes artifact
+provenance, not universal causal proof. Controlled comparisons in isolated
+evaluation can supply a separate `controlled_comparison` receipt.
+
+Policy distributes the existing terminal reward across uniquely linked action
+IDs. Unlinked actions receive no positive training credit; an accounting-only
+final row retains unattributed terminal reward. Adding successful no-op commands
+does not create more reward. Known per-step cost remains; unknown task outcomes
+still do not train. Ordinary model-judged runs without attribution may retain
+outcome/lesson records, but do not positively reinforce guessed tool contributions.
+
+`Loop.run(trusted_context:)` accepts host observations, not model arguments.
+Policy stores only fixed environment/capability/failure/verification categories;
+state backoff stays within that observed scope. Registry checks declared tool
+prerequisites before ranking, including core tools, so a known absent prerequisite
+cannot be outweighed by a historical success score. Unknown availability is not
+treated as absence. Default local scope observes the Ruby runtime and `/bin/sh`;
+callers must supply observations for remote/container-specific capabilities.
 
 Policy observations also capture allowlisted operation, argument-role/type
 features, and result classification, without retaining raw argument values.

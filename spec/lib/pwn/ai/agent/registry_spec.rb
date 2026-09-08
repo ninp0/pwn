@@ -47,6 +47,14 @@ describe PWN::AI::Agent::Registry do
     expect(names.length).to eq(described_class::CORE_TOOLS.length)
   end
 
+  it 'applies observed shell and Ruby prerequisites to the existing core tools' do
+    described_class.discover
+    context = { environment: :local, capabilities: { shell: false, ruby: false } }
+    names = described_class.definitions(core_only: true, trusted_context: context).map { |tool| tool.dig(:function, :name) }
+    expect(names).not_to include('shell', 'pwn_eval')
+    expect(names).to include('memory_recall')
+  end
+
   describe 'contextual policy routing' do
     let(:policy) { PWN::AI::Agent::Policy }
     let(:entries) do
@@ -73,10 +81,63 @@ describe PWN::AI::Agent::Registry do
       allow(PWN::AI::Agent::Metrics).to receive_messages(advantage: 0.0, ucb: 0.0, prm_advantage: 0.0, prm_n: 0, proxy_trust: 1.0)
     end
 
+    it 'excludes observed missing prerequisites from rank and definitions despite learned history or core pinning' do
+      original = described_class.instance_variable_get(:@entries)
+      described_class.instance_variable_set(:@entries, {})
+      allow(described_class).to receive(:eager_load!)
+      described_class.register(name: 'shell', toolset: 'test', schema: { name: 'shell', description: 'inspect' }, handler: ->(_) {}, prerequisites: [:shell])
+      described_class.register(name: 'beta', toolset: 'test', schema: { name: 'beta', description: 'inspect' }, handler: ->(_) {}, prerequisites: [:network])
+      context = { environment: :local, capabilities: { shell: false }, missing_prerequisites: [:network] }
+      allow(PWN::AI::Agent::Metrics).to receive_messages(advantage: 100.0, ucb: 100.0)
+
+      expect(described_class.rank(query: 'inspect', trusted_context: context)).to eq([])
+      expect(described_class.rank(query: '', trusted_context: context)).to eq([])
+      expect(described_class.definitions(core_only: true, trusted_context: context)).to eq([])
+      expect(described_class.definitions(relevance: 'inspect', trusted_context: context)).to eq([])
+      policy.begin_episode(request: 'inspect', trusted_context: context)
+      expect(described_class.rank(query: 'inspect')).to eq([])
+      expect(policy.recommend(actions: %w[shell beta], epsilon: 1.0)[:action]).to be_nil
+    ensure
+      described_class.instance_variable_set(:@entries, original)
+    end
+
+    it 'preserves live decision state when trusted observations accompany a schema refresh' do
+      context = { environment: :local, verification_state: :failed, failure_category: :timeout }
+      policy.begin_episode(request: 'inspect', engine: :grok, kind: :question, trusted_context: context)
+      state = policy.current_state
+      5.times { policy.update_q!(transition: { state: state, action: 'beta', reward: 1.0, terminal: true }) }
+      expect(described_class.rank(query: 'inspect', entries: entries, preference: [], trusted_context: context).map(&:name)).to eq(%w[beta alpha])
+    end
+
+    it 'ignores environment-blind success metrics when trusted observations scope policy history' do
+      context = { environment: :local }
+      state = policy.state(request: 'inspect', trusted_context: context)
+      5.times { policy.update_q!(transition: { state: state, action: 'alpha', reward: 1.0, terminal: true }) }
+      allow(PWN::AI::Agent::Metrics).to receive(:advantage).with(name: 'beta').and_return(100.0)
+      expect(described_class.rank(query: 'inspect', entries: entries, preference: [], trusted_context: context).map(&:name)).to eq(%w[alpha beta])
+    end
+
+    it 'does not transfer tool success across incompatible observed environments' do
+      local = { environment: :local, capabilities: { shell: true } }
+      remote = { environment: :remote, capabilities: { shell: true } }
+      local_state = policy.state(request: 'inspect', trusted_context: local)
+      remote_state = policy.state(request: 'inspect', trusted_context: remote)
+      5.times do
+        policy.update_q!(transition: { state: local_state, action: 'beta', reward: 1.0, terminal: true })
+        policy.update_q!(transition: { state: remote_state, action: 'alpha', reward: 1.0, terminal: true })
+      end
+
+      expect(described_class.rank(query: 'inspect', entries: entries, preference: [], trusted_context: local).map(&:name)).to eq(%w[beta alpha])
+      expect(described_class.rank(query: 'inspect', entries: entries, preference: [], trusted_context: remote).map(&:name)).to eq(%w[alpha beta])
+    end
+
     {
       operations: [{ operation: 'read' }, { operation: 'search' }],
       argument_features: [{ args: { path: '/not-stored' } }, { args: { query: 'not-stored' } }],
-      result_types: [{ result_type: :enoent, ok: false }, { result_type: :timeout, ok: false }]
+      result_types: [{ result_type: :enoent, ok: false }, { result_type: :timeout, ok: false }],
+      observed_failures: [{ trusted_context: { failure_category: :timeout } }, { trusted_context: { failure_category: :auth_required } }],
+      observed_verification: [{ trusted_context: { verification_state: :passed } }, { trusted_context: { verification_state: :failed } }],
+      observed_capabilities: [{ trusted_context: { capabilities: { network: true } } }, { trusted_context: { capabilities: { network: false } } }]
     }.each do |feature, contexts|
       it "learns opposite next-tool rankings from sanitized previous #{feature}" do
         3.times do
@@ -84,9 +145,9 @@ describe PWN::AI::Agent::Registry do
             %w[alpha beta].each do |action|
               policy.begin_episode(request: 'inspect')
               policy.observe_step({ action: 'file', operation: 'read', ok: true }.merge(context))
-              policy.observe_step(action: action, ok: true)
+              step = policy.observe_step(action: action, ok: true)
               score = index.zero? == (action == 'alpha') ? 1.0 : 0.0
-              policy.finish(score: score)
+              policy.finish(score: score, attribution: { source: :independent_verifier, verified_action_ids: [step[:action_id]] })
             end
           end
         end

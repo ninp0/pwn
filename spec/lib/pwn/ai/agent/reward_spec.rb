@@ -4,6 +4,39 @@ require 'spec_helper'
 require 'tmpdir'
 
 describe PWN::AI::Agent::Reward do
+  describe 'executed request verification' do
+    include_context 'pwn tmp sandbox'
+
+    it 'keeps a stale executed contract unknown until it is checked again' do
+      request = 'Write the answer'
+      sid = PWN::Sessions.create(title: 'fresh checks')[:id]
+      PWN::Sessions.append(session_id: sid, role: 'user', content: request)
+      File.write(File.join(@tmp, 'answer'), 'ok')
+      contract = { root: @tmp, requirements: [request], checks: [{ requirement: request, kind: :file, path: 'answer', expected: 'ok' }] }
+      described_class.run_verification(request: request, session_id: sid, contract: contract)
+      PWN::Sessions.append(session_id: sid, role: 'tool', content: 'later mutation')
+      allow(described_class).to receive(:llm_judge).and_return(score: 0.99, source: :llm_orm)
+      allow(described_class).to receive(:verify_as_reward).and_return(nil)
+      result = described_class.judge(request: request, session_id: sid, final: 'PASS', commit: false)
+      expect(result[:training_score]).to be_nil
+    end
+
+    it 'keeps partially covered requests unknown even when the model judge awards a high score' do
+      request = 'Write the answer and validate the service'
+      sid = PWN::Sessions.create(title: 'coverage')[:id]
+      PWN::Sessions.append(session_id: sid, role: 'user', content: request)
+      File.write(File.join(@tmp, 'answer'), 'ok')
+      contract = { root: @tmp, requirements: ['Write the answer', 'validate the service'],
+                   checks: [{ requirement: 'Write the answer', kind: :file, path: 'answer', expected: 'ok' }] }
+      allow(described_class).to receive(:llm_judge).and_return(score: 0.99, source: :llm_orm)
+      allow(described_class).to receive(:verify_as_reward).and_return(nil)
+      result = described_class.judge(request: request, session_id: sid, final: 'PASS', verification_contract: contract, commit: false)
+      expect(result[:training_score]).to be_nil
+      expect(result[:success]).to be_nil
+      expect(result.dig(:verification, :missing)).to eq(['validate the service'])
+    end
+  end
+
   it 'should display information for authors' do
     authors_response = PWN::AI::Agent::Reward
     expect(authors_response).to respond_to :authors

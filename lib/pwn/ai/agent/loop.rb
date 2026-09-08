@@ -1096,6 +1096,8 @@ module PWN
           Policy.finish(
             session_id: opts[:session_id],
             score: opts[:score],
+            confidence: opts[:confidence],
+            attribution: opts[:attribution],
             verdict: opts[:verdict],
             proxy_ok: opts.fetch(:proxy_ok, false),
             final: opts[:final],
@@ -1126,9 +1128,12 @@ module PWN
             rescue JSON::ParserError
               nil
             end
+            observed_context = opts[:trusted_context].merge(failure_category: sem[:semantic_ok] ? 'none' : sem[:shape].to_s) if opts[:trusted_context].is_a?(Hash)
             Policy.observe_step(
               session_id: opts[:session_id],
               action: name,
+              action_id: opts[:action_id],
+              trusted_context: observed_context,
               args: policy_args,
               result_type: sem[:shape],
               ok: sem[:semantic_ok],
@@ -2736,6 +2741,7 @@ module PWN
           on_tool = opts[:on_tool]
           i = 0
           tools_called = 0
+          verified_actions = []
           engine_s = 0.0
           final_chars = 0
           start_debug_session(opts)
@@ -2843,11 +2849,17 @@ module PWN
           # R5 — open the live MDP episode BEFORE the first Registry.rank so
           # Q(s,a) can advise this turn. Planning still owns the task list.
           if defined?(PWN::AI::Agent::Policy) && Policy.respond_to?(:begin_episode)
+            observations = opts[:trusted_context] || {
+              environment: 'local', capabilities: { ruby: true, shell: File.executable?('/bin/sh') },
+              verification_state: opts[:verification_contract] ? 'pending' : 'unknown'
+            }
+            trusted_context = Policy.observed_context(trusted_context: observations)
             Policy.begin_episode(
               session_id: session_id,
               request: request,
               intent: intent,
               engine: engine,
+              trusted_context: trusted_context,
               ts_state: ts_state
             )
           end
@@ -2866,6 +2878,7 @@ module PWN
           tools = Registry.definitions(
             enabled: opts[:enabled_toolsets],
             relevance: request,
+            trusted_context: trusted_context,
             core_only: core_only,
             intent: intent
           )
@@ -2961,7 +2974,8 @@ module PWN
               # Refresh exposure for the next hop without widening its scope
               # or substituting a generated goal for the original request.
               if tools_called.positive?
-                tools = Registry.definitions(enabled: opts[:enabled_toolsets], relevance: request, core_only: core_only, intent: intent)
+                tools = Registry.definitions(enabled: opts[:enabled_toolsets], relevance: request, core_only: core_only, intent: intent,
+                                             trusted_context: Policy.current_episode&.dig(:trusted_context) || trusted_context)
                 no_tools = Array(tools).empty?
                 Thread.current[:pwn_loop_no_tools] = no_tools
               end
@@ -3079,13 +3093,21 @@ module PWN
                   next
                 end
               end
+              verification_outcome = nil
+              if opts[:verification_contract]
+                report = Reward.run_verification(request: request, session_id: session_id, contract: opts[:verification_contract].merge(actions: verified_actions))
+                verification_outcome = Reward.resolve_outcome(outcome: { score: nil, source: :verification, verification: report })
+                on_tool&.call('verification', {}, JSON.generate(report))
+              end
               debug_progress(msg: "final accepted chars=#{text.to_s.length}")
               quiet_debug_tui!(reason: 'final')
               debug_final_text!(text: text)
               final_chars = text.to_s.length
               append_session(session_id: session_id, role: 'assistant', content: text)
               Learning.auto_introspect(session_id: session_id, request: request, final: text, predicted: predicted, ts_state: ts_state) if defined?(Learning) && !nested && !no_tools && should_auto_introspect?(local: local, turn_fails: turn_fails, iter: i)
-              maybe_finish_policy(session_id: session_id, proxy_ok: true, ts_state: ts_state)
+              maybe_finish_policy(session_id: session_id, proxy_ok: true, ts_state: ts_state,
+                                  score: verification_outcome&.dig(:training_score), confidence: verification_outcome&.dig(:confidence),
+                                  verdict: verification_outcome&.dig(:verdict), attribution: verification_outcome&.dig(:verification, :attribution))
               task_summary_flush!(state: ts_state, on_tool: on_tool)
               OpenGoal.clear! if defined?(OpenGoal) && !nested
               return text
@@ -3113,6 +3135,7 @@ module PWN
               argv_s = args.is_a?(String) ? args.to_s : args.inspect
               debug_progress(msg: "tool #{name} start:\n#{argv_s}", keep_newlines: true, cap: 0, tee: nil)
               sig = payload_sig(name: name, args: args)
+              before_artifacts = Verification.snapshot(opts[:verification_contract]) if opts[:verification_contract]
               if Thread.current[:pwn_extinguished].is_a?(Hash) && Thread.current[:pwn_extinguished][sig]
                 raw = no_progress_result(name: name, args: args)
               else
@@ -3121,7 +3144,13 @@ module PWN
                 raw = checkpoint_result(name: name, args: args) if same_n >= 3
               end
               tools_called += 1
-              tele    = record_metrics(name: name, started: started, raw: raw, args: args, session_id: session_id, engine: engine, ts_state: ts_state)
+              if opts[:verification_contract]
+                after_artifacts = Verification.snapshot(opts[:verification_contract])
+                changes = after_artifacts.reject { |path, digest| before_artifacts[path] == digest }
+                verified_actions << { action_id: tc[:id], artifacts: changes }
+              end
+              tele    = record_metrics(name: name, action_id: tc[:id], trusted_context: Policy.current_episode&.dig(:trusted_context) || trusted_context,
+                                       started: started, raw: raw, args: args, session_id: session_id, engine: engine, ts_state: ts_state)
               result  = Result.condition(content: raw, entry: entry)
 
               unless tele[:ok]
@@ -3285,6 +3314,8 @@ module PWN
               enabled_toolsets: 'optional - subset of Registry.toolsets, or nil for all',
               on_tool: 'optional - ->(name, args, result) callback for live UI',
               system_role_content: 'optional - override default system prompt (built from session_id if not provided)',
+              verification_contract: 'optional - host-owned Verification.run checks; execute at final boundary and attribute observed artifacts',
+              trusted_context: 'optional - host-observed capability/prerequisite scope; never copied from model arguments',
               debug: 'optional - debug value consumed by #run',
               from: 'optional - sender account or address to bind as operator',
               account: 'optional - operator account id to bind',

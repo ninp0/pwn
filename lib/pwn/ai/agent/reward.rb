@@ -181,7 +181,11 @@ module PWN
           end
 
           v[:judge_score] = v[:score].to_f
-          v[:verification] = request_verification(request: request, session_id: opts[:session_id])
+          v[:verification] = if opts[:verification_contract]
+                               run_verification(request: request, session_id: opts[:session_id], contract: opts[:verification_contract], commit: commit)
+                             else
+                               request_verification(request: request, session_id: opts[:session_id])
+                             end
           v = resolve_outcome(outcome: v, critic_pass: opts[:critic_pass])
           v[:verdict_class] = taxonomy_class(opts.merge(score: v[:score], verifier_verdict: v[:verifier_verdict], request: request, final: final))
           v[:remediation_hint] = taxonomy_hint(verdict_class: v[:verdict_class])
@@ -233,6 +237,17 @@ module PWN
           vv = if checked
                  verification[:checks].all? { |c| c[:passed] } ? :pass : :fail
                end
+          runner = verification.is_a?(Hash) && verification[:runner_version] == 1
+          if runner
+            checks = Array(verification[:checks])
+            requirements = Array(verification[:requirements])
+            complete = !requirements.empty? && (requirements - checks.map { |c| c[:criterion] }).empty?
+            vv = if checks.any? { |c| c[:passed] == false }
+                   :fail
+                 elsif complete && checked && checks.all? { |c| c[:passed] == true }
+                   :pass
+                 end
+          end
           v[:verifier_verdict] = vv
           v[:confidence] = 1.0 if vv
           if vv == :fail || v.dig(:grounded, :verdict).to_s == 'refuted'
@@ -241,7 +256,7 @@ module PWN
           elsif vv == :pass && verifier_precedence?
             score = [score || 0.0, 0.6].max
             success = true
-          elsif score.nil? || source == 'error'
+          elsif (runner && vv.nil?) || score.nil? || source == 'error'
             success = nil
           elsif source.start_with?('heuristic')
             success = false
@@ -264,6 +279,20 @@ module PWN
           v.merge(score: score, success: success, verdict: verdict,
                   critic_pass: opts.fetch(:critic_pass, v[:critic_pass]),
                   training_score: known ? score : nil, decision_version: 1)
+        end
+
+        # Trusted host-verifier API, deliberately NOT a model-facing tool.
+        # Execute an explicit host-owned contract before recording its result.
+        public_class_method def self.run_verification(opts = {})
+          request = opts[:request].to_s
+          sid = opts[:session_id].to_s
+          rows = PWN::Sessions.load(session_id: sid)
+          user = rows.reverse.find { |row| row[:role].to_s == 'user' }
+          raise ArgumentError, 'verification must match the current session request' unless user && user[:content].to_s == request
+
+          record = Verification.run(opts.fetch(:contract).merge(request: request)).merge(session_id: sid)
+          PWN::Sessions.append(session_id: sid, role: 'verification', content: JSON.generate(record)) if opts.fetch(:commit, true)
+          record
         end
 
         # Trusted host-verifier API, deliberately NOT a model-facing tool.
@@ -302,11 +331,19 @@ module PWN
 
           verification_idx = rows.rindex { |entry| entry[:role].to_s == 'verification' }
           return nil unless verification_idx && verification_idx > user_idx
-          return nil if rows[(verification_idx + 1)..].any? { |entry| entry[:role].to_s == 'tool' }
+
+          stale = rows[(verification_idx + 1)..].any? { |entry| entry[:role].to_s == 'tool' }
 
           row = rows[verification_idx]
           record = JSON.parse(row[:content].to_s, symbolize_names: true)
           return nil unless record[:session_id] == sid && record[:request_digest] == Digest::SHA256.hexdigest(opts[:request].to_s)
+
+          if stale
+            return nil unless record[:runner_version] == 1
+
+            return record.merge(checks: [], missing: record[:requirements], status: :unknown, attribution: nil)
+          end
+          return record if record[:runner_version] == 1
           return nil unless valid_verification_checks?(checks: record[:checks])
 
           record
@@ -1921,7 +1958,16 @@ module PWN
               critic_pass: 'optional - critic pass value consumed by #judge',
               predicted: 'optional - predicted value consumed by #judge',
               proxy_ok: 'optional - proxy ok value consumed by #judge',
-              persist_components: 'optional - persist the resolved outcome and score components'
+              persist_components: 'optional - persist the resolved outcome and score components',
+              verification_contract: 'optional - explicit host-owned Verification.run contract; missing coverage stays unknown'
+            )
+
+            # Execute host-owned acceptance checks and record request-bound coverage.
+            #{self}.run_verification(
+              request: 'required - exact current session request',
+              session_id: 'required - current session',
+              contract: 'required - Verification.run options excluding request',
+              commit: 'optional - persist report (default true)'
             )
 
             # Trusted host verifier only: actually check ALL original-request criteria.

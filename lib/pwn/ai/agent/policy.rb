@@ -19,7 +19,10 @@ module PWN
       #   reward r  — step: 0 (spam cost −0.01 after 8 tools); terminal: judge × confidence
       #   next   s' — state after the tool result
       #
-      # Each Loop turn is one episode. Transitions land in
+      # Each Loop turn is one episode. Trusted environment/prerequisite bins
+      # scope fallback history; independently evidenced terminal attribution
+      # uses isolated action targets, not future-return credit for busywork.
+      # Transitions land in
       # ~/.pwn/policy_traj.jsonl. Q(s,a) and REINFORCE logits H(s,a) are
       # updated from those tuples and persisted in ~/.pwn/policy.json.
       #
@@ -52,6 +55,10 @@ module PWN
         EP_KEY     = :pwn_policy_episode
         OPERATIONS = %w[read list search inspect write create update delete execute start stop status poll].freeze
         RESULT_TYPES = %w[success failure timeout enoent eacces auth_required network syntax exit127 exit126 nonzero_exit handler_error invalid_payload].freeze
+        ENVIRONMENTS = %w[local remote container unknown].freeze
+        CAPABILITIES = %w[shell ruby python browser network filesystem credentials executable dependency service hardware].freeze
+        FAILURE_CATEGORIES = (%w[none unknown missing_prerequisite] + RESULT_TYPES).freeze
+        VERIFICATION_STATES = %w[unknown pending passed failed partial].freeze
         ARGUMENT_ROLES = {
           'action' => 'operation', 'operation' => 'operation', 'op' => 'operation',
           'path' => 'path', 'file' => 'path', 'directory' => 'path',
@@ -82,16 +89,47 @@ module PWN
           # Three independent bins so Q can see plan quality, answer
           # completeness, and whether the human actually got a usable result.
           qual = "p#{plan_q}c#{comp}u#{use}"
-          if warm?
-            last = action_bucket(name: opts[:last_action] || opts[:last] || 'start')
-            fail = fail_bin(count: opts[:fails] || opts[:fail_n])
-            "#{kind}|#{task}|a#{last}|f#{fail}|#{qual}|#{eng}"
-          elsif !cold?
-            fail = fail_bin(count: opts[:fails] || opts[:fail_n])
-            "#{kind}|#{task}|f#{fail}|#{qual}|#{eng}"
-          else
-            "#{kind}|#{task}|#{qual}|#{eng}"
+          key = if warm?
+                  last = action_bucket(name: opts[:last_action] || opts[:last] || 'start')
+                  fail = fail_bin(count: opts[:fails] || opts[:fail_n])
+                  "#{kind}|#{task}|a#{last}|f#{fail}|#{qual}|#{eng}"
+                elsif !cold?
+                  fail = fail_bin(count: opts[:fails] || opts[:fail_n])
+                  "#{kind}|#{task}|f#{fail}|#{qual}|#{eng}"
+                else
+                  "#{kind}|#{task}|#{qual}|#{eng}"
+                end
+          observed_state(state: key, trusted_context: opts[:trusted_context])
+        end
+
+        # Add observations without losing the live engine/task/plan bins.
+        public_class_method def self.observed_state(opts = {})
+          return opts[:state] unless opts[:trusted_context].is_a?(Hash)
+
+          parts = opts[:state].to_s.split('|')
+          engine = parts.pop
+          parts.reject! { |part| part.start_with?('env:', 'obs:') }
+          observed = observed_context(trusted_context: opts[:trusted_context])
+          environment = observed.slice(:environment, :capabilities, :missing_prerequisites)
+          "#{parts.join('|')}|env:#{JSON.generate(environment)}|obs:#{observed[:failure_category]}:#{observed[:verification_state]}|#{engine}"
+        end
+
+        # Caller-only observations, never model claims or raw probe output.
+        public_class_method def self.observed_context(opts = {})
+          raw = opts[:trusted_context].is_a?(Hash) ? opts[:trusted_context] : {}
+          environment = raw[:environment].to_s
+          environment = 'unknown' unless ENVIRONMENTS.include?(environment)
+          capabilities = raw[:capabilities].is_a?(Hash) ? raw[:capabilities] : {}
+          capabilities = CAPABILITIES.each_with_object({}) do |name, result|
+            value = capabilities.key?(name.to_sym) ? capabilities[name.to_sym] : capabilities[name]
+            result[name.to_sym] = value if [true, false].include?(value)
           end
+          missing = Array(raw[:missing_prerequisites]).map(&:to_s).intersection(CAPABILITIES).sort
+          failure = raw[:failure_category].to_s
+          failure = 'unknown' unless FAILURE_CATEGORIES.include?(failure)
+          verification = raw[:verification_state].to_s
+          verification = 'unknown' unless VERIFICATION_STATES.include?(verification)
+          { environment: environment, capabilities: capabilities, missing_prerequisites: missing, failure_category: failure, verification_state: verification }
         end
 
         public_class_method def self.cold?
@@ -150,7 +188,8 @@ module PWN
             last_action: 'start',
             fails: 0,
             engine: opts[:engine],
-            ts_state: opts[:ts_state]
+            ts_state: opts[:ts_state],
+            trusted_context: opts[:trusted_context]
           )
           ep = {
             session_id: sid,
@@ -158,12 +197,14 @@ module PWN
             kind: normalize_kind(raw: opts[:kind]),
             intent: opts[:intent].to_s,
             engine: opts[:engine].to_s,
+            trusted_context: (observed_context(trusted_context: opts[:trusted_context]) if opts[:trusted_context].is_a?(Hash)),
             started_at: Time.now.utc.iso8601,
             state: s0,
             last_action: 'start',
             plan_idx: ts_idx(ts_state: opts[:ts_state]),
             plan_open: ts_open?(ts_state: opts[:ts_state]),
             fails: 0,
+            action_ids: {},
             steps: []
           }
           Thread.current[EP_KEY] = ep
@@ -177,6 +218,8 @@ module PWN
         # step = PWN::AI::Agent::Policy.observe_step(
         #   session_id: 'optional - must match begin_episode when set',
         #   action: 'required - tool name',
+        #   action_id: 'optional - trusted dispatch ID; mapped to a persisted episode-local ID',
+        #   trusted_context: 'optional - caller observations after this step; never model claims',
         #   args: 'optional - arguments, reduced to fixed roles/types, never stored raw',
         #   operation: 'optional - known operation override; otherwise derived from args',
         #   result_type: 'optional - Reward.semantic_ok shape; fixed allowlist only',
@@ -201,7 +244,8 @@ module PWN
               request: opts[:request],
               kind: opts[:kind],
               engine: opts[:engine],
-              ts_state: opts[:ts_state]
+              ts_state: opts[:ts_state],
+              trusted_context: opts[:trusted_context]
             )
             ep = Thread.current[EP_KEY]
           end
@@ -215,19 +259,27 @@ module PWN
           ep[:plan_open] = ts_open?(ts_state: opts[:ts_state])
           s = ep[:state]
           task = active_task_text(ts_state: opts[:ts_state], request: ep[:request])
+          if opts[:trusted_context].is_a?(Hash)
+            previous = ep[:trusted_context] || {}
+            observed = previous.merge(opts[:trusted_context])
+            observed[:capabilities] = (previous[:capabilities] || {}).merge(opts[:trusted_context][:capabilities] || {})
+            ep[:trusted_context] = observed_context(trusted_context: observed)
+          end
           s2 = state(
             kind: ep[:kind],
             request: task,
             last_action: action,
             fails: ep[:fails],
             engine: ep[:engine],
-            ts_state: opts[:ts_state]
+            ts_state: opts[:ts_state],
+            trusted_context: ep[:trusted_context]
           )
           context = action_context(opts)
           context_s2 = contextual_state(state: s2, action: action, context: context)
           trans = {
             state: s,
             action: action,
+            action_id: "a#{ep[:steps].length + 1}",
             action_context: context,
             context_state: ep[:context_state],
             next_context_state: context_s2,
@@ -237,6 +289,10 @@ module PWN
             duration: opts[:duration].to_f,
             terminal: false
           }
+          external_id = (opts[:action_id] || trans[:action_id]).to_s
+          ep[:action_ids] ||= {}
+          ep[:action_ids][external_id] ||= []
+          ep[:action_ids][external_id] << trans[:action_id]
           ep[:steps] << trans
           ep[:state] = s2
           ep[:context_state] = context_s2
@@ -251,6 +307,7 @@ module PWN
         # report = PWN::AI::Agent::Policy.finish(
         #   session_id: 'optional - active episode id',
         #   score: 'optional - Reward.judge 0..1 (training target)',
+        #   attribution: 'optional - trusted {source: independent_verifier|controlled_comparison, verified_action_ids: []}',
         #   verdict: 'optional - solved|partial|wrong|refused',
         #   proxy_ok: 'optional - Boolean fallback when no judge score'
         # )
@@ -273,7 +330,8 @@ module PWN
               engine: ep[:engine],
               ts_state: opts[:ts_state],
               final: opts[:final],
-              score: opts[:score]
+              score: opts[:score],
+              trusted_context: ep[:trusted_context]
             )
           end
           terminal = terminal_reward(
@@ -281,18 +339,7 @@ module PWN
             proxy_ok: opts[:proxy_ok],
             confidence: opts[:confidence]
           )
-          if ep[:steps].empty?
-            ep[:steps] << {
-              state: ep[:state],
-              action: 'final',
-              reward: 0.0,
-              next_state: ep[:state],
-              ok: true,
-              duration: 0.0,
-              terminal: true
-            }
-          end
-          ep[:steps].last[:reward] = (ep[:steps].last[:reward].to_f + terminal).round(4)
+          attribute_terminal!(episode: ep, reward: terminal, attribution: opts[:attribution])
           ep[:steps].last[:terminal] = true
           ep[:score] = opts[:score]
           ep[:verdict] = opts[:verdict]
@@ -304,10 +351,12 @@ module PWN
           ep[:steps].each_with_index do |tr, idx|
             next if opts[:score].nil?
 
-            g = discounted_return(steps: ep[:steps][idx..])
+            g = tr[:credit_mode] ? tr[:reward].to_f : discounted_return(steps: ep[:steps][idx..])
             transition_variants(transition: tr).each do |variant|
               n_td += 1 if update_q!(transition: variant)
-              n_pg += 1 if update_pg!(state: variant[:state], action: variant[:action], advantage: g - value(state: variant[:state]))
+              advantage = g - value(state: variant[:state])
+              advantage = [advantage, 0.0].min unless g.positive?
+              n_pg += 1 if update_pg!(state: variant[:state], action: variant[:action], advantage: advantage)
             end
           end
 
@@ -318,6 +367,8 @@ module PWN
             steps: ep[:steps].length,
             return: ep[:return],
             score: opts[:score],
+            terminal_reward: terminal,
+            attribution: ep[:attribution],
             td_updates: n_td,
             pg_updates: n_pg
           }
@@ -427,11 +478,11 @@ module PWN
           context = nil unless context.to_s.start_with?("#{s}~ctx:")
           contextual_visits = read_visit(table: tab, state: context, action: a)
           qsa = routing_q(table: tab, state: s, context_state: context, action: a)
-          # Tiny visit counts stay at 0 unless the value is already decisive.
-          return 0.0 if contextual_visits < CONTEXT_VISITS_MIN && visits < VISITS_MIN && qsa.abs < 0.08
-
           actions = ((tab[:q][s.to_s.to_sym] || {}).keys + (tab[:q][context.to_s.to_sym] || {}).keys).uniq
           baseline = actions.map { |act| routing_q(table: tab, state: s, context_state: context, action: act) }.max || 0.0
+          # Unknown candidates must not tie an established successful action.
+          return 0.0 if contextual_visits < CONTEXT_VISITS_MIN && visits < VISITS_MIN && [qsa.abs, baseline.abs].max < 0.08
+
           (qsa - baseline).clamp(-1.0, 1.0).round(4)
         rescue StandardError
           0.0
@@ -446,6 +497,7 @@ module PWN
 
         public_class_method def self.recommend(opts = {})
           actions = Array(opts[:actions]).map(&:to_s).reject(&:empty?)
+          actions = actions.select { |action| Registry.available?(name: action, trusted_context: opts[:trusted_context]) } if defined?(Registry)
           return { action: nil, reason: :empty } if actions.empty?
 
           s = opts[:state] || current_state || 'unknown'
@@ -581,7 +633,7 @@ module PWN
           greedy_hits = 0
           greedy_n = 0
           rows.each do |ep|
-            Array(ep[:steps]).each do |tr|
+            Array(ep[:steps]).flat_map { |tr| transition_variants(transition: tr) }.each do |tr|
               s = tr[:state].to_s
               a = tr[:action].to_s
               next if s.empty? || a.empty?
@@ -714,7 +766,19 @@ module PWN
               final: 'optional - final value consumed by #state',
               score: 'optional - score value consumed by #state',
               last: 'optional - last value consumed by #state',
-              fail_n: 'optional - fail n value consumed by #state'
+              fail_n: 'optional - fail n value consumed by #state',
+              trusted_context: 'optional - trusted environment, capability booleans, missing prerequisite categories, failure category and verification state'
+            )
+
+            # Sanitize caller-only observations to fixed allowlisted categories.
+            #{self}.observed_context(
+              trusted_context: 'optional - environment: local|remote|container|unknown; capabilities: Hash of booleans; missing_prerequisites: capability names; failure_category; verification_state: unknown|pending|passed|failed|partial'
+            )
+
+            # Scope a live state without discarding task/engine/plan bins.
+            #{self}.observed_state(
+              state: 'required - existing decision state',
+              trusted_context: 'optional - observations accepted by observed_context'
             )
 
             # Run cold and return its result
@@ -733,13 +797,16 @@ module PWN
               kind: 'optional - request kind',
               intent: 'optional - Loop.request_intent',
               engine: 'optional - active engine',
-              ts_state: 'optional - TaskSummarizer state hash'
+              ts_state: 'optional - TaskSummarizer state hash',
+              trusted_context: 'optional - trusted observations accepted by observed_context'
             )
 
             # Run observe step and return its result
             #{self}.observe_step(
               session_id: 'optional - must match begin_episode when set',
               action: 'required - tool name',
+              action_id: 'optional - trusted dispatch ID, stored only as an episode-local ordinal',
+              trusted_context: 'optional - observations after this step; partial updates retain earlier categories',
               args: 'optional - arguments reduced to fixed roles/types only',
               operation: 'optional - allowlisted operation override',
               result_type: 'optional - allowlisted semantic result shape',
@@ -759,7 +826,8 @@ module PWN
               proxy_ok: 'optional - Boolean fallback when no judge score',
               ts_state: 'optional - ts state value consumed by #finish',
               final: 'optional - final value consumed by #finish',
-              confidence: 'optional - confidence value consumed by #finish'
+              confidence: 'optional - confidence value consumed by #finish',
+              attribution: 'optional - caller-only {source: independent_verifier|controlled_comparison, verified_action_ids: dispatch IDs}; missing or ambiguous IDs earn no tool credit; nil score never trains'
             )
 
             # Value-based update (Q-learning) + policy-gradient (REINFORCE)
@@ -797,6 +865,7 @@ module PWN
               state: 'optional - default current episode state',
               actions: 'required - Array of tool names',
               context_state: 'optional - previous action context (default live context)',
+              trusted_context: 'optional - observed prerequisites used to exclude unavailable actions',
               epsilon: 'optional - explore probability (default EPSILON)'
             )
 
@@ -881,6 +950,12 @@ module PWN
 
         private_class_method def self.transition_variants(opts = {})
           tr = opts[:transition]
+          return [] unless tr[:credit_mode] == 'terminal_attribution' && tr[:credit_eligible]
+
+          # Reward is an attributed terminal target, not a temporal promise
+          # that can bootstrap positive credit back through unrelated calls.
+          # Legacy trajectories lack this provenance and are not replayed.
+          tr = tr.merge(terminal: true)
           return [tr] if tr[:context_state].to_s.empty?
 
           [tr, tr.merge(state: tr[:context_state], next_state: tr[:next_context_state])]
@@ -1036,6 +1111,41 @@ module PWN
           0
         end
 
+        # This is evidence-based attribution, not a claim of causal proof.
+        # Only the trusted caller may construct this receipt after independent
+        # checks or isolated controlled comparisons. Never parse model prose.
+        private_class_method def self.attribute_terminal!(opts = {})
+          ep = opts[:episode]
+          receipt = opts[:attribution].is_a?(Hash) ? opts[:attribution] : {}
+          source = receipt[:source].to_s
+          trusted = %w[independent_verifier controlled_comparison].include?(source)
+          ids = if trusted
+                  Array(receipt[:verified_action_ids]).filter_map do |id|
+                    matches = ep.fetch(:action_ids, {})[id.to_s]
+                    matches.first if matches.is_a?(Array) && matches.length == 1
+                  end.uniq
+                else
+                  []
+                end
+          recipients = ep[:steps].select { |step| ids.include?(step[:action_id]) }
+          ep[:attribution] = { source: trusted ? source : 'none', action_ids: recipients.map { |step| step[:action_id] } }
+          ep[:steps].each do |step|
+            step[:credit_mode] = 'terminal_attribution'
+            step[:credit_eligible] = step[:reward].to_f.negative? || recipients.include?(step)
+          end
+          if recipients.empty?
+            # Keep the terminal budget in the trajectory without pretending an
+            # unlinked tool earned it. This accounting row is never trained.
+            ep[:steps] << {
+              state: ep[:state], action: 'final', next_state: ep[:state],
+              reward: opts[:reward], terminal: true, credit_mode: 'terminal_attribution', credit_eligible: false
+            }
+          else
+            share = opts[:reward].to_f / recipients.length
+            recipients.each { |step| step[:reward] = step[:reward].to_f + share }
+          end
+        end
+
         private_class_method def self.terminal_reward(opts = {})
           conf = opts[:confidence]
           conf = 1.0 if conf.nil? || conf.to_f <= 0.0
@@ -1188,6 +1298,7 @@ module PWN
 
             ks = key.to_s.split('|')
             next unless ks[0] == kind && ks[1] == task && ks[-1] == eng
+            next unless ks.find { |part| part.start_with?('env:') } == parts.find { |part| part.start_with?('env:') }
 
             vals << acts[act].to_f
           end
@@ -1209,6 +1320,7 @@ module PWN
           rows.each do |ep|
             Array(ep[:steps]).each do |tr|
               next if tr[:context_state].to_s.empty? || tr[:action].to_s.empty?
+              next if transition_variants(transition: tr).empty?
 
               context_counts[[tr[:context_state].to_s.to_sym, tr[:action].to_s.to_sym]] += 1
             end
@@ -1290,6 +1402,7 @@ module PWN
             score: ep[:score],
             verdict: ep[:verdict],
             return: ep[:return],
+            attribution: ep[:attribution],
             steps: ep[:steps]
           }
           File.open(TRAJECTORY_FILE, 'a') { |f| f.puts(JSON.dump(row)) }
