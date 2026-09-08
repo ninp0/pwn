@@ -67,6 +67,12 @@ describe PWN::AI::Agent::ToolGuard do
       expect(out[:exit]).to eq(2)
       expect(out[:error]).to eq('invalid_payload')
       expect(out[:stderr]).to include('missing required command')
+      expect(out[:max_payload_bytes]).to eq(described_class::MAX_PAYLOAD_BYTES)
+    end
+
+    it 'names the byte range of a placeholder token' do
+      out = described_class.invalid_payload(hint: 'ellipsis', offending_token: '...', text: 'foo ... bar')
+      expect(out[:byte_range]).to eq([4, 7])
     end
   end
 

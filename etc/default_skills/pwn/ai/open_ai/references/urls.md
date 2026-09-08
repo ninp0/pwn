@@ -5,3 +5,4 @@
 - https://auth.openai.com/oauth/token
 - https://api.openai.com/auth
 - https://auth.openai.com/codex/device
+- https://chatgpt.com/backend-api/codex

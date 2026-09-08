@@ -31,4 +31,14 @@ describe PWN::Plugins::ArtifactRegistry do
       expect(hits[:matches].first[:text]).to include('call system')
     end
   end
+
+  it 'round-trips put then get by sha256' do
+    Dir.mktmpdir do |dir|
+      stub_const('PWN::Plugins::ArtifactRegistry::ROOT', File.join(dir, 'art'))
+      stored = described_class.put(bytes: 'pcap-bytes', kind: 'pcap', tags: ['net'])
+      got = described_class.get(sha256: stored[:sha256])
+      expect(got[:body]).to include('pcap-bytes')
+      expect(stored[:tags]).to include('net')
+    end
+  end
 end

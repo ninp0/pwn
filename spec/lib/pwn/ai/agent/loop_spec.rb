@@ -16,6 +16,51 @@ describe PWN::AI::Agent::Loop do # rubocop:disable Metrics/BlockLength
   end
 
   describe 'RL-adjacent loop contracts' do # rubocop:disable Metrics/BlockLength
+    describe 'live policy tool exposure' do
+      include_context 'pwn tmp sandbox'
+
+      it 'refreshes schemas after observation before the next engine call without changing routing scope' do
+        policy = PWN::AI::Agent::Policy
+        registry = PWN::AI::Agent::Registry
+        request = 'what color is a passion fruit?'
+        session_id = PWN::Sessions.create(title: 'context refresh')[:id]
+        policy.reset
+        allow(PWN::AI::Agent::TaskSummarizer).to receive(:enabled?).and_return(false)
+        allow(described_class).to receive(:should_auto_introspect?).and_return(false)
+        allow(PWN::AI::Agent::Dispatch).to receive(:call).and_return('{"success":true,"result":{"stdout":"purple","exitstatus":0}}')
+        scopes = []
+        allow(registry).to receive(:definitions) do |opts|
+          scopes << opts
+          observed = Array(policy.current_episode&.dig(:steps)).any?
+          names = observed ? %w[pwn_eval shell] : %w[shell pwn_eval]
+          names.map { |name| { type: 'function', function: { name: name } } }
+        end
+        seen = []
+        allow(described_class).to receive(:call_engine) do |opts|
+          seen << Array(opts[:tools]).map { |tool| tool.dig(:function, :name) }
+          if seen.length == 1
+            { role: 'assistant', tool_calls: [{ id: 'observe_color', type: 'function', function: { name: 'shell', arguments: '{"command":"printf purple"}' } }] }
+          else
+            raise 'unexpected extra engine call' if seen.length > 2
+
+            { role: 'assistant', content: 'Purple when ripe.', tool_calls: [] }
+          end
+        end
+        result = described_class.run(request: request, session_id: session_id, system_role_content: 'test system', enabled_toolsets: ['shell'], core_only: false)
+        expect(result).to eq('Purple when ripe.')
+        expect(seen).to eq([%w[shell pwn_eval], %w[pwn_eval shell]])
+        expect(scopes).to all(include(relevance: request, enabled: ['shell'], core_only: false, intent: described_class.request_intent(request: request)))
+      end
+    end
+
+    it 'passes parsed action arguments and result classification into policy observation' do
+      allow(PWN::AI::Agent::Metrics).to receive(:record)
+      allow(PWN::AI::Agent::Reward).to receive(:semantic_ok).and_return(semantic_ok: true, shape: :success)
+      expected = hash_including(args: { 'operation' => 'read', 'path' => '/tmp/report' }, result_type: :success)
+      expect(PWN::AI::Agent::Policy).to receive(:observe_step).with(expected)
+      described_class.send(:record_metrics, name: 'file', raw: '{"success":true}', args: '{"operation":"read","path":"/tmp/report"}')
+    end
+
     it 'spins on engine HTTP wait and still dispatches on_tool (debug must not hide the TUI)' do
       src = File.read(described_class.method(:run).source_location.first)
       expect(src).to match(/spinner:\s*true/)
@@ -434,6 +479,12 @@ describe PWN::AI::Agent::Loop do # rubocop:disable Metrics/BlockLength
       src = File.read(described_class.method(:run).source_location.first)
       expect(src).to match(/engine_transient\?|HttpRetry\.retryable\?/)
       expect(src).to match(/engine hop failed|engine_blip/)
+    end
+
+    it 'returns a billing line on OpenAI quota 429 instead of crashing the REPL' do
+      src = File.read(described_class.method(:run).source_location.first)
+      expect(src).to match(/quota_exhausted\?/)
+      expect(src).to match(/quota_message/)
     end
 
     it 'compacts tool history for every engine, not only local' do

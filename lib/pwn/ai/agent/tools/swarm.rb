@@ -102,7 +102,10 @@ PWN::AI::Agent::Registry.register(
           type: 'string',
           description: 'Existing swarm to join (from swarm_list / a prior ' \
                        'agent_ask). Omit to auto-create a new swarm.'
-        }
+        },
+        unit: { type: 'string', description: 'Claim key host:phase so two children do not duplicate work.' },
+        ttl: { type: 'integer', description: 'Claim TTL seconds (defaults to 300).' },
+        engagement_id: { type: 'string', description: 'Claim namespace (defaults to swarm_id).' }
       },
       required: %w[name request]
     }
@@ -113,7 +116,10 @@ PWN::AI::Agent::Registry.register(
     PWN::AI::Agent::Swarm.ask(
       name: args[:name],
       request: args[:request],
-      swarm_id: args[:swarm_id]
+      swarm_id: args[:swarm_id],
+      unit: args[:unit],
+      ttl: args[:ttl],
+      engagement_id: args[:engagement_id]
     )
   }
 )

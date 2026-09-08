@@ -39,6 +39,7 @@ PWN::Plugins::Findings.required_bins(opts)
 - `report`
 - `query`
 - `chain`
+- `chain_score`
 - `render`
 - `authors`
 - `help`

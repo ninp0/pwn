@@ -39,6 +39,7 @@ PWN::AI::Agent::Engagement.open(opts)
 - `current_name`
 - `in_scope`
 - `deny_if_out_of_scope`
+- `load_roe`
 - `authors`
 - `help`
 - `in_scope?`

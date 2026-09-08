@@ -10,7 +10,7 @@ agent code never cares which model is behind it.
 
 | Engine | Client | Auth | Notes |
 |---|---|---|---|
-| `openai` | `PWN::AI::OpenAI` | `key:` | function-calling native |
+| `openai` | `PWN::AI::OpenAI` | ChatGPT/Codex `oauth:` or `key:` | OAuth preferred when configured; subscription chat uses the Codex Responses backend, API keys use the Platform API |
 | `anthropic` | `PWN::AI::Anthropic` | `key:` | tool-use native |
 | `grok` | `PWN::AI::Grok` | `key:` **or** `oauth: true` | OAuth = RFC-8628 device-code flow using xAI's public Grok-CLI client id (no secret) - see skill `xai_grok_oauth_device_flow` |
 | `gemini` | `PWN::AI::Gemini` | `key:` | function-calling native |
@@ -37,6 +37,39 @@ ai:
 # at runtime
 PWN::Env[:ai][:active] = :ollama
 ```
+
+## OpenAI OAuth enrollment and persistence
+
+To prefer subscription OAuth, set `ai.openai.oauth.enroll: true` through
+`pwn-vault`, then restart `pwn-ai` and follow the device-code consent prompt.
+An existing bearer or refresh token is preferred over `ai.openai.key`.
+The account must have access to the requested model through Codex; OAuth
+does not grant all Platform API permissions or bypass subscription limits.
+
+You can also enroll explicitly from a PWN Ruby console:
+
+```ruby
+PWN::AI::OpenAI.obtain_oauth_bearer_token; nil
+```
+
+The trailing `nil` prevents the console from echoing the returned bearer.
+Successful enrollment updates the live environment and calls the private
+`persist_oauth_to_vault` helper, as token refresh does. It uses the configured
+`driver_opts.pwn_env_path` and `pwn_dec_path`, defaulting to
+`~/.pwn/pwn.yaml` and its `.decryptor` file. Existing decryption artifacts are
+required; missing artifacts leave tokens in the session only and produce a
+notice. Tokens are not printed by the enrollment success message.
+
+Persistence retains unrelated settings and the existing key/IV, encrypts a
+private temporary file, and replaces the vault only after encryption succeeds.
+The resulting vault has mode `0600`. The original vault remains unchanged on
+a persistence failure; the helper does not create or rotate decryptor secrets.
+
+Subscription OAuth requests must not go to the default Platform
+`/v1/responses` endpoint: that mismatch can produce `Missing scopes:
+api.responses.write`. OAuth chat uses
+`https://chatgpt.com/backend-api/codex/responses` instead. An actual Platform
+API key still needs the relevant project and endpoint permissions.
 
 ## Engine-aware behavior
 

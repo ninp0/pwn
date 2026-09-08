@@ -6,6 +6,16 @@ module PWN
   module Reports
     # Compile engagement findings into a client-ready HTML/Markdown report.
     module Engagement
+      public_class_method def self.render(opts = {})
+        out = generate(opts)
+        fmt = (opts[:format] || 'md').to_s
+        case fmt
+        when 'html' then { path: out[:html], format: fmt }
+        when 'json' then { path: out[:json], format: fmt }
+        else { path: out[:markdown], format: 'md', all: out }
+        end
+      end
+
       public_class_method def self.generate(opts = {})
         name = (opts[:engagement] || opts[:name] || 'default').to_s
         rows = if opts[:findings]
@@ -49,6 +59,15 @@ module PWN
             engagement: 'optional - engagement name (defaults to default)',
             name: 'optional - alias for engagement',
             findings: 'optional - Array of finding hashes (defaults to Findings.report)',
+            dir_path: 'optional - output directory',
+            report_name: 'optional - basename without extension'
+          )
+
+          # Render one format (md|html|json) for a session/engagement.
+          #{self}.render(
+            session_id: 'optional - pwn-ai session id',
+            format: 'optional - md, html, or json (defaults to md)',
+            engagement: 'optional - engagement name',
             dir_path: 'optional - output directory',
             report_name: 'optional - basename without extension'
           )

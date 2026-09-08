@@ -58,6 +58,32 @@ module PWN
           token = (opts[:host] || opts[:ip] || opts[:target] || opts[:url]).to_s
           return true if token.empty?
 
+          roe = load_roe
+          host = token
+          begin
+            host = URI.parse(token).host || token if token.include?('://')
+          rescue StandardError
+            host = token
+          end
+          host = host.sub(%r{\Ahttps?://}i, '').split('/').first.to_s.split(':').first
+          if roe[:present]
+            deny = Array(roe[:targets_deny])
+            return false if deny.any? { |ex| host == ex.to_s || host.end_with?(".#{ex}") || host.include?(ex.to_s) }
+
+            allow = Array(roe[:targets_allow])
+            unless allow.empty?
+              ok = allow.any? do |a|
+                a = a.to_s
+                host == a || host.end_with?(".#{a}") || begin
+                  IPAddr.new(a).include?(IPAddr.new(host))
+                rescue StandardError
+                  false
+                end
+              end
+              return false unless ok
+            end
+          end
+
           row = status
           return true if row[:active].nil? || row[:missing]
 
@@ -90,6 +116,16 @@ module PWN
         public_class_method def self.deny_if_out_of_scope(opts = {})
           args = opts[:args] || opts[:command] || opts[:text]
           blob = args.is_a?(Hash) ? args.inspect : args.to_s
+          roe = load_roe
+          tech_hit = Array(roe[:techniques_deny]).find { |t| blob.downcase.include?(t.to_s.downcase) }
+          if tech_hit
+            return {
+              success: false,
+              error: "roe_deny: technique #{tech_hit}",
+              code: 'ROE_DENY',
+              violating: [tech_hit]
+            }
+          end
           tokens = blob.scan(/(?:\d{1,3}\.){3}\d{1,3}|[A-Za-z0-9.-]+\.[A-Za-z]{2,}/).uniq
           bad = tokens.reject { |tok| in_scope?(host: tok) }
           return nil if bad.empty?
@@ -100,6 +136,24 @@ module PWN
             code: 'SCOPE_DENY',
             violating: bad
           }
+        end
+
+        public_class_method def self.load_roe(opts = {})
+          path = (opts[:path] || File.join(Dir.home, '.pwn', 'roe.yaml')).to_s
+          return { present: false, targets_allow: [], targets_deny: [], techniques_deny: [] } unless File.file?(path)
+
+          require 'yaml'
+          raw = YAML.safe_load_file(path, permitted_classes: [], symbolize_names: true) || {}
+          raw = {} unless raw.is_a?(Hash)
+          {
+            present: true,
+            targets_allow: Array(raw[:targets_allow] || raw['targets_allow']),
+            targets_deny: Array(raw[:targets_deny] || raw['targets_deny']),
+            techniques_deny: Array(raw[:techniques_deny] || raw['techniques_deny']),
+            time_windows: raw[:time_windows] || raw['time_windows']
+          }
+        rescue StandardError
+          { present: false, targets_allow: [], targets_deny: [], techniques_deny: [] }
         end
 
         public_class_method def self.authors
@@ -147,6 +201,11 @@ module PWN
               args: 'optional - Hash of tool args',
               command: 'optional - command string',
               text: 'optional - free-form blob to scan'
+            )
+
+            # Load the RoE policy file when present for allow and deny lists.
+            #{self}.load_roe(
+              path: 'optional - filesystem path of roe.yaml (defaults to ~/.pwn/roe.yaml)'
             )
 
             # Print the AUTHOR(S) string for this module.

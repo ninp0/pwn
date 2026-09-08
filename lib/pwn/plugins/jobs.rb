@@ -40,6 +40,26 @@ module PWN
         row
       end
 
+      public_class_method def self.run(opts = {})
+        start(opts)
+      end
+
+      public_class_method def self.job_run(opts = {})
+        start(opts)
+      end
+
+      public_class_method def self.job_status(opts = {})
+        status(id: opts[:handle] || opts[:id])
+      end
+
+      public_class_method def self.job_tail(opts = {})
+        tail(id: opts[:handle] || opts[:id], lines: opts[:lines])
+      end
+
+      public_class_method def self.job_kill(opts = {})
+        stop(id: opts[:handle] || opts[:id])
+      end
+
       public_class_method def self.watch(opts = {})
         row = load_job(opts)
         pattern = opts[:pattern].to_s
@@ -161,6 +181,39 @@ module PWN
           #{self}.watch(
             id: 'required - job id from #start',
             pattern: 'required - regex to match in the job log'
+          )
+
+          # Alias of start that returns a job handle immediately.
+          #{self}.run(
+            command: 'required - command string to run',
+            cmd: 'optional - alias for command',
+            session_id: 'optional - pwn-ai session id',
+            max_runtime: 'optional - seconds after which a live job is killed'
+          )
+
+          # Alias of #run.
+          #{self}.job_run(
+            command: 'required - command string to run',
+            cmd: 'optional - alias for command'
+          )
+
+          # Status by handle or id.
+          #{self}.job_status(
+            handle: 'optional - job handle from #run',
+            id: 'optional - job id alias for handle'
+          )
+
+          # Tail a job log by handle.
+          #{self}.job_tail(
+            handle: 'optional - job handle from #run',
+            id: 'optional - job id alias for handle',
+            lines: 'optional - number of trailing lines'
+          )
+
+          # Kill a job by handle.
+          #{self}.job_kill(
+            handle: 'optional - job handle from #run',
+            id: 'optional - job id alias for handle'
           )
 
           # Print the AUTHOR(S) string for this module.

@@ -5,6 +5,7 @@ require 'base64'
 require 'securerandom'
 require 'digest'
 require 'uri'
+require 'tempfile'
 
 module PWN
   module AI
@@ -34,8 +35,8 @@ module PWN
       #     token response -- no localhost listener)
       #   * refresh_token grant at /oauth/token (JSON body, same as codex)
       #
-      # Access tokens are short-lived JWTs. Persist refresh_token via
-      # pwn-vault under ai.openai.oauth.refresh_token.
+      # Access tokens are short-lived JWTs. Enrollment and refresh update
+      # ai.openai.oauth in the live environment and existing encrypted vault.
       # ------------------------------------------------------------------
       OPENAI_OAUTH_ISSUER     = 'https://auth.openai.com'
       OPENAI_OAUTH_TOKEN_URI  = "#{OPENAI_OAUTH_ISSUER}/oauth/token".freeze
@@ -197,9 +198,14 @@ module PWN
           return false
         end
 
-        PWN::Plugins::Vault.decrypt(file: env_path, key: key, iv: iv)
-        begin
-          cfg = YAML.load_file(env_path, symbolize_names: true)
+        # Work on a private sibling; never decrypt the live vault in place.
+        # Rename only after encryption succeeds, preserving the old vault on
+        # write/encryption errors and keeping the existing key + iv intact.
+        Tempfile.create(['.pwn-openai-oauth-', '.yaml'], File.dirname(env_path)) do |temp|
+          temp.write(File.binread(env_path))
+          temp.flush
+          PWN::Plugins::Vault.decrypt(file: temp.path, key: key, iv: iv)
+          cfg = YAML.load_file(temp.path, symbolize_names: true)
           cfg = {} unless cfg.is_a?(Hash)
           cfg[:ai] = {} unless cfg[:ai].is_a?(Hash)
           cfg[:ai][:openai] = {} unless cfg[:ai][:openai].is_a?(Hash)
@@ -214,16 +220,15 @@ module PWN
 
           # Match PWN::Config.default_env YAML style (string keys, no leading ':').
           yaml_env = YAML.dump(cfg).gsub(/^(\s*):/, '\1')
-          File.write(env_path, yaml_env)
-          File.chmod(0o600, env_path)
-        ensure
-          # Always re-encrypt with the IDENTICAL key + iv — never rotate.
-          PWN::Plugins::Vault.encrypt(file: env_path, key: key, iv: iv)
+          File.write(temp.path, yaml_env)
+          PWN::Plugins::Vault.encrypt(file: temp.path, key: key, iv: iv)
+          temp.fsync
+          File.rename(temp.path, env_path)
         end
 
         true
       rescue StandardError => e
-        warn "[!] OpenAI OAuth vault persistence failed (session tokens still updated): #{e.class}: #{e.message}"
+        warn "[!] OpenAI OAuth vault persistence failed (session tokens still updated): #{e.class}"
         false
       end
 
@@ -239,6 +244,8 @@ module PWN
       #   2. User opens https://auth.openai.com/codex/device and enters code
       #   3. Poll POST /api/accounts/deviceauth/token until authorization_code + pkce
       #   4. POST /oauth/token authorization_code grant -> access/refresh/id tokens
+      # Success syncs standalone calls into the live Env and persists tokens
+      # using existing vault decryption artifacts, or reports session-only use.
       public_class_method def self.obtain_oauth_bearer_token(opts = {})
         client_id = real_config_value?(value: opts[:client_id]) ? opts[:client_id] : OPENAI_OAUTH_CLIENT_ID
         issuer    = real_config_value?(value: opts[:issuer])    ? opts[:issuer].to_s.sub(%r{/*\z}, '') : OPENAI_OAUTH_ISSUER
@@ -356,16 +363,11 @@ module PWN
           end
         end
 
-        puts "\n[*] SUCCESS: OpenAI / ChatGPT OAuth bearer obtained via device_code grant."
-        puts '    Cached in-memory for this pwn / pwn-ai process.'
-        puts ''
-        puts '    TO MAKE THIS PERMANENT (recommended -- one-time), store via pwn-vault:'
-        puts "      ai.openai.oauth.refresh_token = #{refresh_token}" if refresh_token
-        puts "      ai.openai.oauth.bearer_token  = #{access_token}"
-        puts "      ai.openai.oauth.account_id    = #{opts[:account_id]}" if opts[:account_id]
-        puts '    On future runs the refresh_token alone is enough -- PWN::AI::OpenAI will'
-        puts '    silently exchange it for a fresh access_token (no browser, no prompt).'
-        puts ''
+        sync_oauth_into_env(oauth: opts)
+        persisted = persist_oauth_to_vault(oauth: opts)
+
+        puts "\n[*] SUCCESS: OpenAI / ChatGPT OAuth enrollment completed."
+        puts(persisted ? '    Tokens saved to the encrypted vault; future sessions can refresh automatically.' : '    Tokens available in this session only; encrypted vault persistence was unavailable.')
 
         access_token
       rescue RestClient::ExceptionWithResponse => e
@@ -420,6 +422,8 @@ module PWN
 
         token = obtain_oauth_bearer_token(oauth) if token.nil? && (oauth_opt_in || !real_config_value?(value: engine[:key])) && !opts[:non_interactive]
 
+        # Route by the credential actually selected, not configured OAuth state.
+        oauth_selected = !token.nil?
         token = engine[:key] if token.nil? && real_config_value?(value: engine[:key])
 
         if token.nil?
@@ -438,7 +442,7 @@ module PWN
                         opts[:http_method].to_s.scrub.to_sym
                       end
 
-        base_uri = real_config_value?(value: engine[:base_uri]) ? engine[:base_uri] : 'https://api.openai.com/v1'
+        base_uri = transport_base_uri(base_uri: engine[:base_uri], oauth_selected: oauth_selected)
         rest_call = opts[:rest_call].to_s.scrub
         params = opts[:params]
         headers = {
@@ -446,10 +450,19 @@ module PWN
           authorization: "Bearer #{token}"
         }
         # ChatGPT subscription tokens often need the account id header (codex).
-        headers['ChatGPT-Account-Id'] = oauth[:account_id] if real_config_value?(value: oauth[:account_id])
+        headers['ChatGPT-Account-Id'] = oauth[:account_id] if oauth_selected && real_config_value?(value: oauth[:account_id])
 
         http_body = opts[:http_body]
         http_body ||= {}
+        oauth_responses = oauth_selected && %w[chat/completions responses].include?(rest_call)
+        if oauth_responses
+          rest_call = 'responses'
+          http_body = oauth_responses_body(http_body: http_body)
+          headers[:accept] = 'text/event-stream'
+        elsif http_body[:messages].is_a?(Array)
+          # Native Responses items are local history, not Chat Completions fields.
+          http_body = http_body.merge(messages: http_body[:messages].map { |msg| msg.except(:_native_content, '_native_content') })
+        end
 
         timeout = PWN::AI::HttpRetry.timeout_s(opts)
         max_attempts = PWN::AI::HttpRetry.max_attempts(opts)
@@ -470,7 +483,8 @@ module PWN
               method: http_method,
               url: "#{base_uri}/#{rest_call}",
               headers: headers,
-              verify_ssl: false,
+              verify_ssl: oauth_selected,
+              max_redirects: oauth_selected ? 0 : 10,
               timeout: timeout
             )
 
@@ -483,7 +497,8 @@ module PWN
                 url: "#{base_uri}/#{rest_call}",
                 headers: headers,
                 payload: http_body,
-                verify_ssl: false,
+                verify_ssl: oauth_selected,
+                max_redirects: oauth_selected ? 0 : 10,
                 timeout: timeout
               )
             else
@@ -492,7 +507,8 @@ module PWN
                 url: "#{base_uri}/#{rest_call}",
                 headers: headers,
                 payload: http_body.to_json,
-                verify_ssl: false,
+                verify_ssl: oauth_selected,
+                max_redirects: oauth_selected ? 0 : 10,
                 timeout: timeout
               )
             end
@@ -500,20 +516,26 @@ module PWN
           else
             raise @@logger.error("Unsupported HTTP Method #{http_method} for #{self} Plugin")
           end
-          response
+          oauth_responses ? parse_responses(raw: decode_responses_stream(response: response)).to_json : response
         rescue RestClient::TooManyRequests => e
           retry_count += 1
-          if retry_count >= max_attempts
-            unless opts[:quiet]
-              PWN::AI::HttpRetry.report_event(
-                label: 'openai', which_self: self, quiet: opts[:quiet],
-                http_method: http_method, rest_call: rest_call,
-                extra: '429 retries exhausted', error: e
-              )
-            end
-            return "#{e.message}: #{e.response}"
-          end
-          sleep(PWN::AI::HttpRetry.retry_after_s(response: e.response, retry_count: retry_count) + rand(0.3..5.0))
+          body = e.response.to_s[0, 400]
+          quota = PWN::AI::HttpRetry.quota_exhausted?(error: e)
+          extra = if quota
+                    "quota exhausted body=#{body}"
+                  elsif retry_count >= max_attempts
+                    "429 retries exhausted body=#{body}"
+                  else
+                    "429 attempt=#{retry_count}/#{max_attempts} body=#{body}"
+                  end
+          PWN::AI::HttpRetry.report_event(
+            label: 'openai', which_self: self, quiet: opts[:quiet],
+            http_method: http_method, rest_call: rest_call,
+            extra: extra, error: e
+          )
+          raise e if quota || retry_count >= max_attempts
+
+          sleep(PWN::AI::HttpRetry.retry_after_s(response: e.response, retry_count: retry_count) + rand(0.3..1.5))
           retry
         rescue RestClient::Exceptions::Timeout => e
           # Sidecar hops pass quiet:true. Never print
@@ -528,12 +550,18 @@ module PWN
           end
           retry if retry_count < max_attempts
 
+          raise e if oauth_selected
+
           nil
         end
       rescue RestClient::ExceptionWithResponse => e
+        raise e if oauth_selected || e.is_a?(RestClient::TooManyRequests)
+
         puts "ERROR: #{e.message}: #{e.response}" unless opts[:quiet]
         "#{e.message}: #{e.response}" if opts[:quiet]
       rescue StandardError => e
+        raise e if oauth_selected
+
         case e.message
         when '400 Bad Request', '404 Resource Not Found'
           nil
@@ -579,7 +607,14 @@ module PWN
         raise 'ERROR: messages array is required' if messages.nil? || messages.empty?
 
         # OpenAI rejects Hash function.arguments / Hash content (422 map → string).
-        messages = PWN::AI::Agent::Loop.openai_wire_messages(messages: messages) if defined?(PWN::AI::Agent::Loop) && PWN::AI::Agent::Loop.respond_to?(:openai_wire_messages)
+        if defined?(PWN::AI::Agent::Loop) && PWN::AI::Agent::Loop.respond_to?(:openai_wire_messages)
+          originals = messages.grep(Hash)
+          messages = PWN::AI::Agent::Loop.openai_wire_messages(messages: messages)
+          messages.each_with_index do |msg, index|
+            native = originals[index][:_native_content] || originals[index]['_native_content']
+            msg[:_native_content] = native if native.is_a?(Array)
+          end
+        end
 
         model = opts[:model] ||= engine[:model]
 
@@ -602,6 +637,8 @@ module PWN
           model: model,
           messages: messages
         }
+        max_tokens = (engine[:max_tokens] || engine[:max_completion_tokens] || 16_384).to_i
+        http_body[:max_completion_tokens] = max_tokens if max_tokens.positive?
         http_body[:prompt_cache_key] = cache_key if cache_key
         unless reasoning
           temp = opts[:temp].to_f
@@ -611,9 +648,21 @@ module PWN
         http_body[:tools]       = opts[:tools]       if opts[:tools] && !opts[:tools].empty?
         http_body[:tool_choice] = opts[:tool_choice] if opts[:tool_choice]
 
+        endpoint = api_endpoint(model: model, tools: opts[:tools])
+        if endpoint == 'responses'
+          http_body = responses_http_body(
+            model: model,
+            messages: messages,
+            tools: opts[:tools],
+            tool_choice: opts[:tool_choice],
+            max_tokens: max_tokens,
+            reasoning_effort: opts[:reasoning_effort] || engine[:reasoning_effort]
+          )
+        end
+
         response = open_ai_rest_call(
           http_method: :post,
-          rest_call: 'chat/completions',
+          rest_call: endpoint,
           http_body: http_body,
           timeout: opts[:timeout],
           spinner: opts[:spinner],
@@ -622,10 +671,19 @@ module PWN
         return nil if response.nil?
 
         json_resp = JSON.parse(response, symbolize_names: true)
-        json_resp[:assistant_message] = json_resp.dig(:choices, 0, :message)
+        json_resp = parse_responses(raw: json_resp) if endpoint == 'responses'
+        json_resp[:assistant_message] ||= json_resp.dig(:choices, 0, :message)
         json_resp
       rescue StandardError => e
         raise e
+      end
+
+      public_class_method def self.api_endpoint(opts = {})
+        model = opts[:model].to_s.downcase
+        tools = opts[:tools]
+        return 'responses' if responses_api?(model: model, tools: tools)
+
+        'chat/completions'
       end
 
       # OpenAI reasoning-family models (o1 / o3 / o4 / gpt-5 reasoning) reject
@@ -633,7 +691,198 @@ module PWN
       # 'system'. Detect by prefix so future minor revisions still match.
       private_class_method def self.reasoning_model?(opts = {})
         m = opts[:model].to_s.downcase
-        m.start_with?('o1', 'o3', 'o4', 'o5') || m.include?('reason')
+        m.start_with?('o1', 'o3', 'o4', 'o5', 'gpt-5', 'gpt-6') || m.include?('reason') || m.include?('astra')
+      end
+
+      private_class_method def self.responses_api?(opts = {})
+        m = opts[:model].to_s.downcase
+        return true if m.start_with?('gpt-6') || m.include?('astra')
+        return true if m.include?('codex')
+
+        if m.match?(/\Agpt-5\.(\d+)/)
+          minor = m[/\Agpt-5\.(\d+)/, 1].to_i
+          return true if minor >= 4
+        end
+
+        false
+      end
+
+      private_class_method def self.responses_http_body(opts = {})
+        model = opts[:model]
+        max_tokens = opts[:max_tokens].to_i
+        instructions = []
+        input = []
+        Array(opts[:messages]).each do |msg|
+          role = (msg[:role] || msg['role']).to_s
+          content = msg[:content] || msg['content']
+          case role
+          when 'system', 'developer'
+            instructions << content.to_s unless content.to_s.empty?
+          when 'user'
+            input << { role: 'user', content: content }
+          when 'assistant'
+            native = msg[:_native_content] || msg['_native_content']
+            if native.is_a?(Array) && native.any?
+              input.concat(native)
+            else
+              Array(msg[:tool_calls] || msg['tool_calls']).each do |tc|
+                fn = tc[:function] || tc['function'] || {}
+                input << {
+                  type: 'function_call',
+                  call_id: tc[:id] || tc['id'],
+                  name: fn[:name] || fn['name'] || tc[:name],
+                  arguments: (fn[:arguments] || fn['arguments'] || tc[:arguments]).to_s
+                }
+              end
+              input << { role: 'assistant', content: content } unless content.to_s.empty?
+            end
+          when 'tool'
+            input << {
+              type: 'function_call_output',
+              call_id: msg[:tool_call_id] || msg['tool_call_id'],
+              output: content.to_s
+            }
+          else
+            input << { role: role, content: content } unless content.to_s.empty?
+          end
+        end
+
+        body = {
+          model: model,
+          input: input
+        }
+        body[:instructions] = instructions.join("\n") unless instructions.empty?
+        body[:max_output_tokens] = max_tokens if max_tokens.positive?
+        rtools = responses_tools(tools: opts[:tools])
+        body[:tools] = rtools unless rtools.empty?
+        tc = opts[:tool_choice]
+        if tc.is_a?(Hash)
+          fn = tc[:function] || tc['function'] || tc
+          name = fn[:name] || fn['name']
+          body[:tool_choice] = { type: 'function', name: name } if name
+        elsif !tc.to_s.empty?
+          body[:tool_choice] = tc
+        end
+        effort = opts[:reasoning_effort].to_s
+        body[:reasoning] = { effort: effort } if !effort.empty? && effort != 'none'
+        body
+      end
+
+      # Built-in endpoints are auth-specific; explicit compatible proxies remain
+      # operator-controlled. Never send subscription credentials over plain HTTP.
+      private_class_method def self.transport_base_uri(opts = {})
+        oauth_selected = opts[:oauth_selected]
+        default = oauth_selected ? 'https://chatgpt.com/backend-api/codex' : 'https://api.openai.com/v1'
+        return default unless real_config_value?(value: opts[:base_uri])
+
+        base_uri = opts[:base_uri].to_s.strip.sub(%r{/+\z}, '')
+        uri = URI.parse(base_uri)
+        return default if %w[api.openai.com chatgpt.com chat.openai.com].include?(uri.host.to_s.downcase)
+
+        raise ArgumentError, 'OpenAI OAuth custom endpoints require HTTPS' if oauth_selected && uri.scheme != 'https'
+
+        base_uri
+      end
+
+      # Match openai/codex core/src/client.rs and codex-api/src/common.rs:
+      # subscription requests stream, do not store, and omit sampling/token caps.
+      private_class_method def self.oauth_responses_body(opts = {})
+        body = opts[:http_body].dup
+        if body.key?(:messages)
+          body = responses_http_body(
+            model: body[:model], messages: body[:messages], tools: body[:tools],
+            tool_choice: body[:tool_choice], reasoning_effort: body[:reasoning_effort]
+          )
+        end
+        %i[temperature top_p max_tokens max_completion_tokens max_output_tokens].each { |key| body.delete(key) }
+        body[:include] = (Array(body[:include]) + ['reasoning.encrypted_content']).uniq
+        body.merge(instructions: body[:instructions].to_s, store: false, stream: true)
+      end
+
+      # RestClient buffers the SSE body; only a completed response is usable.
+      private_class_method def self.decode_responses_stream(opts = {})
+        output = {}
+        # SSE dispatches only blank-line-terminated frames, never a partial EOF.
+        opts[:response].to_s.split(/\r?\n\r?\n/, -1)[0...-1].each do |frame|
+          data = frame.lines.filter_map { |line| line.sub(/\Adata: ?/, '').strip if line.start_with?('data:') }.join("\n")
+          next if data.empty? || data == '[DONE]'
+
+          event = JSON.parse(data, symbolize_names: true)
+          output[event[:output_index]] = event[:item] if event[:type] == 'response.output_item.done' && event[:item].is_a?(Hash)
+          response = event[:response]
+          response = {} unless response.is_a?(Hash)
+          if %w[error response.failed response.incomplete].include?(event[:type]) || response[:error] ||
+             (response[:status] && event[:type] == 'response.completed' && response[:status] != 'completed')
+            detail = response.dig(:error, :message) || event.dig(:error, :message) ||
+                     response.dig(:incomplete_details, :reason) || event[:message] || response[:status]
+            raise "OpenAI #{event[:type]}: #{detail}"
+          end
+          next unless event[:type] == 'response.completed'
+
+          raise 'OpenAI response.completed missing response' if response.empty?
+
+          response[:output] ||= output.sort_by { |index, _| index.to_i }.map(&:last)
+          return response
+        end
+        raise 'OpenAI response stream closed before response.completed'
+      end
+
+      private_class_method def self.responses_tools(opts = {})
+        Array(opts[:tools]).filter_map do |tool|
+          fn = tool[:function] || tool['function'] || tool
+          name = fn[:name] || fn['name'] || tool[:name] || tool['name']
+          next if name.to_s.empty?
+
+          {
+            type: 'function',
+            name: name,
+            description: fn[:description] || fn['description'] || tool[:description],
+            parameters: fn[:parameters] || fn['parameters'] || { type: 'object', properties: {} },
+            strict: false
+          }
+        end
+      end
+
+      private_class_method def self.parse_responses(opts = {})
+        raw = opts[:raw]
+        raw = {} unless raw.is_a?(Hash)
+        output = Array(raw[:output] || raw['output'])
+        text = (raw[:output_text] || raw['output_text']).to_s
+        text_parts = []
+        tool_calls = []
+        output.each do |item|
+          next unless item.is_a?(Hash)
+
+          type = (item[:type] || item['type']).to_s
+          if type == 'function_call'
+            tool_calls << {
+              id: item[:call_id] || item['call_id'] || item[:id] || item['id'],
+              type: 'function',
+              function: {
+                name: item[:name] || item['name'],
+                arguments: (item[:arguments] || item['arguments']).to_s
+              }
+            }
+          elsif type == 'message' && text.empty?
+            Array(item[:content] || item['content']).each do |part|
+              next unless part.is_a?(Hash)
+
+              t = part[:text] || part['text']
+              text_parts << t.to_s if (part[:type] || part['type']).to_s.include?('text') && !t.to_s.empty?
+            end
+          end
+        end
+        text = text_parts.join if text.empty?
+        msg = {
+          role: 'assistant',
+          content: text.empty? ? nil : text,
+          tool_calls: tool_calls,
+          _native_content: output
+        }
+        raw.merge(
+          assistant_message: msg,
+          choices: [{ message: msg }]
+        )
       end
 
       private_class_method def self.remap_system_to_developer(opts = {})
@@ -1190,7 +1439,7 @@ module PWN
 
       public_class_method def self.help
         puts "USAGE:
-          # Run refresh oauth bearer token and return its result
+          # Refresh OAuth credentials and save them to the existing encrypted vault.
           #{self}.refresh_oauth_bearer_token(
             refresh_token: 'required - OpenAI/ChatGPT OAuth refresh_token',
             client_id: 'optional - defaults to Codex public client',
@@ -1201,7 +1450,8 @@ module PWN
             account_id: 'optional - account id value consumed by #refresh_oauth_bearer_token'
           )
 
-          # Run obtain oauth bearer token and return its result
+          # Enroll via device consent; cache and persist tokens without printing them.
+          # Returns the bearer: append '; nil' in a console to suppress its echo.
           #{self}.obtain_oauth_bearer_token(
             client_id: 'optional - Codex public client id',
             issuer: 'optional - defaults to https://auth.openai.com',
@@ -1217,6 +1467,12 @@ module PWN
           # Run get models and return its result
           #{self}.get_models
 
+          # Chat Completions vs Responses path for this model (tools may force Responses).
+          #{self}.api_endpoint(
+            model: 'required - OpenAI model id (e.g. gpt-6-astra or gpt-4o)',
+            tools: 'optional - tools array; gpt-6 and gpt-5.4+ with tools use responses'
+          )
+
           # Run chat with tools and return its result
           #{self}.chat_with_tools(
             messages: 'required - full OpenAI-format messages array (system/user/assistant/tool)',
@@ -1226,7 +1482,8 @@ module PWN
             temp: 'optional - temperature (defaults to PWN::Env[:ai][:openai][:temp] || 1)',
             timeout: 'optional - seconds (default 900)',
             spinner: 'optional - display spinner (default false)',
-            quiet: 'optional - quiet value consumed by #chat_with_tools'
+            quiet: 'optional - quiet value consumed by #chat_with_tools',
+            reasoning_effort: 'optional - Responses reasoning.effort (never none on gpt-6-astra)'
           )
 
           # Run chat and return its result

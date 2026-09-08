@@ -54,3 +54,35 @@ PWN::AI::Agent::Registry.register(
     PWN::Plugins::Jobs.result(id: args[:id] || args['id'], lines: args[:lines] || args['lines'])
   }
 )
+PWN::AI::Agent::Registry.register(
+  name: 'job_tail',
+  toolset: 'terminal',
+  schema: {
+    name: 'job_tail',
+    description: 'Tail a job log started by job_run.',
+    parameters: {
+      type: 'object',
+      properties: { id: { type: 'string' }, handle: { type: 'string' }, lines: { type: 'integer' } },
+      required: %w[id]
+    }
+  },
+  handler: lambda { |args|
+    PWN::Plugins::Jobs.job_tail(id: args[:id] || args[:handle] || args['id'], lines: args[:lines] || args['lines'])
+  }
+)
+PWN::AI::Agent::Registry.register(
+  name: 'job_kill',
+  toolset: 'terminal',
+  schema: {
+    name: 'job_kill',
+    description: 'Stop a job started by job_run.',
+    parameters: {
+      type: 'object',
+      properties: { id: { type: 'string' }, handle: { type: 'string' } },
+      required: %w[id]
+    }
+  },
+  handler: lambda { |args|
+    PWN::Plugins::Jobs.job_kill(id: args[:id] || args[:handle] || args['id'])
+  }
+)

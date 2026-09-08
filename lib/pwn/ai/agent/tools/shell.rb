@@ -56,11 +56,20 @@ PWN::AI::Agent::Registry.register(
                         .gsub(/\\+\s*\z/, '')
                         .strip
     timeout = PWN::AI::Agent::ToolGuard.deadline_s(timeout: args[:timeout], kind: :shell, payload: cmd)
+    if cmd.bytesize > PWN::AI::Agent::ToolGuard::MAX_PAYLOAD_BYTES
+      return PWN::AI::Agent::ToolGuard.invalid_payload(
+        hint: "command exceeds max payload size #{PWN::AI::Agent::ToolGuard::MAX_PAYLOAD_BYTES} bytes",
+        text: cmd,
+        byte_range: [PWN::AI::Agent::ToolGuard::MAX_PAYLOAD_BYTES, cmd.bytesize],
+        code: 'PAYLOAD_TOO_LARGE'
+      )
+    end
     if cmd.empty? || PWN::AI::Agent::ToolGuard.placeholder?(text: cmd)
       return PWN::AI::Agent::ToolGuard.invalid_payload(
         hint: 'command is required (string). Do not send ..., {...}, {…}, or empty. ' \
-              'Example: shell(command="uname -r").',
+              'Example: shell(command="uname -r"). Triple-dot inside quoted/heredoc bodies is allowed.',
         offending_token: '...',
+        text: cmd,
         code: 'SYNTAX_DENY',
         suggestion: 'replace ellipsis or placeholders with a concrete command'
       )

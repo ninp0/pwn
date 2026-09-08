@@ -39,6 +39,9 @@ PWN::AI::Agent::Metrics.load(opts)
 - `append_jsonl`
 - `summary`
 - `snapshot`
+- `record_tokens`
+- `usage`
+- `routing`
 - `to_context`
 - `proxy_trust`
 - `ucb`

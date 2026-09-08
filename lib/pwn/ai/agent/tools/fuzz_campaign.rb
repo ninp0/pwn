@@ -32,7 +32,16 @@ PWN::AI::Agent::Registry.register(
     when 'status'
       row = PWN::Plugins::Jobs.status(id: args[:id] || args['id'])
       out_dir = args[:out_dir] || args['out_dir']
-      out_dir ? row.merge(PWN::Plugins::AFLplusplus.parse_stats(out_dir: out_dir)) : row
+      row = row.merge(PWN::Plugins::AFLplusplus.parse_stats(out_dir: out_dir)) if out_dir
+      if out_dir && defined?(PWN::Plugins::AFLplusplus)
+        begin
+          triage = PWN::Plugins::AFLplusplus.crash_triage(out_dir: out_dir)
+          row = row.merge(triage: triage) if triage
+        rescue StandardError
+          nil
+        end
+      end
+      row
     when 'stop'
       PWN::Plugins::Jobs.stop(id: args[:id] || args['id'])
     when 'triage'

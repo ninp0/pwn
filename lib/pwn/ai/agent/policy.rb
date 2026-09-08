@@ -44,11 +44,20 @@ module PWN
         MAX_TRAJ   = 2_000
         GOLD_MIN   = 0.6
         VISITS_MIN = 2
+        CONTEXT_VISITS_MIN = 3
         COLD_EPISODES = 8
         WARM_EPISODES = 40
         TASK_MOD   = 16
         ACTION_MOD = 16
         EP_KEY     = :pwn_policy_episode
+        OPERATIONS = %w[read list search inspect write create update delete execute start stop status poll].freeze
+        RESULT_TYPES = %w[success failure timeout enoent eacces auth_required network syntax exit127 exit126 nonzero_exit handler_error invalid_payload].freeze
+        ARGUMENT_ROLES = {
+          'action' => 'operation', 'operation' => 'operation', 'op' => 'operation',
+          'path' => 'path', 'file' => 'path', 'directory' => 'path',
+          'command' => 'program', 'code' => 'program', 'query' => 'query',
+          'url' => 'url', 'timeout' => 'control', 'limit' => 'control'
+        }.freeze
 
         # ----------------------------------------------------------------
         # Feature → discrete state
@@ -110,7 +119,7 @@ module PWN
           tab[:q].each_value { |acts| pairs += acts.length if acts.is_a?(Hash) }
           return true if warmed && pairs >= COLD_EPISODES
 
-          traj_n = trajectories(limit: COLD_EPISODES).length
+          traj_n = trajectories(limit: COLD_EPISODES).count { |ep| !ep[:score].nil? }
           warmed && traj_n >= COLD_EPISODES
         rescue StandardError
           false
@@ -145,7 +154,7 @@ module PWN
           )
           ep = {
             session_id: sid,
-            request: opts[:request].to_s[0, 240],
+            request: opts[:request].to_s.dup,
             kind: normalize_kind(raw: opts[:kind]),
             intent: opts[:intent].to_s,
             engine: opts[:engine].to_s,
@@ -168,6 +177,9 @@ module PWN
         # step = PWN::AI::Agent::Policy.observe_step(
         #   session_id: 'optional - must match begin_episode when set',
         #   action: 'required - tool name',
+        #   args: 'optional - arguments, reduced to fixed roles/types, never stored raw',
+        #   operation: 'optional - known operation override; otherwise derived from args',
+        #   result_type: 'optional - Reward.semantic_ok shape; fixed allowlist only',
         #   ok: 'required - Boolean, Reward.semantic_ok',
         #   duration: 'optional - Float seconds',
         #   ts_state: 'optional - TaskSummarizer state',
@@ -211,9 +223,14 @@ module PWN
             engine: ep[:engine],
             ts_state: opts[:ts_state]
           )
+          context = action_context(opts)
+          context_s2 = contextual_state(state: s2, action: action, context: context)
           trans = {
             state: s,
             action: action,
+            action_context: context,
+            context_state: ep[:context_state],
+            next_context_state: context_s2,
             reward: reward,
             next_state: s2,
             ok: ok,
@@ -222,6 +239,7 @@ module PWN
           }
           ep[:steps] << trans
           ep[:state] = s2
+          ep[:context_state] = context_s2
           ep[:last_action] = action
           trans
         rescue StandardError => e
@@ -278,15 +296,19 @@ module PWN
           ep[:steps].last[:terminal] = true
           ep[:score] = opts[:score]
           ep[:verdict] = opts[:verdict]
-          ep[:return] = discounted_return(steps: ep[:steps])
+          ep[:return] = opts[:score].nil? ? nil : discounted_return(steps: ep[:steps])
           ep[:ended_at] = Time.now.utc.iso8601
 
           n_td = 0
           n_pg = 0
           ep[:steps].each_with_index do |tr, idx|
-            n_td += 1 if update_q!(transition: tr)
+            next if opts[:score].nil?
+
             g = discounted_return(steps: ep[:steps][idx..])
-            n_pg += 1 if update_pg!(state: tr[:state], action: tr[:action], advantage: g - value(state: tr[:state]))
+            transition_variants(transition: tr).each do |variant|
+              n_td += 1 if update_q!(transition: variant)
+              n_pg += 1 if update_pg!(state: variant[:state], action: variant[:action], advantage: g - value(state: variant[:state]))
+            end
           end
 
           persist_episode!(episode: ep)
@@ -401,11 +423,16 @@ module PWN
 
           tab = load
           visits = read_visit(table: tab, state: s, action: a)
-          qsa = smoothed_q(table: tab, state: s, action: a)
+          context = opts[:context_state]
+          context = nil unless context.to_s.start_with?("#{s}~ctx:")
+          contextual_visits = read_visit(table: tab, state: context, action: a)
+          qsa = routing_q(table: tab, state: s, context_state: context, action: a)
           # Tiny visit counts stay at 0 unless the value is already decisive.
-          return 0.0 if visits < VISITS_MIN && qsa.abs < 0.08
+          return 0.0 if contextual_visits < CONTEXT_VISITS_MIN && visits < VISITS_MIN && qsa.abs < 0.08
 
-          (qsa - max_q(table: tab, state: s)).round(4)
+          actions = ((tab[:q][s.to_s.to_sym] || {}).keys + (tab[:q][context.to_s.to_sym] || {}).keys).uniq
+          baseline = actions.map { |act| routing_q(table: tab, state: s, context_state: context, action: act) }.max || 0.0
+          (qsa - baseline).clamp(-1.0, 1.0).round(4)
         rescue StandardError
           0.0
         end
@@ -432,7 +459,8 @@ module PWN
           return { action: actions.sample, reason: :explore, state: s, epsilon: eps } if rand < eps
 
           tab = load
-          scored = actions.map { |a| [a, smoothed_q(table: tab, state: s, action: a)] }
+          context = opts.key?(:context_state) ? opts[:context_state] : (current_context_state if s == current_state)
+          scored = actions.map { |a| [a, routing_q(table: tab, state: s, context_state: context, action: a)] }
           best = scored.max_by { |_, v| v }
           { action: best[0], q: best[1].round(4), reason: :greedy, state: s, ranked: scored.sort_by { |_, v| -v } }
         rescue StandardError => e
@@ -446,6 +474,13 @@ module PWN
 
         public_class_method def self.current_episode
           Thread.current[EP_KEY]
+        end
+
+        # Previous action features are available BEFORE the next tool choice;
+        # the candidate's own result must never leak into its decision state.
+        public_class_method def self.current_context_state
+          ep = current_episode
+          ep.is_a?(Hash) ? ep[:context_state] : nil
         end
 
         # Hermes split: snapshot + clear the live episode so Loop.maybe_finish_policy
@@ -538,7 +573,7 @@ module PWN
         # Does not write. Used by task 7 (evaluate policy quality).
 
         public_class_method def self.evaluate(opts = {})
-          rows = trajectories(limit: opts[:limit] || 200)
+          rows = trajectories(limit: opts[:limit] || 200).reject { |ep| ep[:score].nil? }
           return { n: 0, mean_return: nil, greedy_match: nil, mean_abs_td: nil } if rows.empty?
 
           tab = load
@@ -705,6 +740,9 @@ module PWN
             #{self}.observe_step(
               session_id: 'optional - must match begin_episode when set',
               action: 'required - tool name',
+              args: 'optional - arguments reduced to fixed roles/types only',
+              operation: 'optional - allowlisted operation override',
+              result_type: 'optional - allowlisted semantic result shape',
               ok: 'required - Boolean, Reward.semantic_ok',
               duration: 'optional - Float seconds',
               ts_state: 'optional - TaskSummarizer state',
@@ -750,13 +788,15 @@ module PWN
             # Q(s,a) − V(s). Unknown / cold-start pairs return 0 so rank is unchanged
             #{self}.advantage(
               state: 'optional - state value consumed by #advantage (defaults to current_state)',
-              action: 'optional - action value consumed by #advantage'
+              action: 'optional - action value consumed by #advantage',
+              context_state: 'optional - previous action context supplied by Registry'
             )
 
             # Run recommend and return its result
             #{self}.recommend(
               state: 'optional - default current episode state',
               actions: 'required - Array of tool names',
+              context_state: 'optional - previous action context (default live context)',
               epsilon: 'optional - explore probability (default EPSILON)'
             )
 
@@ -765,6 +805,9 @@ module PWN
 
             # Run current episode and return its result
             #{self}.current_episode
+
+            # Sanitized previous-action state used for advisory routing
+            #{self}.current_context_state
 
             # Hermes split: snapshot + clear the live episode so Loop.maybe_finish_policy
             #{self}.detach_episode!
@@ -830,6 +873,74 @@ module PWN
 
         private_class_method def self.blank_table
           { q: {}, h: {}, visits: {}, returns: [], n_updates: 0, td_abs_sum: 0.0, updated_at: nil }
+        end
+
+        private_class_method def self.contextual_state(opts = {})
+          "#{opts[:state]}~ctx:a#{action_bucket(name: opts[:action])}:#{JSON.generate(opts[:context])}"
+        end
+
+        private_class_method def self.transition_variants(opts = {})
+          tr = opts[:transition]
+          return [tr] if tr[:context_state].to_s.empty?
+
+          [tr, tr.merge(state: tr[:context_state], next_state: tr[:next_context_state])]
+        end
+
+        # Shrink sparse contextual values toward the existing broad Q table.
+        # A strict sample floor prevents a single unusual call moving rank.
+        private_class_method def self.routing_q(opts = {})
+          broad = smoothed_q(table: opts[:table], state: opts[:state], action: opts[:action])
+          context = opts[:context_state]
+          return broad unless context.to_s.start_with?("#{opts[:state]}~ctx:")
+
+          n = read_visit(table: opts[:table], state: context, action: opts[:action])
+          return broad if n < CONTEXT_VISITS_MIN
+
+          specific = read_q(table: opts[:table], state: context, action: opts[:action])
+          weight = n.to_f / (n + CONTEXT_VISITS_MIN)
+          ((weight * specific) + ((1.0 - weight) * broad)).round(5)
+        end
+
+        # No arbitrary keys, values, lengths, hashes, paths, or class names.
+        # Nested containers are represented by type only, not traversed.
+        private_class_method def self.action_context(opts = {})
+          args = opts[:args]
+          operation = opts[:operation]
+          operation = args[:operation] || args['operation'] || args[:action] || args['action'] || args[:op] || args['op'] if operation.nil? && args.is_a?(Hash)
+          operation ||= 'execute' if %w[shell pwn_eval].include?(opts[:action].to_s)
+          operation = operation.to_s.downcase
+          operation = 'other' unless OPERATIONS.include?(operation)
+          arguments = { shape: feature_type(value: args) }
+          if args.is_a?(Hash)
+            size = if args.empty?
+                     'empty'
+                   elsif args.length <= 4
+                     'few'
+                   else
+                     'many'
+                   end
+            features = args.map do |key, value|
+              role = ARGUMENT_ROLES.fetch(key.to_s, 'other')
+              "#{role}:#{feature_type(value: value)}"
+            end.uniq.sort
+            arguments.merge!(size: size, features: features)
+          end
+          result = opts[:result_type].to_s
+          result = opts[:ok] ? 'success' : 'failure' if result.empty?
+          result = 'other' unless RESULT_TYPES.include?(result)
+          { operation: operation, arguments: arguments, result_type: result }
+        end
+
+        private_class_method def self.feature_type(opts = {})
+          case opts[:value]
+          when Hash then 'object'
+          when Array then 'array'
+          when String, Symbol then 'string'
+          when Numeric then 'number'
+          when true, false then 'boolean'
+          when nil then 'null'
+          else 'other'
+          end
         end
 
         private_class_method def self.normalize_kind(opts = {})
@@ -1073,6 +1184,7 @@ module PWN
           vals = []
           tab[:q].each do |key, acts|
             next unless acts.is_a?(Hash) && acts.key?(act)
+            next if key.to_s.include?('~ctx:')
 
             ks = key.to_s.split('|')
             next unless ks[0] == kind && ks[1] == task && ks[-1] == eng
@@ -1092,11 +1204,19 @@ module PWN
           return { skipped: :no_traj } unless File.exist?(TRAJECTORY_FILE)
 
           tab = load
-          rows = trajectories(limit: opts[:limit] || 400)
+          rows = trajectories(limit: opts[:limit] || 400).reject { |ep| ep[:score].nil? }
+          context_counts = Hash.new(0)
+          rows.each do |ep|
+            Array(ep[:steps]).each do |tr|
+              next if tr[:context_state].to_s.empty? || tr[:action].to_s.empty?
+
+              context_counts[[tr[:context_state].to_s.to_sym, tr[:action].to_s.to_sym]] += 1
+            end
+          end
           n = 0
           2.times do
             rows.reverse_each do |ep|
-              Array(ep[:steps]).each do |tr|
+              Array(ep[:steps]).flat_map { |tr| transition_variants(transition: tr) }.each do |tr|
                 s = tr[:state].to_s
                 a = tr[:action].to_s
                 next if s.empty? || a.empty?
@@ -1109,12 +1229,18 @@ module PWN
                 target = r + (GAMMA * max_n)
                 td = target - qsa
                 write_q!(table: tab, state: s, action: a, value: qsa + (ALPHA * td))
-                bump_visit!(table: tab, state: s, action: a)
+                bump_visit!(table: tab, state: s, action: a) unless s.include?('~ctx:')
                 tab[:n_updates] = tab[:n_updates].to_i + 1
                 tab[:td_abs_sum] = tab[:td_abs_sum].to_f + td.abs
                 n += 1
               end
             end
+          end
+          # Replay is not new evidence: restore observed counts, never count
+          # the two passes (or repeated warmups) as independent samples.
+          context_counts.each do |(s, a), count|
+            tab[:visits][s] ||= {}
+            tab[:visits][s][a] = [tab[:visits][s][a].to_i, count].max
           end
           # Credit stored returns toward the episode budget so greedy
           # suggestions are not omitted after a successful replay of a
@@ -1151,12 +1277,12 @@ module PWN
           return unless ep.is_a?(Hash)
 
           tab = load
-          tab[:returns] = (Array(tab[:returns]) + [ep[:return].to_f]).last(200)
+          tab[:returns] = (Array(tab[:returns]) + [ep[:return].to_f]).last(200) unless ep[:score].nil?
           save(table: tab)
           FileUtils.mkdir_p(File.dirname(TRAJECTORY_FILE))
           row = {
             session_id: ep[:session_id],
-            request: ep[:request],
+            request_family: task_family(text: ep[:request]),
             kind: ep[:kind],
             engine: ep[:engine],
             started_at: ep[:started_at],

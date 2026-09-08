@@ -40,6 +40,7 @@ PWN::Plugins::Radare2.required_bins(opts)
 - `close`
 - `functions`
 - `xrefs_to`
+- `xrefs_from`
 - `disasm`
 - `strings`
 - `imports`

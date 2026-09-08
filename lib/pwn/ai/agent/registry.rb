@@ -276,7 +276,7 @@ module PWN
             ucb   = defined?(Metrics) && Metrics.respond_to?(:ucb) ? Metrics.ucb(name: e.name) : 0.5
             prm   = defined?(Metrics) && Metrics.respond_to?(:prm_advantage) ? Metrics.prm_advantage(name: e.name) : 0.0
             qadv  = if eps_q.positive? && pol_state
-                      Policy.advantage(state: pol_state, action: e.name)
+                      Policy.advantage(state: pol_state, action: e.name, context_state: Policy.current_context_state)
                     else
                       0.0
                     end

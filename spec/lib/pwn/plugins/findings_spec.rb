@@ -37,6 +37,8 @@ describe PWN::Plugins::Findings do
       child = described_class.chain(parent_id: parent[:id], title: 'account-takeover', poc_artifacts: [poc], severity: 'high')
       expect(child[:chain_parent_id]).to eq(parent[:id])
       expect(child[:composite_severity]).to eq('high')
+      score = described_class.chain_score(ids: [parent[:id], child[:id]])
+      expect(score[:combined_severity]).to eq('critical')
     end
   end
 

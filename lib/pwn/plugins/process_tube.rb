@@ -20,9 +20,9 @@ module PWN
 
         argv = cmd.is_a?(Array) ? cmd.map(&:to_s) : ['bash', '-lc', cmd.to_s]
         r, w, pid = PTY.spawn(*argv)
-        id = "tube_#{pid}"
-        @tubes[id] = { r: r, w: w, pid: pid, buf: +'', started_at: Time.now, last_io: Time.now }
-        { id: id, pid: pid }
+        name = (opts[:name] || "tube_#{pid}").to_s
+        @tubes[name] = { r: r, w: w, pid: pid, buf: +'', started_at: Time.now, last_io: Time.now, name: name, scrollback: +'' }
+        { id: name, pid: pid, name: name }
       end
 
       public_class_method def self.connect(opts = {})
@@ -41,6 +41,8 @@ module PWN
         line = opts[:line] || opts[:data] || ''
         t[:w].write("#{line}\n")
         t[:w].flush
+        t[:last_io] = Time.now
+        t[:scrollback] = (t[:scrollback].to_s + "#{line}\n")[-65_536, 65_536] || (t[:scrollback].to_s + "#{line}\n")
         line.to_s
       end
 
@@ -69,13 +71,14 @@ module PWN
 
       public_class_method def self.close(opts = {})
         t = tube!(opts)
+        dump_scrollback(tube: t, id: opts[:id] || opts[:name])
         t[:w].close
         t[:r].close
         Process.kill('TERM', t[:pid]) if t[:pid]
-        @tubes.delete(opts[:id].to_s)
+        @tubes.delete((opts[:id] || opts[:name]).to_s)
         true
       rescue StandardError
-        @tubes.delete(opts[:id].to_s)
+        @tubes.delete((opts[:id] || opts[:name]).to_s)
         false
       end
 
@@ -137,7 +140,8 @@ module PWN
           # Run spawn and return its result
           #{self}.spawn(
             cmd: 'required - command string to run (defaults to opts[:command])',
-            command: 'optional - command value consumed by #spawn'
+            command: 'optional - command value consumed by #spawn',
+            name: 'optional - persistent session name reused across tool calls'
           )
 
           # Connect a TCP tube with the same write_line/recvuntil API as spawn.
@@ -202,11 +206,24 @@ module PWN
       end
 
       private_class_method def self.tube!(opts = {})
-        id = opts[:id].to_s
+        id = (opts[:id] || opts[:name]).to_s
         t = @tubes[id]
         raise 'ERROR: id is required / unknown tube' unless t
 
         t
+      end
+
+      private_class_method def self.dump_scrollback(opts = {})
+        t = opts[:tube]
+        return unless t
+
+        body = t[:scrollback].to_s + t[:buf].to_s
+        return if body.empty?
+        return unless defined?(PWN::Plugins::ArtifactRegistry)
+
+        PWN::Plugins::ArtifactRegistry.put(bytes: body, kind: 'pty-scrollback', tags: ['pty', opts[:id].to_s])
+      rescue StandardError
+        nil
       end
     end
   end

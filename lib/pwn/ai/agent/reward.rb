@@ -162,6 +162,7 @@ module PWN
             else
               v[:score] = raw
             end
+
             v[:verdict] = if v[:score] >= 0.6 then :solved
                           elsif v[:score] >= 0.3 then :partial
                           else :wrong
@@ -172,59 +173,33 @@ module PWN
 
           ground = verify_as_reward(final: final)
           unless ground.nil?
-            # Ground-truth override: a browser-refuted claim caps score at
-            # 0.2 regardless of how confident the judge was; a confirmed
-            # claim floors it at 0.6. E3.
+            # A refuted claim is negative evidence. Confirming one claim
+            # does not establish completion of the entire operator request.
             v[:score] = [v[:score], 0.2].min if ground[:verdict] == :refuted
-            v[:score] = [v[:score], 0.6].max if ground[:verdict] == :confirmed
             v[:grounded] = ground
             v[:confidence] = [v[:confidence].to_f, ground[:confidence].to_f].max if ground[:confidence]
           end
 
-          pass = final.match?(/\bPASS\b/) && !(defined?(Learning) && final.match?(Learning::FAILURE_FINAL_RX))
           v[:judge_score] = v[:score].to_f
-          vv = opts[:verifier_verdict]
-          vv = :pass if vv.nil? && (opts[:verifier_pass] == true || pass || (ground && ground[:verdict] == :confirmed))
-          vv = vv.to_s.to_sym if vv
-          v[:verifier_verdict] = vv
-          v[:verdict_class] = taxonomy_class(opts.merge(score: v[:score], verifier_verdict: vv, request: request, final: final))
+          v[:verification] = request_verification(request: request, session_id: opts[:session_id])
+          v = resolve_outcome(outcome: v, critic_pass: opts[:critic_pass])
+          v[:verdict_class] = taxonomy_class(opts.merge(score: v[:score], verifier_verdict: v[:verifier_verdict], request: request, final: final))
           v[:remediation_hint] = taxonomy_hint(verdict_class: v[:verdict_class])
-          prec = verifier_precedence?
-          if prec && vv == :pass
-            v[:success] = true
-          else
-            v[:success] = promote_to_success?(
-              orm: v[:source].to_s != 'heuristic' && v[:score].to_f >= 0.6,
-              verify: if ground.nil?
-                        nil
-                      else
-                        ground[:verdict] == :confirmed
-                      end,
-              critic: opts.key?(:critic_pass) ? opts[:critic_pass] : nil
-            )
-          end
           v[:needs_spot_check] = v[:success] && v[:score].to_f >= 0.85 && (rand < 0.05)
           v[:engine] = eng
           v[:task_class] = request.match?(/analy[sz]e|summar|strength|weakness|fitness/i) ? 'analysis' : 'operational'
-          if pass
-            score = v[:score].to_f
-            v[:score] = [score, 0.6].max
-            v[:success] = true if prec
-            v[:verifier_verdict] ||= :pass
-            v[:verdict] = :solved
-          end
           v[:score_components] ||= {
             judge: v[:score].to_f,
-            overlap: pass ? 0.0 : nil,
+            overlap: nil,
             checks: 0.0,
-            weights: { overlap: pass ? 0.0 : 0.15 }
+            weights: { overlap: 0.15 }
           }
-          v[:score_components][:weights][:overlap] = 0.0 if pass
           if commit && defined?(Learning) && opts[:persist_components]
             Learning.note_outcome(
               task: request[0, 80],
               success: v[:success],
               score: v[:score],
+              outcome: v,
               details: v[:score_components].to_json,
               verifier_verdict: v[:verifier_verdict],
               verdict_class: v[:verdict_class]
@@ -232,7 +207,7 @@ module PWN
           end
           # W3 — write Brier on every judged turn so overconfidence can
           # throttle max_iters/critic even when plan_first never fired.
-          if commit
+          if commit && !v[:training_score].nil?
             pred = opts[:predicted]
             pred = Thread.current[:pwn_plan_predicted] if pred.nil?
             pred = v[:confidence] if pred.nil?
@@ -240,10 +215,103 @@ module PWN
           end
           # P1 — sentinel stores confidence so distrust math can haircut
           # heuristic-heavy windows differently from LLM ORM windows.
-          record_sentinel(proxy: opts[:proxy_ok], judge: v[:score], confidence: v[:confidence], source: v[:source]) if commit
+          record_sentinel(v.slice(:training_score, :decision_version, :verdict, :confidence, :source).merge(proxy: opts[:proxy_ok], judge: v[:training_score])) if commit && !v[:training_score].nil?
           v
         rescue StandardError => e
-          { score: 0.5, verdict: :unknown, rationale: "judge error: #{e.class}", success: !final.strip.empty?, error: e.message, confidence: 0.2, source: :error }
+          resolve_outcome(outcome: { score: nil, rationale: "judge error: #{e.class}", error: e.message, confidence: 0.0, source: :error })
+        end
+
+        # The sole outcome decision. Scores are diagnostic; training_score
+        # is absent when the evaluator cannot supply a reliable label.
+        public_class_method def self.resolve_outcome(opts = {})
+          v = (opts[:outcome] || {}).dup
+          source = (v[:source] || v[:judge_source]).to_s
+          score = v[:score]
+          score = score.to_f.clamp(0.0, 1.0) unless score.nil?
+          verification = v[:verification]
+          checked = verification.is_a?(Hash) && valid_verification_checks?(checks: verification[:checks])
+          vv = if checked
+                 verification[:checks].all? { |c| c[:passed] } ? :pass : :fail
+               end
+          v[:verifier_verdict] = vv
+          v[:confidence] = 1.0 if vv
+          if vv == :fail || v.dig(:grounded, :verdict).to_s == 'refuted'
+            score = [score || 0.0, 0.2].min
+            success = false
+          elsif vv == :pass && verifier_precedence?
+            score = [score || 0.0, 0.6].max
+            success = true
+          elsif score.nil? || source == 'error'
+            success = nil
+          elsif source.start_with?('heuristic')
+            success = false
+          elsif opts[:critic_pass] == false || v[:critic_pass] == false
+            if score >= 0.6
+              success = nil
+            else
+              score = [score, 0.3].min
+              success = false
+            end
+          else
+            success = score >= 0.6
+          end
+          known = !success.nil? && (!source.start_with?('heuristic') || !vv.nil?)
+          verdict = if !known then :unknown
+                    elsif success then :solved
+                    elsif score >= 0.3 then :partial
+                    else :wrong
+                    end
+          v.merge(score: score, success: success, verdict: verdict,
+                  critic_pass: opts.fetch(:critic_pass, v[:critic_pass]),
+                  training_score: known ? score : nil, decision_version: 1)
+        end
+
+        # Trusted host-verifier API, deliberately NOT a model-facing tool.
+        # Caller must actually check every original-request criterion. Never
+        # construct these records by parsing an assistant/tool claim of PASS.
+        public_class_method def self.record_verification(opts = {})
+          request = opts[:request].to_s
+          sid = opts[:session_id].to_s
+          checks = opts[:checks]
+          raise ArgumentError, 'nonempty complete request checks required' unless valid_verification_checks?(checks: checks)
+
+          rows = PWN::Sessions.load(session_id: sid)
+          user = rows.reverse.find { |row| row[:role].to_s == 'user' }
+          raise ArgumentError, 'verification must match the current session request' if request.empty? || !user || user[:content].to_s != request
+
+          record = { request_digest: Digest::SHA256.hexdigest(request), session_id: sid, checks: checks }
+          PWN::Sessions.append(session_id: sid, role: 'verification', content: JSON.generate(record))
+          record
+        end
+
+        private_class_method def self.valid_verification_checks?(opts = {})
+          checks = opts[:checks]
+          checks.is_a?(Array) && !checks.empty? && checks.all? do |check|
+            check.is_a?(Hash) && !check[:criterion].to_s.strip.empty? &&
+              [true, false].include?(check[:passed]) && !check[:evidence].to_s.strip.empty?
+          end
+        end
+
+        private_class_method def self.request_verification(opts = {})
+          sid = opts[:session_id].to_s
+          return nil if sid.empty?
+
+          rows = PWN::Sessions.load(session_id: sid)
+          user_idx = rows.rindex { |row| row[:role].to_s == 'user' }
+          return nil unless user_idx && rows[user_idx][:content].to_s == opts[:request].to_s
+
+          verification_idx = rows.rindex { |entry| entry[:role].to_s == 'verification' }
+          return nil unless verification_idx && verification_idx > user_idx
+          return nil if rows[(verification_idx + 1)..].any? { |entry| entry[:role].to_s == 'tool' }
+
+          row = rows[verification_idx]
+          record = JSON.parse(row[:content].to_s, symbolize_names: true)
+          return nil unless record[:session_id] == sid && record[:request_digest] == Digest::SHA256.hexdigest(opts[:request].to_s)
+          return nil unless valid_verification_checks?(checks: record[:checks])
+
+          record
+        rescue StandardError
+          nil
         end
 
         public_class_method def self.promote_to_success?(opts = {})
@@ -509,7 +577,7 @@ module PWN
           need = SENTINEL_WINDOW - have
           limit = (opts[:limit] || [need * 4, 200].max).to_i
           # Prefer scored rows; fall back to success-boolean so local hosts still warm.
-          rows = Learning.outcomes(limit: limit)
+          rows = Learning.outcomes(limit: limit).select { |r| sentinel_outcome_known?(outcome: r) }
           scored, unscored = rows.partition { |r| !r[:score].nil? }
           ordered = scored.reverse + unscored.reverse
           added = 0
@@ -1568,12 +1636,23 @@ module PWN
           nil
         end
 
+        private_class_method def self.sentinel_outcome_known?(opts = {})
+          row = opts[:outcome] || {}
+          return false if row[:verdict].to_s == 'unknown'
+          return !row[:training_score].nil? if row.key?(:training_score) || row.key?(:decision_version)
+
+          source = (row[:source] || row[:judge_source]).to_s
+          return false if source.start_with?('heuristic') || source == 'error'
+
+          !row[:judge].nil? || !row[:score].nil? || [true, false, 'true', 'false', 'soft'].include?(row[:success])
+        end
+
         private_class_method def self.record_sentinel(opts = {})
           s = normalize_sentinel(raw: load_sentinel)
           # Clamp judge to [0,1] — LLM/heuristic should already, but a bad
           # write must not poison rolling means forever.
           judge = opts[:judge].to_f.clamp(0.0, 1.0)
-          entry = { judge: judge, at: Time.now.utc.iso8601 }
+          entry = opts.slice(:training_score, :decision_version, :verdict).merge(judge: judge, at: Time.now.utc.iso8601)
           # P1 — optional per-sample confidence (heuristic < LLM ORM)
           entry[:confidence] = opts[:confidence].to_f.clamp(0.0, 1.0) unless opts[:confidence].nil?
           entry[:source] = opts[:source].to_s unless opts[:source].to_s.empty?
@@ -1646,10 +1725,15 @@ module PWN
         private_class_method def self.normalize_sentinel(opts = {})
           raw = opts.is_a?(Hash) && opts.key?(:raw) ? opts[:raw] : opts
           s = (raw.is_a?(Hash) ? raw.dup : empty_sentinel)
-          s[:window] = Array(s[:window]).map do |e|
-            next nil unless e.is_a?(Hash)
-
-            h = { judge: e[:judge].to_f.clamp(0.0, 1.0) }
+          window = Array(s[:window])
+          known = window.select { |e| e.is_a?(Hash) && sentinel_outcome_known?(outcome: e) }
+          if known.length < window.length
+            s[:proxy_distrust] = 0.0
+            s.delete(:distrust_at)
+            s[:distrust_meta] = { reason: 'unknown_outcomes_removed', cleared: true }
+          end
+          s[:window] = known.map do |e|
+            h = e.slice(:training_score, :decision_version, :verdict).merge(judge: e[:judge].to_f.clamp(0.0, 1.0))
             h[:at] = e[:at] if e[:at]
             h[:source] = e[:source].to_s unless e[:source].to_s.empty?
             h[:confidence] = e[:confidence].to_f.clamp(0.0, 1.0) unless e[:confidence].nil?
@@ -1837,9 +1921,21 @@ module PWN
               critic_pass: 'optional - critic pass value consumed by #judge',
               predicted: 'optional - predicted value consumed by #judge',
               proxy_ok: 'optional - proxy ok value consumed by #judge',
-              persist_components: 'optional - write score_components into the learning ledger',
-              verifier_verdict: 'optional - :pass when a deterministic verifier already succeeded',
-              verifier_pass: 'optional - true as a boolean alias for verifier_verdict :pass'
+              persist_components: 'optional - persist the resolved outcome and score components'
+            )
+
+            # Trusted host verifier only: actually check ALL original-request criteria.
+            # PASS prose, exit zero, and single confirmed claims are not substitutes.
+            #{self}.record_verification(
+              request: 'required - exact current session user request',
+              session_id: 'required - session holding the request and verification',
+              checks: 'required - complete Array of {criterion:, passed: Boolean, evidence:}'
+            )
+
+            # Shared verdict and training eligibility; unknown training_score is nil.
+            #{self}.resolve_outcome(
+              outcome: 'required - outcome Hash from the judge or trusted evaluator',
+              critic_pass: 'optional - false records a critic disagreement'
             )
 
             # Run promote to success and return its result

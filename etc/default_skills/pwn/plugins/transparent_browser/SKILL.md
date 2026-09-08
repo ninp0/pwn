@@ -56,6 +56,9 @@ PWN::Plugins::TransparentBrowser.open(opts)
 - `jmp_devtools_panel`
 - `close`
 - `evidence`
+- `intercept`
+- `har_export`
+- `replay`
 - `authors`
 - `help`
 - `evidence!`

@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require 'spec_helper'
+require 'tmpdir'
 
 describe PWN::AI::Agent::Registry do
   it 'should display information for authors' do
@@ -44,6 +45,67 @@ describe PWN::AI::Agent::Registry do
     expect(names).to eq(described_class::CORE_TOOLS)
     expect(names).not_to include('sessions_view')
     expect(names.length).to eq(described_class::CORE_TOOLS.length)
+  end
+
+  describe 'contextual policy routing' do
+    let(:policy) { PWN::AI::Agent::Policy }
+    let(:entries) do
+      %w[alpha beta].map do |name|
+        described_class::Entry.new(name: name, toolset: 'test', schema: { description: 'inspect' })
+      end
+    end
+
+    around do |example|
+      Dir.mktmpdir do |tmp|
+        @policy_dir = tmp
+        example.run
+      ensure
+        policy.attach_episode!(episode: nil)
+      end
+    end
+
+    before do
+      stub_const('PWN::AI::Agent::Policy::POLICY_FILE', File.join(@policy_dir, 'policy.json'))
+      stub_const('PWN::AI::Agent::Policy::TRAJECTORY_FILE', File.join(@policy_dir, 'policy_traj.jsonl'))
+      allow(policy).to receive(:enabled?).and_return(true)
+      allow(policy).to receive(:cold?).and_return(true)
+      allow(policy).to receive(:warm?).and_return(false)
+      allow(PWN::AI::Agent::Metrics).to receive_messages(advantage: 0.0, ucb: 0.0, prm_advantage: 0.0, prm_n: 0, proxy_trust: 1.0)
+    end
+
+    {
+      operations: [{ operation: 'read' }, { operation: 'search' }],
+      argument_features: [{ args: { path: '/not-stored' } }, { args: { query: 'not-stored' } }],
+      result_types: [{ result_type: :enoent, ok: false }, { result_type: :timeout, ok: false }]
+    }.each do |feature, contexts|
+      it "learns opposite next-tool rankings from sanitized previous #{feature}" do
+        3.times do
+          contexts.each_with_index do |context, index|
+            %w[alpha beta].each do |action|
+              policy.begin_episode(request: 'inspect')
+              policy.observe_step({ action: 'file', operation: 'read', ok: true }.merge(context))
+              policy.observe_step(action: action, ok: true)
+              score = index.zero? == (action == 'alpha') ? 1.0 : 0.0
+              policy.finish(score: score)
+            end
+          end
+        end
+
+        contexts.each_with_index do |context, index|
+          policy.begin_episode(request: 'inspect')
+          observation = { action: 'file', operation: 'read', ok: true }.merge(context)
+          observation[:args] = context[:args].transform_values { 'different-value' } if context[:args]
+          policy.observe_step(observation)
+          ranked = described_class.rank(query: 'inspect', entries: entries, preference: []).map(&:name)
+          expected = index.zero? ? %w[alpha beta] : %w[beta alpha]
+          expect(ranked).to eq(expected)
+          expect(policy.recommend(actions: %w[alpha beta], epsilon: 0.0)[:action]).to eq(expected.first)
+        end
+
+        lexical = described_class::Entry.new(name: 'lexical', toolset: 'test', schema: { description: 'inspect priority' })
+        expect(described_class.rank(query: 'inspect priority', entries: entries + [lexical], preference: []).first.name).to eq('lexical')
+      end
+    end
   end
 
   it 'pins pentest and RE tools when the request is offensive-security work' do

@@ -10,12 +10,12 @@ PWN::AI::Agent::Registry.register(
     description: 'Open a persistent PTY (gdb, r2, ssh, sh). Returns {id, pid}.',
     parameters: {
       type: 'object',
-      properties: { cmd: { type: 'string' }, command: { type: 'string' } },
+      properties: { cmd: { type: 'string' }, command: { type: 'string' }, name: { type: 'string' } },
       required: %w[cmd]
     }
   },
   handler: lambda { |args|
-    PWN::Plugins::ProcessTube.spawn(cmd: args[:cmd] || args[:command] || args['cmd'])
+    PWN::Plugins::ProcessTube.spawn(cmd: args[:cmd] || args[:command] || args['cmd'], name: args[:name] || args['name'])
   }
 )
 PWN::AI::Agent::Registry.register(
@@ -26,12 +26,12 @@ PWN::AI::Agent::Registry.register(
     description: 'Write a line to a PTY opened by pty_open.',
     parameters: {
       type: 'object',
-      properties: { id: { type: 'string' }, line: { type: 'string' }, data: { type: 'string' } },
+      properties: { id: { type: 'string' }, name: { type: 'string' }, line: { type: 'string' }, data: { type: 'string' } },
       required: %w[id]
     }
   },
   handler: lambda { |args|
-    PWN::Plugins::ProcessTube.write_line(id: args[:id] || args['id'], line: args[:line] || args[:data] || args['line'])
+    PWN::Plugins::ProcessTube.write_line(id: args[:id] || args[:name] || args['id'] || args['name'], line: args[:line] || args[:data] || args['line'])
   }
 )
 PWN::AI::Agent::Registry.register(

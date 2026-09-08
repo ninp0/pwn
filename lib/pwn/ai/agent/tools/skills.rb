@@ -242,6 +242,36 @@ PWN::AI::Agent::Registry.register(
 )
 
 PWN::AI::Agent::Registry.register(
+  name: 'skills_create',
+  toolset: 'skills',
+  schema: {
+    name: 'skills_create',
+    description: 'Create a new skill under ~/.pwn/skills. Requires confirm:true (operator gate).',
+    parameters: {
+      type: 'object',
+      properties: {
+        name: { type: 'string' },
+        sop_markdown: { type: 'string' },
+        content: { type: 'string' },
+        description: { type: 'string' },
+        confirm: { type: 'boolean' }
+      },
+      required: %w[name]
+    }
+  },
+  handler: lambda { |args|
+    raise ArgumentError, 'refusing to create a skill without confirm:true' unless args[:confirm] == true
+
+    PWN::Config.write_skill(
+      name: args[:name],
+      description: args[:description],
+      content: args[:sop_markdown] || args[:content] || args['sop_markdown'] || args['content'],
+      pwn_skills_path: PWN::Config.pwn_skills_path
+    ).merge(saved: true)
+  }
+)
+
+PWN::AI::Agent::Registry.register(
   name: 'skill_add_reference',
   toolset: 'skills',
   schema: {
