@@ -18,8 +18,9 @@ bundle exec rubocop scripts/benchmark_policy.rb
 The experiment uses Ruby and its standard libraries; it does not require the
 full application boot sequence. Use a fresh Ruby process, not the live agent
 console. JSON is printed to stdout and optionally written to `--output`.
-`--self-check` runs independent scorer tests and both complete experimental arms;
-it prints a short pass message instead of a report. Use the options separately.
+`--self-check` runs independent scorer tests, both complete experimental arms,
+and two fresh snapshot workers; it prints short pass messages instead of a
+report. Use the options separately.
 The benchmark exits nonzero if persistence changes during evaluation, splits
 overlap, a negative control succeeds, or a positive control fails. Self-checks
 also require actual training updates in the on arm and none in the off arm.
@@ -36,8 +37,9 @@ not `Reward.judge`, model prose, or a previously assigned reward. It calls
 training. This is not a test of Reward's verification-record binding, the live
 Loop, Metrics learning, memory retrieval, or adapter training.
 
-The new `scripts/` directory keeps this experimental driver outside the installed
-CLI and production module tree; no module manifest or generated skill is needed.
+The experimental driver remains in `scripts/`. The opt-in `PolicyEvaluation`
+module launches only this fixed runner; it does not load the live agent in its
+workers. Its module autoload does not enable evaluation or promotion.
 
 ## Protocol
 
@@ -60,6 +62,10 @@ CLI and production module tree; no module manifest or generated skill is needed.
    answer keys to choose actions. Each call writes into a fresh task directory.
    Exact artifact correctness supplies a binary training label to Policy; the
    off arm executes the same work but Policy declines to update.
+   Each call has an explicit action ID. Only after the independent artifact
+   check, `finish` receives a `controlled_comparison` attribution receipt naming
+   that ID. This is a one-action isolated experiment, not a claim that the last
+   action in an arbitrary live trace caused the outcome.
 4. **Held-out evaluation.** Only after training, materialize eight distinct
    held-out inputs with literal answer keys: four numeric and four inventory
    tasks. Assert no training input appears in evaluation. Task families and
@@ -117,6 +123,9 @@ No fixed gains are embedded in the report.
 
 - **Completion:** tasks with at least one objectively successful attempt divided
   by evaluated tasks. A failed attempt does not count as task completion.
+- **Artifact check score:** each attempt earns 1.0 only for an exact correct
+  artifact with unchanged input, otherwise 0.0; phase score is its mean across
+  attempts. Report rows retain the actual artifact body as well as its hash.
 - **False-success count/rate:** attempts claiming `ok: true` without achieving the
   task; rate denominator is executed attempts, not tasks. This is false reporting
   by the handler, not acceptance of that report by the independent checker.
@@ -149,3 +158,139 @@ would undermine the no-network/no-credentials guarantee. A future live-model
 study should use a separately reviewed runner, identical model/tool budgets,
 external objective verifiers, frozen held-out evaluation, and actual provider
 usage records. Do not present this controller experiment as that study.
+
+## Opt-in independent snapshot evaluation (R5)
+
+The original commands and `off`/`on` report shape still work. To additionally
+export snapshots and run repeated evaluations in **fresh subprocesses**, use:
+
+```sh
+ruby scripts/benchmark_policy.rb --heldout \
+  --snapshot-dir /tmp/pwn-policy-snapshots \
+  --output /tmp/pwn-policy-heldout.json
+```
+
+The snapshot directory must be **new**, below `/tmp`, with no symlink parents.
+`off.json` and `on.json` are genuine Policy JSON tables after the same real
+training schedule. Exported `updated_at` metadata is normalized to `null` for
+reproducible snapshot digests; no Q entries or rewards are fabricated. Export
+happens before that arm's evaluation. Neither `--heldout` nor `--snapshot-dir`
+promotes anything or discovers/reads a real home-directory policy.
+
+The added `heldout` array contains protocol `pwn-policy-heldout-v2`, for suite
+indices 0 and 1. Each worker runs three frozen arms: `off` (baseline snapshot,
+policy disabled), `baseline` (baseline enabled), and `candidate` (candidate
+enabled). Workers never call begin/observe/finish, warmup, or reset the caller's
+policy. Resets and snapshot installation occur only inside temporary HOME.
+Only fixed local handlers are registered; no provider, shell tool, credential,
+user config, or network client is loaded. Environment variables, including Ruby
+startup hooks, are removed before spawning Ruby. Workers have a 30-second
+deadline; stalled children are killed and reaped. Snapshot inputs must be regular
+non-symlink files, at most 4 MiB, with valid numeric `q`, `h`, `visits`, `returns`,
+`n_updates`, and `td_abs_sum` fields. Parent directories cannot be symlinks.
+
+Suite indices 0..7 are bounded deterministic variations, **not random trials**.
+Numeric inputs and separate literal answer keys are scaled by `seed + 1`;
+inventory IDs and separate answer keys are offset by `100 * seed`. This does not
+call a candidate algorithm to construct its answer key. Even indices use flat
+paths and compact JSON; odd indices use nested paths containing spaces, pretty
+JSON, and read-only inputs. Every arm runs eight tasks, 16 negative controls and
+eight positive controls. Training fixtures remain unchanged and disjoint.
+These are two task families and two filesystem configurations, not unseen tools
+or broad environment generalization. Both environment types are required for
+promotion eligibility.
+For externally supplied snapshots, `disjoint_inputs` describes the harness's
+fixture sets, not proof of the snapshot's training history; that history is not
+attested by this runner.
+
+Explicit snapshots from another controlled experiment can be evaluated without
+booting the application:
+
+```ruby
+require './lib/pwn/ai/agent/policy_evaluation'
+evaluator = PWN::AI::Agent::PolicyEvaluation
+reports = [0, 1].map do |seed|
+  evaluator.evaluate(baseline: '/tmp/baseline.json',
+                     candidate: '/tmp/candidate.json', seed: seed)
+end
+```
+
+With fixed source revisions and snapshot bytes, snapshot reports reproduce all
+fields except `elapsed_seconds`. They contain no wall-clock timestamps, random
+IDs or temporary paths. The original training report still contains the timing
+and metadata variability described above.
+
+## Explicit promotion and rollback
+
+This is an **operator-invoked local eligibility gate**, not automatic online
+policy promotion. `Policy.finish` and Loop do not call it. The existing online
+learning behavior is not redirected or promoted by this module. No live policy
+path is defaulted, and writes require `enabled: true` **and** `quiescent: true`.
+The latter is an operator assertion: **stop all agent processes and policy
+writers first**. The existing Policy writer does not share a transaction lock
+with this module; concurrent live learning or concurrent promotions are not
+supported. Restart writers only after the operation and readback complete.
+
+Promotion requires 2..8 reports with distinct valid suite indices covering both
+filesystem configurations. It then **reruns each suite in a fresh worker** using
+the specified snapshot bytes. Every non-timing report field must match the fresh
+execution, including source/harness digests, snapshot digests, input hashes,
+artifact bodies and hashes, action choices, scores, controls, and frozen-policy
+checks. Hashes alone are not signatures or evidence of trusted authorship;
+re-execution is the authority. Model-written `passed: true`, edited scores,
+invented artifact bodies, stale source revisions, or copied duplicate reports
+cannot substitute for those executions. Supplied elapsed times are discarded;
+only newly measured times enter the gate.
+
+For **every** repeated suite, compared with both baseline-on and off:
+
+- completion and mean artifact-check score must not decrease;
+- no previously solved individual task may become unsolved (aggregate gains
+  cannot hide a task/family regression);
+- false-success count **and rate**, repeated mistakes and tool calls must not rise;
+- elapsed time must be at most `baseline_seconds * 1.25 + 0.02`, a fixed local
+  jitter allowance rather than evidence of a statistically established speedup.
+
+Each suite must also improve completion, false-success count, repeated mistakes,
+or calls relative to baseline-on. Better training returns, more updates, or a
+timing-only change cannot qualify. The gate fails closed when verification fails.
+Snapshots, source digests and live-baseline bytes must still match. An explicit
+live target must already exist and equal the evaluated baseline byte-for-byte.
+The previous policy is saved beside it as a digest-named rollback JSON before a
+same-directory atomic replacement and exact readback. No trajectory file is
+modified. Preserve the returned receipt for rollback.
+
+A disposable demonstration using the opt-in benchmark output above:
+
+```ruby
+require './lib/pwn/ai/agent/policy_evaluation'
+evaluator = PWN::AI::Agent::PolicyEvaluation
+baseline = '/tmp/pwn-policy-snapshots/off.json'
+candidate = '/tmp/pwn-policy-snapshots/on.json'
+reports = JSON.parse(File.read('/tmp/pwn-policy-heldout.json'), symbolize_names: true).fetch(:heldout)
+live = '/tmp/pwn-policy-demo-live.json' # NOT the real online policy
+File.open(live, File::WRONLY | File::CREAT | File::EXCL, 0o600) { |f| f.write(File.binread(baseline)) }
+receipt = evaluator.promote(enabled: true, quiescent: true,
+                            baseline: baseline, candidate: candidate,
+                            reports: reports, live_path: live)
+raise receipt.inspect unless receipt[:promoted]
+restored = evaluator.rollback(enabled: true, quiescent: true,
+                              live_path: live, receipt: receipt)
+raise restored.inspect unless restored[:rolled_back]
+```
+
+Rollback verifies the receipt's explicit target, backup path and prior digest,
+validates the backup schema, and refuses if the live file no longer matches the
+promoted candidate digest. Missing, altered or symlink backups/targets fail
+closed. Both methods default to a disabled result; rejected operations return
+`promoted: false` or `rolled_back: false` with a reason. `evaluate` raises on an
+invalid snapshot, worker failure, or deadline. Force-killing a worker can leave
+its temporary directory; this is not an OS sandbox for untrusted code.
+
+**Limit:** this gate measures only the fixed benchmark action vocabulary and
+public task families. A real online policy containing unrelated tools may show
+no gain and be rejected; passing does not validate those unrelated routes or
+establish live LLM gains. A production rollout still needs separately reviewed,
+representative objective tasks and operator judgment. Do not interpret this
+small public held-out set as a secret test or optimize repeatedly against it
+and then claim independent generalization.

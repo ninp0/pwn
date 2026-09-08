@@ -180,6 +180,91 @@ describe PWN::AI::OpenAI do
     expect(msg[:_native_content]).to eq(raw[:output])
   end
 
+  describe 'completed OAuth response normalization' do
+    def response_event(type, fields = {})
+      "data: #{fields.merge(type: type).to_json}\n\n"
+    end
+
+    before do
+      stub_const('PWN::Env', { ai: { openai: { model: 'gpt-6-astra', oauth: { bearer_token: 'fixture-token' } } } })
+      allow(PWN::Plugins::TransparentBrowser).to receive(:open).and_return(browser: RestClient)
+      allow(PWN::Plugins::TTYSpinner).to receive(:stop)
+      allow(described_class).to receive(:obtain_oauth_bearer_token).and_raise('Unexpected enrollment')
+      allow(described_class).to receive(:refresh_oauth_bearer_token).and_raise('Unexpected refresh')
+      allow(RestClient::Request).to receive(:execute).and_raise('Unexpected HTTP request')
+    end
+
+    [
+      [],
+      [{ type: 'reasoning', encrypted_content: 'fixture-secret' }],
+      [{ type: 'message', content: [{ type: 'output_text', text: " \n " }] }],
+      [{ type: 'fixture-secret', content: 'fixture-secret' }]
+    ].each_with_index do |native, index|
+      it "rejects unusable completed output shape #{index} with sanitized structural diagnostics" do
+        expect(RestClient::Request).to receive(:execute).once.and_return(
+          response_event('response.completed', response: { status: 'completed', id: 'fixture-secret', output: native })
+        )
+        expect do
+          described_class.chat_with_tools(messages: [{ role: 'user', content: 'Check' }], quiet: true)
+        end.to raise_error(RuntimeError) { |error|
+          expect(error.message).to include('OpenAI Responses protocol error', 'no usable assistant text or function calls', "output_items=#{native.length}", 'Check provider response compatibility')
+          expect(error.message).not_to include('fixture-secret')
+          expect(PWN::AI::Agent::Loop.send(:engine_transient?, error: error)).to be(false)
+        }
+      end
+    end
+
+    it 'uses message text when the top-level text convenience field is whitespace' do
+      raw = { status: 'completed', output_text: " \n", output: [{ type: 'message', content: [{ type: 'output_text', text: 'Actual answer' }] }] }
+      expect(described_class.send(:parse_responses, raw: raw).dig(:assistant_message, :content)).to eq('Actual answer')
+    end
+
+    it 'keeps authoritative terminal output instead of duplicating buffered done items' do
+      item = { type: 'message', content: [{ type: 'output_text', text: 'Answer' }] }
+      stream = response_event('response.output_item.done', output_index: 0, item: item)
+      stream << response_event('response.completed', response: { status: 'completed', output: [item] })
+      raw = described_class.send(:decode_responses_stream, response: stream)
+      expect(described_class.send(:parse_responses, raw: raw)[:assistant_message]).to include(content: 'Answer', _native_content: [item])
+    end
+
+    it 'does not invent output from deltas when a completed response contains no done items' do
+      stream = response_event('response.output_text.delta', delta: 'Partial private text')
+      stream << response_event('response.completed', response: { status: 'completed', output: [] })
+      expect(RestClient::Request).to receive(:execute).once.and_return(stream)
+      expect do
+        described_class.chat_with_tools(messages: [{ role: 'user', content: 'Check' }], quiet: true)
+      end.to raise_error(RuntimeError, /protocol error.*output_items=0/)
+    end
+
+    it 'surfaces refusal content instead of normalizing it to a blank assistant' do
+      native = [{ type: 'message', role: 'assistant', content: [{ type: 'refusal', refusal: 'Cannot fulfill this request.' }] }]
+      expect(RestClient::Request).to receive(:execute).once.and_return(
+        response_event('response.completed', response: { status: 'completed', output: native })
+      )
+      result = described_class.chat_with_tools(messages: [{ role: 'user', content: 'Check' }], quiet: true)
+      expect(result[:assistant_message]).to include(content: 'Cannot fulfill this request.', _native_content: native, tool_calls: [])
+    end
+
+    it 'recovers ordered native calls and text when terminal output is an empty array' do
+      native = [
+        { type: 'reasoning', encrypted_content: 'fixture-encrypted' },
+        { type: 'function_call', call_id: 'call_1', name: 'shell', arguments: '{"cmd":"pwd"}' },
+        { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Checking.' }] }
+      ]
+      stream = [2, 0, 1].map { |index| response_event('response.output_item.done', output_index: index, item: native[index]) }.join
+      stream << response_event('response.completed', response: { status: 'completed', output: [], usage: { output_tokens: 9 } })
+      expect(RestClient::Request).to receive(:execute).once.and_return(stream)
+
+      result = described_class.chat_with_tools(messages: [{ role: 'user', content: 'Check' }], quiet: true)
+      expect(result[:assistant_message]).to include(
+        content: 'Checking.', _native_content: native,
+        tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'shell', arguments: '{"cmd":"pwd"}' } }]
+      )
+      expect(result.dig(:choices, 0, :message)).to eq(result[:assistant_message])
+      expect(result[:usage]).to eq(output_tokens: 9)
+    end
+  end
+
   it 'caps chat_with_tools completion tokens and does not retry quota 429s' do
     src = File.read(described_class.method(:chat_with_tools).source_location.first)
     expect(src).to include('max_completion_tokens')

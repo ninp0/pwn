@@ -1558,17 +1558,24 @@ RSpec.describe 'PWN::AI::Agent reinforced feedback loop', :aggregate_failures do
   describe 'R5 · Policy (live MDP + Q / REINFORCE)' do
     let(:policy) { PWN::AI::Agent::Policy }
 
-    it 'records (s,a,r,s\') steps and updates Q toward a judge-scored terminal' do
+    it 'records (s,a,r,s\') steps and updates Q only for an independently checked contribution' do
       @agent_cfg[:policy] = true
       policy.reset
-      policy.begin_episode(session_id: 'r5', request: 'run uname', kind: :autonomous_goal, engine: :ollama)
-      policy.observe_step(action: 'shell', ok: true, session_id: 'r5')
-      policy.observe_step(action: 'shell', ok: true, session_id: 'r5')
-      report = policy.finish(session_id: 'r5', score: 0.9, verdict: :solved)
+      policy.begin_episode(session_id: 'r5', request: 'write result', kind: :autonomous_goal, engine: :ollama)
+      File.write(File.join(@tmp, 'result'), 'checked')
+      check = { requirement: 'write result', kind: :file, path: 'result', expected: 'checked' }
+      snapshot = PWN::AI::Agent::Verification.snapshot(root: @tmp, checks: [check])
+      policy.observe_step(action: 'shell', action_id: 'writer', ok: true, session_id: 'r5')
+      policy.observe_step(action: 'shell', action_id: 'noop', ok: true, session_id: 'r5')
+      verified = PWN::AI::Agent::Verification.run(
+        request: 'write result', requirements: ['write result'], root: @tmp, checks: [check],
+        actions: [{ action_id: 'writer', artifacts: snapshot }]
+      )
+      report = policy.finish(session_id: 'r5', score: 0.9, verdict: :solved, attribution: verified[:attribution])
       expect(report[:steps]).to eq 2
       expect(report[:td_updates]).to be >= 1
       expect(policy.trajectories(limit: 1).first[:steps].length).to eq 2
-      expect(policy.stats[:n_updates]).to be >= 2
+      expect(policy.stats[:n_updates]).to eq 1
     end
 
     it 'Q-advantage is zero until visits accumulate, so rank stays keyword-first' do

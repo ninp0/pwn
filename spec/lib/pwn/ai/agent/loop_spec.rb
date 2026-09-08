@@ -16,6 +16,59 @@ describe PWN::AI::Agent::Loop do # rubocop:disable Metrics/BlockLength
   end
 
   describe 'RL-adjacent loop contracts' do # rubocop:disable Metrics/BlockLength
+    describe 'host acceptance contracts' do
+      include_context 'pwn tmp sandbox'
+
+      it 'executes the supplied verification contract at the final boundary even without introspection' do
+        request = 'what color is a passion fruit?'
+        sid = PWN::Sessions.create(title: 'verification')[:id]
+        File.write(File.join(@tmp, 'answer'), 'purple')
+        allow(PWN::AI::Agent::TaskSummarizer).to receive(:enabled?).and_return(false)
+        allow(described_class).to receive(:should_auto_introspect?).and_return(false)
+        allow(described_class).to receive(:call_engine).and_return(role: 'assistant', content: 'Purple when ripe.', tool_calls: [])
+        described_class.run(request: request, session_id: sid, system_role_content: 'test system',
+                            verification_contract: { root: @tmp, requirements: [request],
+                                                     checks: [{ requirement: request, kind: :file, path: 'answer', expected: 'purple' }] })
+        records = PWN::Sessions.load(session_id: sid).select { |row| row[:role].to_s == 'verification' }
+        expect(records.length).to eq(1)
+        expect(JSON.parse(records.first[:content], symbolize_names: true)).to include(status: 'pass', runner_version: 1)
+      end
+
+      it 'passes only the observed artifact producer to terminal attribution after a successful noop' do
+        request = 'what color is a passion fruit?'
+        sid = PWN::Sessions.create(title: 'attribution')[:id]
+        allow(PWN::AI::Agent::TaskSummarizer).to receive(:enabled?).and_return(false)
+        allow(described_class).to receive(:should_auto_introspect?).and_return(false)
+        allow(PWN::AI::Agent::Dispatch).to receive(:call) do |opts|
+          File.write(File.join(@tmp, 'answer'), 'purple') if opts[:tool_call][:id] == 'writer'
+          '{"success":true,"result":{"exit":0}}'
+        end
+        calls = %w[writer noop].map { |id| { id: id, type: 'function', function: { name: 'shell', arguments: '{}' } } }
+        allow(described_class).to receive(:call_engine).and_return(
+          { role: 'assistant', tool_calls: calls }, { role: 'assistant', content: 'Purple when ripe.', tool_calls: [] }
+        )
+        expect(PWN::AI::Agent::Policy).to receive(:finish).with(hash_including(attribution: { source: 'independent_verifier', verified_action_ids: ['writer'] })).and_call_original
+        described_class.run(request: request, session_id: sid, system_role_content: 'test system',
+                            verification_contract: { root: @tmp, requirements: [request],
+                                                     checks: [{ requirement: request, kind: :file, path: 'answer', expected: 'purple' }] })
+      end
+
+      it 'passes host-observed capability scope to both policy and schema selection' do
+        sid = PWN::Sessions.create(title: 'scope')[:id]
+        context = { environment: 'container', capabilities: { shell: false }, missing_prerequisites: ['shell'] }
+        allow(PWN::AI::Agent::TaskSummarizer).to receive(:enabled?).and_return(false)
+        allow(described_class).to receive(:should_auto_introspect?).and_return(false)
+        allow(described_class).to receive(:call_engine).and_return(role: 'assistant', content: 'Purple when ripe.', tool_calls: [])
+        allow(described_class).to receive(:call_engine) do |opts|
+          expect(opts[:tools].map { |tool| tool.dig(:function, :name) }).not_to include('shell')
+          { role: 'assistant', content: 'Purple when ripe.', tool_calls: [] }
+        end
+        expect(PWN::AI::Agent::Policy).to receive(:begin_episode).with(hash_including(trusted_context: hash_including(environment: 'container', capabilities: { shell: false }))).and_call_original
+        expect(PWN::AI::Agent::Registry).to receive(:definitions).with(hash_including(trusted_context: hash_including(missing_prerequisites: ['shell']))).and_call_original
+        described_class.run(request: 'what color is a passion fruit?', session_id: sid, system_role_content: 'test system', enabled_toolsets: nil, trusted_context: context)
+      end
+    end
+
     describe 'live policy tool exposure' do
       include_context 'pwn tmp sandbox'
 

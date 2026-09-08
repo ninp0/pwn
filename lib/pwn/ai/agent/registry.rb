@@ -37,6 +37,7 @@ module PWN
           :handler,     # Proc    - ->(args_hash) { ... } returning a JSON-serialisable object
           :check,       # Proc    - -> { bool } gate; tool only advertised when truthy
           :max_chars,   # Integer - cap on serialised result before it re-enters the convo
+          :prerequisites, # Array - capability categories required by this tool
           keyword_init: true
         )
 
@@ -49,6 +50,7 @@ module PWN
         # opts[:preference], or PWN::Env[:ai][:agent][:tool_preference].
         # Explicit nil/empty order disables preference (no Env/DEFAULT fallback).
         DEFAULT_PREFERENCE = CORE_TOOLS
+        DEFAULT_PREREQUISITES = { 'shell' => %w[shell].freeze, 'pwn_eval' => %w[ruby].freeze }.freeze
 
         @entries = {}
         @discovered = false
@@ -60,6 +62,7 @@ module PWN
         #   schema: 'required - OpenAI function schema {name:, description:, parameters:}',
         #   handler: 'required - ->(args_hash) { ... } returning a JSON-serialisable object',
         #   check: 'optional - -> { bool } gate; tool only advertised when truthy',
+        #   prerequisites: 'optional - required capability categories; shell and pwn_eval have core defaults',
         #   max_chars: 'optional - cap on serialised result (default 24_000)'
         # )
 
@@ -75,7 +78,8 @@ module PWN
             schema: opts[:schema],
             handler: opts[:handler],
             check: opts[:check] ||= -> { true },
-            max_chars: opts[:max_chars] ||= 24_000
+            max_chars: opts[:max_chars] ||= 24_000,
+            prerequisites: Array(opts.fetch(:prerequisites, DEFAULT_PREREQUISITES[name])).map(&:to_s)
           )
         end
 
@@ -117,12 +121,14 @@ module PWN
           enabled = opts[:enabled]
           enabled = enabled.map(&:to_s) if enabled
           pool = @entries.values.select { |e| (enabled.nil? || enabled.include?(e.toolset)) && safe_check(entry: e) }
+          pool = pool.select { |e| available?(entry: e, trusted_context: opts[:trusted_context]) }
 
           pref_fwd = {}
           pref_fwd[:order] = opts[:order] if opts.key?(:order)
           pref_fwd[:preference] = opts[:preference] if opts.key?(:preference)
           pref_fwd[:kind] = opts[:kind] if opts.key?(:kind)
           pref_fwd[:intent] = opts[:intent] if opts.key?(:intent)
+          pref_fwd[:trusted_context] = opts[:trusted_context] if opts.key?(:trusted_context)
 
           if opts[:core_only]
             pool = pool.select { |e| CORE_TOOLS.include?(e.name) }
@@ -213,6 +219,7 @@ module PWN
         public_class_method def self.rank(opts = {})
           query   = opts[:query].to_s.downcase
           entries = opts[:entries] || all
+          entries = entries.select { |entry| available?(entry: entry, trusted_context: opts[:trusted_context]) }
           return entries if query.strip.empty?
 
           tokens = query.scan(/[a-z0-9_]{3,}/).uniq
@@ -269,6 +276,14 @@ module PWN
                     0.0
                   end
           pol_state = (Policy.current_state || Policy.state(request: query) if defined?(PWN::AI::Agent::Policy) && Policy.respond_to?(:current_state))
+          pol_state = Policy.observed_state(state: pol_state, trusted_context: opts[:trusted_context]) if defined?(Policy) && opts.key?(:trusted_context)
+          # Metrics has no environment dimension. Do not transfer its global
+          # success/PRM/UCB history into explicitly observed environments.
+          if pol_state.to_s.include?('|env:')
+            beta = 0.0
+            gamma = 0.0
+            delta = 0.0
+          end
           scored = entries.map do |e|
             hay   = "#{e.name} #{e.toolset} #{e.schema[:description]} #{Array(e.schema.dig(:parameters, :properties)&.keys).join(' ')}".downcase
             sim   = tokens.count { |t| hay.include?(t) }
@@ -327,6 +342,21 @@ module PWN
             { name: name, schema_valid: schema, handler: !e.handler.nil?, required: required }
           end
           { tools: rows, files: files.length, registered: @entries.length, ok: rows.length >= files.length }
+        end
+
+        # Unknown capability is not an absence. Only trusted negative evidence
+        # excludes a tool; learned history and CORE/domain pins cannot override it.
+        public_class_method def self.available?(opts = {})
+          entry = opts[:entry] || lookup(name: opts[:name])
+          return true unless entry && defined?(Policy)
+
+          raw = opts[:trusted_context] || Policy.current_episode&.dig(:trusted_context)
+          return true unless raw.is_a?(Hash)
+
+          observed = Policy.observed_context(trusted_context: raw)
+          Array(entry.prerequisites).none? do |capability|
+            observed[:missing_prerequisites].include?(capability.to_s) || observed[:capabilities][capability.to_sym] == false
+          end
         end
 
         private_class_method def self.safe_check(opts = {})
@@ -393,6 +423,7 @@ module PWN
               schema: 'required - OpenAI function schema {name:, description:, parameters:}',
               handler: 'required - ->(args_hash) { ... } returning a JSON-serialisable object',
               check: 'optional - -> { bool } gate; tool only advertised when truthy',
+              prerequisites: 'optional - required capability categories; observed absence excludes this tool',
               max_chars: 'optional - cap on serialised result (default 24_000)'
             )
 
@@ -416,7 +447,8 @@ module PWN
               preference: 'optional - alias of :order; same key-present rule',
               kind: 'optional - kind value consumed by #definitions',
               intent: 'optional - intent value consumed by #definitions',
-              core_only: 'optional - core only value consumed by #definitions'
+              core_only: 'optional - core only value consumed by #definitions',
+              trusted_context: 'optional - caller observations accepted by Policy.observed_context; defaults to live episode observations'
             )
 
             # Run preference order and return its result
@@ -438,7 +470,15 @@ module PWN
               query: 'required - user request text',
               entries: 'optional - Entry pool to rank (default .all)',
               order: 'optional - preference list forwarded to preference_order',
-              preference: 'optional - preference value consumed by #rank'
+              preference: 'optional - preference value consumed by #rank',
+              trusted_context: 'optional - caller-only environment and prerequisite observations; missing tools cannot win via history'
+            )
+
+            # Test observed prerequisites independently of learned ranking.
+            #{self}.available?(
+              entry: 'optional - registered Entry',
+              name: 'optional - lookup name when entry is absent',
+              trusted_context: 'optional - observed capabilities and missing prerequisites; default live episode context'
             )
 
             # Run discover and return its result

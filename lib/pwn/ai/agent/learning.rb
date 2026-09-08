@@ -713,6 +713,7 @@ module PWN
             Policy.finish(
               session_id: session_id,
               score: v[:training_score],
+              attribution: v.dig(:verification, :runner_version) == 1 ? v.dig(:verification, :attribution) : nil,
               confidence: v[:confidence],
               verdict: v[:verdict],
               proxy_ok: ok,

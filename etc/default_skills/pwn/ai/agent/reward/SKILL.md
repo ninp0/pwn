@@ -35,6 +35,7 @@ PWN::AI::Agent::Reward.judge(opts)
 
 - `judge`
 - `resolve_outcome`
+- `run_verification`
 - `record_verification`
 - `promote_to_success`
 - `prm`

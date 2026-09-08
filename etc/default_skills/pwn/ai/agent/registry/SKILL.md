@@ -44,8 +44,10 @@ PWN::AI::Agent::Registry.register(opts)
 - `discover`
 - `eager_load`
 - `selftest`
+- `available`
 - `authors`
 - `help`
+- `available?`
 - `eager_load!`
 
 ## Source
