@@ -6,6 +6,7 @@ require 'time'
 require 'fileutils'
 require 'securerandom'
 require 'socket'
+require 'digest'
 
 module PWN
   module AI
@@ -41,19 +42,14 @@ module PWN
         # Supported Method Parameters::
         #   personas = PWN::AI::Agent::Swarm.personas
 
-        public_class_method def self.personas
-          return {} unless File.exist?(AGENTS_FILE)
-
-          raw = YAML.safe_load_file(
-            AGENTS_FILE,
-            permitted_classes: [Symbol],
-            aliases: true,
-            symbolize_names: true
-          ) || {}
-          raw.transform_values { |v| normalize_persona(persona: v) }
-        rescue StandardError => e
-          warn "[pwn-ai/swarm] failed to load #{AGENTS_FILE}: #{e.class}: #{e.message}"
-          {}
+        public_class_method def self.personas(opts = {})
+          all = load_personas_file(path: AGENTS_FILE)
+          sid = opts[:swarm_id].to_s
+          unless sid.empty?
+            local = load_personas_file(path: File.join(SWARM_ROOT, sid, 'agents.yml'))
+            all = all.merge(local)
+          end
+          all
         end
 
         # Supported Method Parameters::
@@ -70,11 +66,21 @@ module PWN
           raise ArgumentError, 'name is required' if name.strip.empty?
           raise ArgumentError, 'role is required' if opts[:role].to_s.strip.empty?
 
-          all = personas
-          all[name.to_sym] = normalize_persona(persona: opts)
-          FileUtils.mkdir_p(File.dirname(AGENTS_FILE))
-          File.write(AGENTS_FILE, YAML.dump(deep_stringify(hash: all)))
-          { name: name, persona: all[name.to_sym], file: AGENTS_FILE }
+          packed = pack_specialist(opts)
+          sid = opts[:swarm_id].to_s
+          ephemeral = opts[:ephemeral] == true || (!sid.empty? && opts[:global] != true)
+          path = if ephemeral && !sid.empty?
+                   FileUtils.mkdir_p(File.join(SWARM_ROOT, sid))
+                   File.join(SWARM_ROOT, sid, 'agents.yml')
+                 else
+                   AGENTS_FILE
+                 end
+          all = load_personas_file(path: path)
+          row = normalize_persona(persona: opts.merge(toolsets: packed[:toolsets], skills: packed[:skills]))
+          all[name.to_sym] = row
+          FileUtils.mkdir_p(File.dirname(path))
+          File.write(path, YAML.dump(deep_stringify(hash: all)))
+          { name: name, persona: row, file: path, ephemeral: ephemeral }
         end
 
         # Supported Method Parameters::
@@ -131,13 +137,27 @@ module PWN
           raise ArgumentError, 'swarm_id is required' if sid.empty?
 
           FileUtils.mkdir_p(File.join(SWARM_ROOT, sid))
+          raw = opts[:content].to_s
           entry = {
             ts: Time.now.utc.iso8601,
             from: opts[:from].to_s,
             to: (opts[:to] || :all).to_s,
-            content: opts[:content].to_s
+            content: raw
           }
-          File.open(bus_path(swarm_id: sid), 'a') { |f| f.puts(JSON.generate(entry)) }
+          if raw.bytesize > 400
+            stored = if defined?(PWN::Plugins::ArtifactRegistry)
+                       PWN::Plugins::ArtifactRegistry.put(bytes: raw, kind: 'swarm-bus', session_id: sid)
+                     else
+                       { sha256: Digest::SHA256.hexdigest(raw), path: bus_path(swarm_id: sid) }
+                     end
+            entry[:content] = raw.byteslice(0, 400)
+            entry[:ref] = stored[:path]
+            entry[:sha256] = stored[:sha256]
+          end
+          File.open(bus_path(swarm_id: sid), 'a') do |f|
+            f.flock(File::LOCK_EX)
+            f.puts(JSON.generate(entry))
+          end
           entry
         end
 
@@ -170,11 +190,16 @@ module PWN
 
         public_class_method def self.ask(opts = {})
           name    = opts[:name].to_s
-          persona = personas[name.to_sym]
+          depth   = Thread.current[:pwn_swarm_depth] || 0
+          sid     = opts[:swarm_id] || create(topic: opts[:request].to_s[0, 60])[:swarm_id]
+          persona = personas(swarm_id: sid)[name.to_sym]
           raise ArgumentError, "unknown persona: #{name} (see #{AGENTS_FILE})" unless persona
 
-          sid   = opts[:swarm_id] || create(topic: opts[:request].to_s[0, 60])[:swarm_id]
-          depth = Thread.current[:pwn_swarm_depth] || 0
+          if opts[:unit].to_s != ''
+            held = claim(unit: opts[:unit], agent_id: name, ttl: opts[:ttl] || 300, engagement_id: opts[:engagement_id] || sid)
+            return { ok: false, error: 'claim_held', claim: held } unless held[:ok]
+          end
+
           if depth >= max_depth
             raise "swarm recursion depth #{depth} >= max_depth #{max_depth} " \
                   '(PWN::Env[:ai][:agent][:max_depth])'
@@ -189,6 +214,7 @@ module PWN
 
           empty_tools = opts[:text_only] == true || Array(persona[:toolsets]).empty?
           Thread.current[:pwn_swarm_depth] = depth + 1
+          Thread.current[:pwn_swarm_id] = sid
           reply = with_persona_env(persona: persona) do
             Loop.run(
               request: opts[:request].to_s,
@@ -196,12 +222,16 @@ module PWN
               enabled_toolsets: empty_tools ? [] : persona[:toolsets],
               core_only: empty_tools ? false : true,
               system_role_content: sys,
-              on_tool: opts[:on_tool]
+              on_tool: opts[:on_tool],
+              nested: true
             )
           end
 
           bus_append(swarm_id: sid, from: name, to: opts[:to] || :all, content: reply)
-          { swarm_id: sid, name: name, session_id: session_id, reply: reply }
+          inbox = child_inbox(session_id: session_id, name: name)
+          honesty = child_honesty(name: name, toolsets: persona[:toolsets], session_id: session_id, skills: persona[:skills])
+          (Thread.current[:pwn_swarm_honesty] ||= []) << honesty.merge(name: name)
+          { ok: true, swarm_id: sid, name: name, session_id: session_id, reply: reply, inbox: inbox, honesty: honesty }
         ensure
           Thread.current[:pwn_swarm_depth] = depth
         end
@@ -263,10 +293,10 @@ module PWN
           names = personas.keys.map(&:to_s) if names.empty?
           sid   = opts[:swarm_id] || create(topic: req[0, 60])[:swarm_id]
 
-          replies = names.to_h do |n|
-            [n, ask(name: n, request: req, swarm_id: sid,
-                    from: 'broadcast', on_tool: opts[:on_tool])[:reply]]
+          threads = names.map do |n|
+            [n, Thread.new { ask(name: n, request: req, swarm_id: sid, from: 'broadcast', on_tool: opts[:on_tool])[:reply] }]
           end
+          replies = threads.to_h { |n, th| [n, th.value] }
           { swarm_id: sid, replies: replies }
         end
 
@@ -276,6 +306,23 @@ module PWN
 
         private_class_method def self.bus_path(opts = {})
           File.join(SWARM_ROOT, opts[:swarm_id].to_s, 'bus.jsonl')
+        end
+
+        private_class_method def self.load_personas_file(opts = {})
+          path = opts[:path].to_s
+          return {} unless File.file?(path)
+
+          raw = YAML.safe_load_file(
+            path,
+            permitted_classes: [Symbol],
+            aliases: true,
+            symbolize_names: true
+          ) || {}
+          raw = {} unless raw.is_a?(Hash)
+          raw.transform_values { |v| normalize_persona(persona: v) }
+        rescue StandardError => e
+          warn "[pwn-ai/swarm] failed to load #{path}: #{e.class}: #{e.message}"
+          {}
         end
 
         private_class_method def self.persona_session(opts = {})
@@ -337,10 +384,12 @@ module PWN
           prev_active = ai[:active]
           prev_iters  = agent_h[:max_iters]
 
-          ai[:active]          = persona[:engine].to_s if persona[:engine]
-          agent_h[:max_iters]  = persona[:max_iters]   if persona[:max_iters]
+          ai[:active] = persona[:engine].to_s if persona[:engine]
+          Thread.current[:pwn_swarm_engine] = persona[:engine].to_s if persona[:engine]
+          agent_h[:max_iters] = persona[:max_iters] if persona[:max_iters]
           yield
         ensure
+          Thread.current[:pwn_swarm_engine] = nil
           if ai
             ai[:active]         = prev_active
             agent_h[:max_iters] = prev_iters
@@ -352,7 +401,11 @@ module PWN
           {
             role: p[:role].to_s,
             engine: (p[:engine].to_s.empty? ? nil : p[:engine].to_s.downcase.to_sym),
-            toolsets: Array(p[:toolsets]).map(&:to_s).then { |a| a.empty? ? DEFAULT_TOOLSET.dup : a },
+            toolsets: begin
+              raw_ts = p[:toolsets]
+              raw_ts.nil? ? DEFAULT_TOOLSET.dup : Array(raw_ts).map(&:to_s)
+            end,
+            skills: Array(p[:skills]).map(&:to_s).first(3),
             max_iters: (p[:max_iters] || DEFAULT_ITERS).to_i
           }
         end
@@ -392,6 +445,10 @@ module PWN
           hosts = opts[:targets].to_s.split(/[,\s]+/).reject(&:empty?)
           ports = opts[:ports].to_s.split(/[,\s]+/).map(&:to_i).reject(&:zero?)
           ports = [80, 443] if ports.empty?
+          if defined?(PWN::Plugins::Packet) && PWN::Plugins::Packet.respond_to?(:tcp_connect_scan)
+            row = PWN::Plugins::Packet.tcp_connect_scan(hosts: hosts, ports: ports)
+            return Array(row[:results])
+          end
 
           hosts.product(ports).map do |host, port|
             Thread.new do
@@ -445,7 +502,7 @@ module PWN
 
           ttl = (opts[:ttl] || 300).to_i
           agent = (opts[:agent_id] || 'anon').to_s
-          dir = File.join(Dir.home, '.pwn', 'swarm', eng)
+          dir = File.join(SWARM_ROOT, eng)
           FileUtils.mkdir_p(dir)
           path = File.join(dir, "#{unit.gsub(/[^A-Za-z0-9._:-]/, '_')}.claim")
           now = Time.now.to_i
@@ -466,6 +523,102 @@ module PWN
           end
         end
 
+        public_class_method def self.pack_specialist(opts = {})
+          name = opts[:name].to_s
+          skills = Array(opts[:skills]).map(&:to_s).reject(&:empty?).first(3)
+          toolsets = Array(opts[:toolsets]).map(&:to_s)
+          toolsets -= %w[swarm] unless opts[:orchestrator]
+          toolsets = DEFAULT_TOOLSET.dup if toolsets.empty?
+          { name: name, skills: skills, toolsets: toolsets }
+        end
+
+        public_class_method def self.child_inbox(opts = {})
+          sid = opts[:session_id].to_s
+          findings = if defined?(PWN::Plugins::Findings)
+                       Array(PWN::Plugins::Findings.report).select { |r| r[:session_id].to_s == sid || sid.empty? }
+                     else
+                       []
+                     end
+          arts = if defined?(PWN::Plugins::ArtifactRegistry)
+                   Array(PWN::Plugins::ArtifactRegistry.list(session_id: sid))
+                 else
+                   []
+                 end
+          {
+            name: opts[:name].to_s,
+            finding_ids: findings.map { |r| r[:id].to_s },
+            artifact_shas: arts.filter_map { |a| a[:sha256] || a['sha256'] },
+            coverage: []
+          }
+        end
+
+        public_class_method def self.child_honesty(opts = {})
+          inbox = child_inbox(opts)
+          toolsets = Array(opts[:toolsets]).map(&:to_s)
+          pwnish = toolsets.include?('pwn') || toolsets.include?('extrospection')
+          empty = Array(inbox[:finding_ids]).empty? && Array(inbox[:artifact_shas]).empty?
+          gap = pwnish && empty ? 'child_filed_nothing' : nil
+          { name: opts[:name].to_s, gap: gap, inbox: inbox }
+        end
+
+        public_class_method def self.honesty_unmet(opts = {})
+          _sid = opts[:swarm_id]
+          Array(Thread.current[:pwn_swarm_honesty]).filter_map do |h|
+            next unless h[:gap]
+
+            "child_filed_nothing:#{h[:name]}"
+          end
+        end
+
+        public_class_method def self.view_graph(opts = {})
+          sid = opts[:swarm_id].to_s
+          raise ArgumentError, 'swarm_id is required' if sid.empty?
+
+          map_path = File.join(SWARM_ROOT, sid, 'personas.json')
+          map = File.file?(map_path) ? JSON.parse(File.read(map_path)) : {}
+          agents = map.map { |name, sess| { name: name, session_id: sess } }
+          claims = Dir[File.join(SWARM_ROOT, sid, '*.claim')].filter_map do |path|
+            JSON.parse(File.read(path), symbolize_names: true)
+          rescue StandardError
+            nil
+          end
+          { swarm_id: sid, agents: agents, claims: claims }
+        end
+
+        public_class_method def self.migrate_personas(opts = {})
+          path = opts[:path].to_s
+          path = AGENTS_FILE if path.empty?
+          return { changed: false, path: path, patched: [] } unless File.file?(path)
+
+          raw = YAML.safe_load_file(
+            path,
+            permitted_classes: [Symbol],
+            aliases: true,
+            symbolize_names: true
+          )
+          return { changed: false, path: path, patched: [] } unless raw.is_a?(Hash)
+
+          patched = []
+          if raw[:escalator].is_a?(Hash)
+            ts = Array(raw[:escalator][:toolsets]).map(&:to_s)
+            if ts.sort == %w[memory pwn terminal]
+              raw[:escalator][:toolsets] = []
+              patched << 'escalator'
+            end
+          end
+          if raw[:scribe].is_a?(Hash)
+            ts = Array(raw[:scribe][:toolsets]).map(&:to_s)
+            unless ts.include?('pwn')
+              raw[:scribe][:toolsets] = ts + %w[pwn]
+              patched << 'scribe'
+            end
+          end
+          return { changed: false, path: path, patched: [] } if patched.empty?
+
+          File.write(path, YAML.dump(deep_stringify(hash: raw)))
+          { changed: true, path: path, patched: patched }
+        end
+
         # Author(s):: 0day Inc. <support@0dayinc.com>
 
         public_class_method def self.authors
@@ -477,7 +630,9 @@ module PWN
         public_class_method def self.help
           puts "USAGE:
             # Persona registry (~/.pwn/agents.yml)
-            #{self}.personas
+            #{self}.personas(
+              swarm_id: 'optional - merge ephemeral personas from this swarm'
+            )
 
             # Run spawn and return its result
             #{self}.spawn(
@@ -485,7 +640,12 @@ module PWN
               role: 'required - system_role_content overlay for this persona',
               toolsets: 'optional - Array of Registry toolset names',
               engine: 'optional - :openai / :anthropic / :grok / :gemini / :ollama / :openwebui',
-              max_iters: 'optional - per-turn iteration cap for this persona'
+              max_iters: 'optional - per-turn iteration cap for this persona',
+              skills: 'optional - Array of SOP skill names (capped at 3)',
+              swarm_id: 'optional - write ephemeral persona under this swarm',
+              ephemeral: 'optional - true to keep the persona off the host agents.yml',
+              global: 'optional - true to write ~/.pwn/agents.yml even with swarm_id',
+              orchestrator: 'optional - true to keep the swarm toolset'
             )
 
             # Run retire and return its result
@@ -523,7 +683,10 @@ module PWN
               to: 'optional - addressee recorded on the bus (default :all)',
               on_tool: 'optional - ->(name, args, result) live-UI callback',
               from: 'optional - sender account or address to bind as operator (defaults to caller_label)',
-              text_only: 'required - text only value consumed by #ask'
+              text_only: 'required - text only value consumed by #ask',
+              unit: 'optional - claim key (host+phase) before the child runs',
+              ttl: 'optional - claim TTL seconds (defaults to 300)',
+              engagement_id: 'optional - claim namespace (defaults to swarm_id)'
             )
 
             # Run debate and return its result
@@ -569,6 +732,43 @@ module PWN
               engagement_id: 'optional - engagement id (defaults to default)',
               ttl: 'optional - seconds until the claim expires (defaults to 300)',
               agent_id: 'optional - claimant id'
+            )
+
+            # Cap a child to 1-3 skills and drop swarm unless orchestrator.
+            #{self}.pack_specialist(
+              name: 'optional - specialist name',
+              skills: 'optional - Array of SOP skill names (kept at most 3)',
+              toolsets: 'optional - Registry toolset names',
+              orchestrator: 'optional - true to keep the swarm toolset'
+            )
+
+            # World-object inbox for a child session (finding ids, artifact shas).
+            #{self}.child_inbox(
+              session_id: 'optional - child PWN::Sessions id',
+              name: 'optional - persona name'
+            )
+
+            # Honesty gap when a pwn child filed no findings and no artifacts.
+            #{self}.child_honesty(
+              name: 'optional - persona name',
+              toolsets: 'optional - Array of toolset names',
+              session_id: 'optional - child session id',
+              skills: 'optional - Array of SOP skill names'
+            )
+
+            # Unmet tokens for parent Loop from child honesty gaps.
+            #{self}.honesty_unmet(
+              swarm_id: 'optional - swarm id whose children were recorded'
+            )
+
+            # Personas and live claims for a swarm (check before spawning).
+            #{self}.view_graph(
+              swarm_id: 'required - swarm id from #create'
+            )
+
+            # Patch stock escalator/scribe toolsets on an older agents.yml.
+            #{self}.migrate_personas(
+              path: 'optional - agents.yml path (defaults to ~/.pwn/agents.yml)'
             )
 
             # Print the AUTHOR(S) string for this module.

@@ -54,11 +54,12 @@ PWN::AI::Agent::Registry.register(
 
     code = args[:code].to_s
     if code.strip.empty? || PWN::AI::Agent::ToolGuard.placeholder?(text: code)
-      return {
-        stdout: '',
-        error: 'invalid_payload',
-        hint: 'code is required (string). Do not send ..., {...}, {…}, or empty. Example: pwn_eval(code="1 + 1").'
-      }
+      return PWN::AI::Agent::ToolGuard.invalid_payload(
+        hint: 'code is required (string). Do not send ..., {...}, {…}, or empty. Example: pwn_eval(code="1 + 1"). Triple-dot inside quoted/heredoc bodies is allowed.',
+        offending_token: '...',
+        text: code,
+        suggestion: 'replace ellipsis or placeholders with concrete Ruby'
+      )
     end
 
     old_stdout = $stdout

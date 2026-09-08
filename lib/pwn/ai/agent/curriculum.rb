@@ -104,11 +104,12 @@ module PWN
 
               prompts = generate_reproducers(mistake: m, count: [per, 2].max)
               runs = dry_run ? [] : prompts.map { |p| self_play(prompt: p, tag: "practice:#{m[:signature]}") }
-              solved = runs.select { |r| r[:score].to_f >= 0.6 }
-              mean = runs.empty? ? 0.0 : (runs.sum { |r| r[:score].to_f } / runs.length)
+              solved = runs.select { |r| r[:success] == true && !r[:training_score].nil? }
+              scored = runs.reject { |r| r[:training_score].nil? }
+              mean = scored.empty? ? nil : (scored.sum { |r| r[:training_score].to_f } / scored.length)
               resolved = false
               # 2.4 — auto-resolve only with N≥2 holdout successes + store trace
-              # P23 — auto-resolve only with N≥2 holdouts at judge≥0.7 AND a
+              # P23 — auto-resolve only with N≥2 trusted holdout successes AND a
               # real tool trace (not empty-final luck). Budget fingerprints
               # additionally require mean holdout ≥0.7 and short-horizon tags.
               if solved.length >= 2 && defined?(Mistakes)
@@ -130,7 +131,7 @@ module PWN
                   bump_cooldown!(cooldown: cool, signature: m[:signature], mean: mean) unless dry_run
                   results << {
                     signature: m[:signature], tool: m[:tool], prompts: prompts,
-                    runs: runs.map { |r| { score: r[:score], verdict: r[:verdict] } },
+                    runs: runs,
                     resolved: false, mean_score: mean.round(3),
                     reason: 'holdouts_ok_but_trace_weak'
                   }
@@ -177,14 +178,14 @@ module PWN
                 end
                 resolved = true
                 cool.delete(m[:signature].to_s)
-              elsif !dry_run
+              elsif !dry_run && !mean.nil?
                 # P1 — track zero-progress nights; park after COOLDOWN_FAIL_NIGHTS
                 bump_cooldown!(cooldown: cool, signature: m[:signature], mean: mean)
               end
               results << {
                 signature: m[:signature], tool: m[:tool], prompts: prompts,
-                runs: runs.map { |r| { score: r[:score], verdict: r[:verdict] } },
-                resolved: resolved, mean_score: mean.round(3)
+                runs: runs,
+                resolved: resolved, mean_score: mean&.round(3)
               }
             end
           end
@@ -264,7 +265,7 @@ module PWN
 
             if commit && defined?(Learning)
               prior = Learning.outcomes(limit: 500).find do |o|
-                o[:session_id].to_s == sid.to_s && o[:score] && Array(o[:tags]).include?('offline_judge')
+                o[:session_id].to_s == sid.to_s && !o[:training_score].nil? && Array(o[:tags]).include?('offline_judge')
               end
               next if prior
             end
@@ -278,38 +279,31 @@ module PWN
             next if req.strip.empty? || fin.strip.empty?
 
             v = Reward.judge(request: req, final: fin, session_id: sid, commit: commit)
-            Reward.prm(request: req, session_id: sid) if do_prm
+            known = !v[:training_score].nil?
+            Reward.prm(request: req, session_id: sid) if do_prm && commit && known
             # P7/W3 — offline path must also fill calibration so the controller
             # (force plan_first/critic at n≥8) actually becomes reachable under
             # :failure_only local introspect. Pull p(success)= out of any PLAN.
-            if commit
+            if commit && known
               plan = t.find { |e| e[:role].to_s == 'assistant' && e[:content].to_s.start_with?('PLAN:') }
               pred = plan && plan[:content].to_s[/p\(success\)\s*=\s*([01](?:\.\d+)?)/i, 1]
               if pred
                 eng = (PWN::Env.dig(:ai, :active) if defined?(PWN::Env))
-                calibrate(predicted: pred.to_f, actual: v[:score].to_f, engine: eng)
+                calibrate(predicted: pred.to_f, actual: v[:success] ? 1.0 : 0.0, engine: eng)
               end
             end
             if commit && defined?(Learning)
-              # P29 — keep verdict tag score-aligned (same as auto_introspect).
-              sc = v[:score].to_f
-              verd = if defined?(Learning) && Learning.respond_to?(:verdict_for_score, true)
-                       Learning.send(:verdict_for_score, score: sc).to_s
-                     elsif sc >= 0.6 then 'solved'
-                     elsif sc >= 0.3 then 'partial'
-                     else 'wrong'
-                     end
+              verd = v[:verdict].to_s
               Learning.note_outcome(
                 task: req[0, 120],
-                success: sc >= 0.6,
-                score: sc,
-                details: "offline_judge #{verd}(#{sc.round(2)}) #{v[:rationale]}",
+                outcome: v,
+                details: "offline_judge #{verd}(#{v[:score]}) #{v[:rationale]}",
                 session_id: sid,
                 tags: ['offline_judge', 'auto', verd],
                 judge_source: v[:source]
               )
             end
-            scored << { session_id: sid, score: v[:score], verdict: v[:verdict] }
+            scored << v.merge(session_id: sid)
           end
 
           mean = scored.empty? ? nil : (scored.sum { |r| r[:score].to_f } / scored.length).round(3)
@@ -1059,9 +1053,11 @@ module PWN
           rescue StandardError
             nil
           end
-          { session_id: sid, prompt: opts[:prompt], final: final, score: v[:score], verdict: v[:verdict], trace: trace }
+          v.merge(session_id: sid, prompt: opts[:prompt], final: final, trace: trace)
         rescue StandardError => e
-          { prompt: opts[:prompt], error: e.message, score: 0.0, trace: nil }
+          Reward.resolve_outcome(outcome: { source: :error, error: e.message }).merge(
+            session_id: sid, prompt: opts[:prompt], final: final, trace: trace
+          )
         end
 
         private_class_method def self.score_branch(opts = {})
@@ -1204,7 +1200,8 @@ module PWN
           smoke_ok = cand_smoke[:resolved].to_i >= base_smoke[:resolved].to_i &&
                      cand_smoke[:mean_score].to_f + 0.05 >= base_smoke[:mean_score].to_f
 
-          promote = resolved_win && mean_win && smoke_ok
+          outcomes_known = [baseline, candid, base_smoke, cand_smoke].all? { |r| r[:unknown]&.zero? }
+          promote = outcomes_known && resolved_win && mean_win && smoke_ok
           {
             baseline: opts[:baseline],
             candidate: opts[:candidate],
@@ -1223,6 +1220,7 @@ module PWN
             resolved_win: resolved_win,
             mean_win: mean_win,
             smoke_ok: smoke_ok,
+            outcomes_known: outcomes_known,
             promote: promote,
             evalset_size: evalset.length,
             gate_version: 2
@@ -1270,34 +1268,28 @@ module PWN
 
         private_class_method def self.replay_on_detailed(opts = {})
           tag = opts[:tag].to_s
-          return { resolved: 0, mean_score: 0.0, scores: [] } if tag.empty?
+          return { resolved: 0, mean_score: 0.0, scores: [], outcomes: [], unknown: Array(opts[:evalset]).length } if tag.empty?
 
-          scores = []
+          outcomes = []
           with_ollama_model(tag: tag) do
             Array(opts[:evalset]).each do |e|
-              r = self_play(prompt: e[:prompt], tag: "gate:#{tag}")
-              scores << r[:score].to_f
+              outcomes << self_play(prompt: e[:prompt], tag: "gate:#{tag}")
             end
           end
-          resolved = scores.count { |s| s >= 0.7 }
-          mean = scores.empty? ? 0.0 : (scores.sum / scores.length)
-          { resolved: resolved, mean_score: mean.round(3), scores: scores }
+          known = outcomes.reject { |r| r[:training_score].nil? }
+          resolved = known.count { |r| r[:success] == true }
+          mean = known.empty? ? 0.0 : (known.sum { |r| r[:training_score] } / known.length)
+          {
+            resolved: resolved, mean_score: mean.round(3),
+            scores: outcomes.map { |r| r[:score] }, outcomes: outcomes,
+            unknown: outcomes.length - known.length
+          }
         rescue StandardError
-          { resolved: 0, mean_score: 0.0, scores: [] }
+          { resolved: 0, mean_score: 0.0, scores: [], outcomes: outcomes || [], unknown: Array(opts[:evalset]).length }
         end
 
         private_class_method def self.replay_on(opts = {})
-          tag = opts[:tag].to_s
-          return 0 if tag.empty?
-
-          with_ollama_model(tag: tag) do
-            opts[:evalset].count do |e|
-              r = self_play(prompt: e[:prompt], tag: "gate:#{tag}")
-              r[:score].to_f >= 0.7
-            end
-          end
-        rescue StandardError
-          0
+          replay_on_detailed(tag: opts[:tag], evalset: opts[:evalset])[:resolved]
         end
 
         private_class_method def self.with_ollama_model(opts = {})

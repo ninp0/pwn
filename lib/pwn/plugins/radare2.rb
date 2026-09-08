@@ -100,6 +100,11 @@ module PWN
         cmdj(opts.merge(cmd: "axtj #{addr}"))
       end
 
+      public_class_method def self.xrefs_from(opts = {})
+        addr = opts[:addr].to_s
+        cmdj(opts.merge(cmd: "axfj #{addr}"))
+      end
+
       # Supported Method Parameters::
       # PWN::Plugins::Radare2.disasm(
       #   session: 'required - session id returned by #open',
@@ -108,7 +113,7 @@ module PWN
       # )
       public_class_method def self.disasm(opts = {})
         addr = opts[:addr].to_s
-        n = (opts[:n] || 32).to_i
+        n = (opts[:n] || opts[:len] || 32).to_i
         cmd(opts.merge(cmd: "pd #{n} @ #{addr}"))
       end
 
@@ -198,11 +203,18 @@ module PWN
             addr: 'required - address or flag to list xrefs to (e.g. main or 0x401000)'
           )
 
+          # List xrefs from an address or flag (axfj JSON).
+          #{self}.xrefs_from(
+            session: 'required - session id returned by #open',
+            addr: 'required - address or flag to list xrefs from'
+          )
+
           # Disassemble n instructions at addr (pd text).
           #{self}.disasm(
             session: 'required - session id returned by #open',
             addr: 'required - address or flag to disassemble from',
-            n: 'optional - instruction count (defaults to 32)'
+            n: 'optional - instruction count (defaults to 32)',
+            len: 'optional - alias for n, number of instructions to disassemble'
           )
 
           # List strings in the binary (izj JSON).

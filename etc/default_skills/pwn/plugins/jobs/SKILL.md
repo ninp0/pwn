@@ -35,6 +35,11 @@ PWN::Plugins::Jobs.required_bins(opts)
 
 - `required_bins`
 - `start`
+- `run`
+- `job_run`
+- `job_status`
+- `job_tail`
+- `job_kill`
 - `watch`
 - `status`
 - `tail`

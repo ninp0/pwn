@@ -59,3 +59,19 @@ PWN::AI::Agent::Registry.register(
     { reset: true, tools_cleared: before, file: PWN::AI::Agent::Metrics::METRICS_FILE }
   }
 )
+
+PWN::AI::Agent::Registry.register(
+  name: 'ai_usage',
+  toolset: 'metrics',
+  schema: {
+    name: 'ai_usage',
+    description: 'Per-call token counts and cumulative cost plus configured model routing.',
+    parameters: { type: 'object', properties: { session_id: { type: 'string' } } }
+  },
+  handler: lambda { |args|
+    {
+      usage: PWN::AI::Agent::Metrics.usage(session_id: args[:session_id] || args['session_id']),
+      routing: PWN::AI::Agent::Metrics.routing
+    }
+  }
+)

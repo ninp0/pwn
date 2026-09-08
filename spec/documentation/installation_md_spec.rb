@@ -3,6 +3,8 @@
 require 'spec_helper'
 require 'stringio'
 require 'timeout'
+require 'tmpdir'
+require 'open3'
 require 'pwn/setup'
 
 # Guards documentation/Installation.md from silently rotting.
@@ -110,10 +112,22 @@ RSpec.describe 'documentation/Installation.md' do
     end
 
     it '`pwn setup` and `pwn_setup` produce identical --list-profiles output' do
-      a = `#{RbConfig.ruby} #{File.join(repo_root, 'bin/pwn')} setup --list-profiles </dev/null 2>&1`
-      b = `#{RbConfig.ruby} #{File.join(repo_root, 'bin/pwn_setup')} --list-profiles </dev/null 2>&1`
-      expect(a).to eq(b)
-      PWN::Setup::PROFILES.each_key { |k| expect(a).to include(k.to_s) }
+      Dir.mktmpdir('pwn-list-profiles') do |home|
+        config_dir = File.join(home, '.pwn')
+        FileUtils.mkdir_p(config_dir)
+        config_path = File.join(config_dir, 'pwn.yaml')
+        fixture = "# unconfigured fixture; listing profiles must not load this file\n"
+        File.write(config_path, fixture)
+        outputs = [[File.join(repo_root, 'bin/pwn'), 'setup'], [File.join(repo_root, 'bin/pwn_setup')]].map do |command|
+          stdout, stderr, status = Open3.capture3({ 'HOME' => home }, RbConfig.ruby, *command, '--list-profiles', stdin_data: '')
+          expect(status.success?).to be(true), stderr
+          expect(stderr).to be_empty
+          stdout
+        end
+        expect(outputs.first).to eq(outputs.last)
+        PWN::Setup::PROFILES.each_key { |k| expect(outputs.first).to include(k.to_s) }
+        expect(File.read(config_path)).to eq(fixture)
+      end
     end
   end
 

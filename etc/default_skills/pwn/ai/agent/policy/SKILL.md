@@ -48,6 +48,7 @@ PWN::AI::Agent::Policy.state(opts)
 - `recommend`
 - `current_state`
 - `current_episode`
+- `current_context_state`
 - `detach_episode`
 - `attach_episode`
 - `load`

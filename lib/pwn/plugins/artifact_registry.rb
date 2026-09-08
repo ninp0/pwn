@@ -43,8 +43,13 @@ module PWN
       end
 
       public_class_method def self.get(opts = {})
-        path = opts[:path].to_s
-        raise 'ERROR: path is required' if path.empty?
+        sha = opts[:sha256].to_s
+        unless sha.empty?
+          dest = File.join(ROOT, 'sha256', sha[0, 2], sha)
+          path = dest if File.file?(dest)
+        end
+        path ||= opts[:path].to_s
+        raise 'ERROR: path is required' if path.to_s.empty?
         raise "ERROR: file not found: #{path}" unless File.file?(path)
 
         { path: path, sha256: Digest::SHA256.file(path).hexdigest, bytes: File.size(path), body: File.binread(path)[0, 65_536] }
@@ -99,9 +104,9 @@ module PWN
         FileUtils.mkdir_p(ROOT)
         File.open(meta, 'a') do |f|
           f.flock(File::LOCK_EX)
-          f.puts(JSON.generate(sha256: sha, size: bytes.bytesize, tool: opts[:tool], session: opts[:session_id], kind: opts[:kind], created_at: Time.now.utc.iso8601, source_path: src, dest: dest))
+          f.puts(JSON.generate(sha256: sha, size: bytes.bytesize, tool: opts[:tool], session: opts[:session_id], kind: opts[:kind], tags: Array(opts[:tags]), created_at: Time.now.utc.iso8601, source_path: src, dest: dest))
         end
-        { sha256: sha, path: dest, size: bytes.bytesize }
+        { sha256: sha, path: dest, size: bytes.bytesize, tags: Array(opts[:tags]) }
       end
 
       public_class_method def self.authors
@@ -127,7 +132,8 @@ module PWN
 
           # Read an artifact file and return sha256 plus a body cap.
           #{self}.get(
-            path: 'required - filesystem path of a registered artifact'
+            path: 'required - filesystem path of a registered artifact',
+            sha256: 'optional - content hash used when path is omitted'
           )
 
           # Store bytes under artifacts/sha256/<h2>/<hash> and append manifest.jsonl.
@@ -136,7 +142,8 @@ module PWN
             path: 'optional - filesystem path to read when bytes is omitted',
             tool: 'optional - tool name for provenance',
             session_id: 'optional - pwn-ai session id for provenance',
-            kind: 'optional - artifact kind'
+            kind: 'optional - artifact kind',
+            tags: 'optional - Array of short labels for this artifact'
           )
 
           # Page an artifact; grep: searches lines, ref: alias for path.

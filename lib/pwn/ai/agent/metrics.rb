@@ -169,6 +169,36 @@ module PWN
           }
         end
 
+        public_class_method def self.record_tokens(opts = {})
+          n = opts[:tokens].to_i
+          cost = opts[:cost].to_f
+          model = opts[:model].to_s
+          m = load
+          m[:usage] ||= { tokens: 0, cost: 0.0, calls: 0, by_model: {} }
+          m[:usage][:tokens] += n
+          m[:usage][:cost] += cost
+          m[:usage][:calls] += 1
+          m[:usage][:by_model][model] ||= { tokens: 0, cost: 0.0, calls: 0 }
+          m[:usage][:by_model][model][:tokens] += n
+          m[:usage][:by_model][model][:cost] += cost
+          m[:usage][:by_model][model][:calls] += 1
+          save(metrics: m)
+          m[:usage]
+        end
+
+        public_class_method def self.usage(opts = {})
+          _sid = opts[:session_id]
+          load[:usage] || { tokens: 0, cost: 0.0, calls: 0 }
+        end
+
+        public_class_method def self.routing(opts = {})
+          _n = opts[:n]
+          chain = (PWN::Env.dig(:ai, :routing) if defined?(PWN::Env))
+          Array(chain)
+        rescue StandardError
+          []
+        end
+
         # Supported Method Parameters::
         # ctx = PWN::AI::Agent::Metrics.to_context(
         #   limit: 'optional - cap number of tools included (default 8)',
@@ -557,9 +587,12 @@ module PWN
                     end
           task_ok = nil
           if defined?(Learning) && Learning.respond_to?(:outcomes)
-            rec = Learning.outcomes(limit: 200)
+            rec = Learning.outcomes(limit: 200).reject do |r|
+              r[:success].nil? || r[:status].to_s == 'unverified' || r[:verdict].to_s == 'unknown' ||
+                (r[:decision_version] && r[:training_score].nil?)
+            end
             if rec.any?
-              hits = rec.count { |r| r[:success] == true || r[:score].to_f >= 0.6 }
+              hits = rec.count { |r| r[:success] == true }
               task_ok = (hits.to_f / rec.length).round(3)
             end
           end
@@ -830,6 +863,23 @@ module PWN
             # Snapshot success rates per judge source for the LEARNING block.
             #{self}.snapshot(
               day: 'optional - reserved day key for rotation'
+            )
+
+            # Record token/cost for a model call.
+            #{self}.record_tokens(
+              tokens: 'optional - integer token count',
+              cost: 'optional - Float USD cost',
+              model: 'optional - model id string'
+            )
+
+            # Return cumulative token/cost usage.
+            #{self}.usage(
+              session_id: 'optional - unused reserved session id'
+            )
+
+            # Return ai.routing fallback chain from pwn.yaml.
+            #{self}.routing(
+              n: 'optional - unused reserved index'
             )
 
             # Print the AUTHOR(S) string for this module.

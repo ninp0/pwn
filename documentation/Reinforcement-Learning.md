@@ -65,6 +65,32 @@ high-return / high-score episodes.
 
 ## Reward signal (`PWN::AI::Agent::Reward`)
 
+`Reward.resolve_outcome` is the shared decision used by live learning and
+offline practice. The ledger retains the raw judge score, source, confidence,
+verdict, and verification evidence. Heuristic guesses, evaluator errors, and
+unresolved high-score/critic disagreements are unverified, with a nil
+`training_score`; they do not become policy updates, failures, or supervised
+success examples. Requeuing a disputed result rejudges its original session
+instead of raising its score automatically.
+
+Writing “PASS” in an answer, returning exit zero, or confirming one claim does
+not establish completion. A trusted host verifier can call
+`Reward.record_verification` after checking every original-request criterion,
+providing actual boolean check results and evidence. Records are bound to the
+current session request and invalidated by subsequent tool execution. The API
+trusts the host verifier to cover the complete request; it cannot infer missing
+criteria or automatically verify arbitrary tasks. LLM judgments remain fallible.
+
+Policy observations also capture allowlisted operation, argument-role/type
+features, and result classification, without retaining raw argument values.
+These condition next-tool ranking only after enough contextual samples exist,
+with backoff to broad tool scores. Ranking remains advisory.
+
+For an independently checked learning-on/off experiment, see
+[Policy-Benchmark.md](Policy-Benchmark.md). It exercises real local handlers and
+controller updates on separate training and held-out inputs; it does not prove
+that a live language model performs better.
+
 | Method | What it does |
 |--------|--------------|
 | **R1** `.judge` | Cheap LLM outcome score on `(request, final)` -> `{score:0..1, verdict:, rationale:, key_step:, source:}`. Calls the active engine `.chat` with a short timeout (default 12s). `Reflect.on` is used only when `module_reflection` is on. Fallback scores completeness, plan cover, claims, and tool-trace echo. Token overlap is only a small on-topic gate. |
@@ -147,7 +173,7 @@ This is the live control list. Track the outcomes, not source comments.
 |-------|------|
 | **E1** `Metrics.changepoints` + `Loop.attribute_cause` | Env-drift-attributed failures get `cause: :env_drift` and do not inflate `[REPEATING]`. |
 | **E2** `Extrospection.correlate` | Lead-lag style joins ("tool X started failing after toolchain Y changed"). |
-| **E3** `Reward.verify_as_reward` | Browser-backed claim checks can floor/cap the outcome score. |
+| **E3** `Reward.verify_as_reward` | Browser-backed claim checks provide diagnostics and refutation caps; one confirmed claim cannot promote whole-request success. |
 
 ## Config (`PWN::Env[:ai][:agent]`)
 

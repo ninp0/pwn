@@ -612,7 +612,9 @@ module PWN
       text = text.gsub(%r{Bearer\s+[A-Za-z0-9._\-+/=]{12,}}i) { |m| redacted_token(kind: 'bearer', value: m) }
       text = text.gsub(/-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----/m) { |m| redacted_token(kind: 'pem', value: m) }
       text = text.gsub(/(password\s*[:=]\s*)\S+/i) { "#{Regexp.last_match(1)}#{redacted_token(kind: 'password', value: Regexp.last_match(0))}" }
-      text.gsub(/Set-Cookie:\s*[^\r\n]+/i) { |m| redacted_token(kind: 'cookie', value: m) }
+      text = text.gsub(/Set-Cookie:\s*[^\r\n]+/i) { |m| redacted_token(kind: 'cookie', value: m) }
+      text = PWN::Plugins::Vault.redact(text: text) if defined?(PWN::Plugins::Vault)
+      text
     end
 
     private_class_method def self.redact_disabled?

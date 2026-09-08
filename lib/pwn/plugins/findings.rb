@@ -20,22 +20,37 @@ module PWN
         raise 'ERROR: title is required' if title.empty?
 
         arts = Array(opts[:poc_artifacts]).map(&:to_s).reject(&:empty?)
-        arts << opts[:poc].to_s unless opts[:poc].to_s.empty?
+        if opts[:poc].is_a?(Hash)
+          arts << opts[:poc][:path].to_s unless opts[:poc][:path].to_s.empty?
+        else
+          arts << opts[:poc].to_s unless opts[:poc].to_s.empty?
+        end
         raise 'ERROR: poc_artifacts are required' if arts.empty?
 
-        ev = opts[:evidence].to_s
-        raise 'ERROR: evidence must be at least 40 characters citing the PoC' if ev.length < 40
+        ev = opts[:evidence]
+        ev_list = Array(ev).map(&:to_s)
+        ev_text = ev_list.join(' ')
+        raise 'ERROR: evidence must be at least 40 characters citing the PoC' if ev_text.length < 40
 
+        sha_ev = arts.filter_map do |p|
+          next unless File.file?(p)
+
+          Digest::SHA256.file(p).hexdigest
+        end
+        proven = sha_ev.any?
         row = {
           id: SecureRandom.hex(6),
           title: title,
-          severity: (opts[:severity] || 'info').to_s,
+          severity: proven ? (opts[:severity] || 'info').to_s : 'unproven',
+          cvss_vector: (opts[:cvss_vector] || opts[:cvss]).to_s,
+          affected_asset: (opts[:affected_asset] || opts[:host]).to_s,
           host: opts[:host].to_s,
-          evidence: opts[:evidence].to_s,
-          poc: opts[:poc].to_s,
+          evidence: sha_ev.any? ? sha_ev : ev_list,
+          poc: opts[:poc].is_a?(Hash) ? opts[:poc] : { type: 'file', path: arts.first, reproduction_steps: opts[:reproduction_steps].to_s },
           poc_artifacts: arts,
+          chain_refs: Array(opts[:chain_refs] || opts[:chain_parent_id]).map(&:to_s).reject(&:empty?),
           cvss: opts[:cvss].to_s,
-          status: (opts[:status] || 'open').to_s,
+          status: proven ? (opts[:status] || 'open').to_s : 'unproven',
           engagement_id: opts[:engagement_id].to_s,
           chain_parent_id: opts[:chain_parent_id].to_s,
           session_id: opts[:session_id].to_s,
@@ -98,6 +113,21 @@ module PWN
         child.merge(composite_severity: sev)
       end
 
+      public_class_method def self.chain_score(opts = {})
+        ids = Array(opts[:ids] || opts[:chain_refs]).map(&:to_s)
+        rows = report.select { |r| ids.include?(r[:id].to_s) || ids.include?(r[:chain_parent_id].to_s) }
+        rows = report if rows.empty? && ids.empty?
+        ranks = { 'info' => 0, 'low' => 1, 'medium' => 2, 'high' => 3, 'critical' => 4, 'unproven' => 0 }
+        peak = rows.map { |r| ranks[r[:severity].to_s] || 0 }.max || 0
+        linked = rows.length >= 2
+        sev = if linked && peak >= 2
+                'critical'
+              else
+                %w[info low medium high critical][peak] || 'info'
+              end
+        { chain_refs: rows.map { |r| r[:id] }, score: sev, combined_severity: sev, n: rows.length }
+      end
+
       public_class_method def self.render(opts = {})
         dir = opts[:dir_path].to_s
         dir = File.join(Dir.home, '.pwn', 'exports') if dir.empty?
@@ -148,9 +178,13 @@ module PWN
             severity: 'optional - info|low|medium|high|critical (defaults to info)',
             host: 'optional - affected host or URL',
             evidence: 'optional - proof text or path',
-            poc: 'optional - filesystem path of a PoC',
+            poc: 'optional - filesystem path of a PoC or Hash with type/path/reproduction_steps',
             poc_artifacts: 'required - Array of artifact paths proving the issue',
             cvss: 'optional - CVSS vector or score string',
+            cvss_vector: 'optional - CVSS 3.1 vector string (defaults to cvss)',
+            affected_asset: 'optional - host or URL the finding applies to (defaults to host)',
+            reproduction_steps: 'optional - how to replay the PoC',
+            chain_refs: 'optional - Array of related finding ids',
             status: 'optional - open|closed (defaults to open)',
             engagement_id: 'optional - engagement identifier',
             session_id: 'optional - pwn-ai session id',
@@ -187,6 +221,12 @@ module PWN
           #{self}.evidence_verify(
             engagement_id: 'optional - engagement name (defaults to default)',
             name: 'optional - alias for engagement_id'
+          )
+
+          # Recompute combined severity for chained findings.
+          #{self}.chain_score(
+            ids: 'optional - Array of finding ids to score together',
+            chain_refs: 'optional - alias for ids'
           )
 
           # Print the AUTHOR(S) string for this module.

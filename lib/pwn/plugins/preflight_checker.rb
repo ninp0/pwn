@@ -1,5 +1,9 @@
 # frozen_string_literal: true
 
+require 'json'
+require 'fileutils'
+require 'time'
+
 module PWN
   module Plugins
     # Plugin/binary/capability preflight. Plugins declare required_bins /
@@ -82,6 +86,26 @@ module PWN
           return { capability: want.to_s, covered: covered, bins: bins }
         end
         CAPABILITIES.keys.map { |k| capability_coverage(capability: k) }
+      end
+
+      public_class_method def self.manifest(opts = {})
+        _refresh = opts[:refresh]
+        path = File.join(Dir.home, '.pwn', 'capabilities.json')
+        FileUtils.mkdir_p(File.dirname(path))
+        caps = {}
+        PLUGIN_DEPS.each do |mod, dep|
+          missing = Array(dep[:bins]).reject { |b| bin?(name: b) }
+          caps[mod] = { bins: dep[:bins], missing: missing, ok: missing.empty?, caps: Array(dep[:caps]) }
+        end
+        row = {
+          at: Time.now.utc.iso8601,
+          cap_net_raw: cap_net_raw?,
+          container: bin?(name: 'podman') || bin?(name: 'docker'),
+          plugins: caps,
+          coverage: capability_coverage
+        }
+        File.write(path, JSON.pretty_generate(row))
+        row.merge(path: path)
       end
 
       TASK_BINS = {
@@ -227,6 +251,11 @@ module PWN
           #{self}.host_summary(
             names: 'optional - names value consumed by #host_summary',
             limit: 'optional - limit value consumed by #host_summary'
+          )
+
+          # Refresh ~/.pwn/capabilities.json with bin/CAP_* presence.
+          #{self}.manifest(
+            refresh: 'optional - unused reserved refresh flag'
           )
 
           # Print the AUTHOR(S) string for this module.

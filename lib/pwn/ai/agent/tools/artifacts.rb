@@ -64,3 +64,45 @@ PWN::AI::Agent::Registry.register(
     )
   }
 )
+PWN::AI::Agent::Registry.register(
+  name: 'artifact_put',
+  toolset: 'sessions',
+  schema: {
+    name: 'artifact_put',
+    description: 'Store bytes or a file in the content-addressed artifact store.',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string' },
+        bytes: { type: 'string' },
+        kind: { type: 'string' },
+        tags: { type: 'array', items: { type: 'string' } },
+        session_id: { type: 'string' }
+      }
+    }
+  },
+  handler: lambda { |args|
+    PWN::Plugins::ArtifactRegistry.put(
+      path: args[:path] || args['path'],
+      bytes: args[:bytes] || args['bytes'],
+      kind: args[:kind] || args['kind'],
+      tags: args[:tags] || args['tags'],
+      session_id: args[:session_id] || args['session_id']
+    )
+  }
+)
+PWN::AI::Agent::Registry.register(
+  name: 'artifact_get',
+  toolset: 'sessions',
+  schema: {
+    name: 'artifact_get',
+    description: 'Fetch an artifact by sha256 or path.',
+    parameters: {
+      type: 'object',
+      properties: { sha256: { type: 'string' }, path: { type: 'string' } }
+    }
+  },
+  handler: lambda { |args|
+    PWN::Plugins::ArtifactRegistry.get(sha256: args[:sha256] || args['sha256'], path: args[:path] || args['path'])
+  }
+)

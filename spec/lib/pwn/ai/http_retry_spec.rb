@@ -43,6 +43,33 @@ describe PWN::AI::HttpRetry do
     PWN::Plugins::Log.stop_debug if defined?(PWN::Plugins::Log)
   end
 
+  it 'honors Retry-After seconds and does not use sub-second fallback' do
+    resp = instance_double('RestClient::Response', headers: { retry_after: '45' })
+    expect(described_class.retry_after_s(response: resp, retry_count: 1)).to eq(45.0)
+    expect(described_class.retry_after_s(retry_count: 1)).to be >= 2.0
+    expect(described_class.retry_after_s(retry_count: 4)).to be >= 8.0
+  end
+
+  it 'treats insufficient_quota 429 bodies as non-retryable' do
+    resp = instance_double('RestClient::Response', body: '{"error":{"code":"insufficient_quota","message":"You exceeded your current quota"}}')
+    err = instance_double('RestClient::TooManyRequests', message: '429 Too Many Requests', response: resp)
+    expect(described_class.quota_exhausted?(error: err)).to eq(true)
+    expect(described_class.quota_exhausted?(error: '429 rate_limit_exceeded')).to eq(false)
+  end
+
+  it 'builds an operator billing line from credit_balance_exhausted 429 bodies' do
+    resp = instance_double(
+      'RestClient::Response',
+      body: '{"error":{"message":"You have no credits remaining. Add credits to continue using the API at https://platform.openai.com/settings/organization/billing/.","type":"insufficient_quota","code":"credit_balance_exhausted"}}'
+    )
+    err = instance_double('RestClient::TooManyRequests', message: '429 Too Many Requests', response: resp)
+    expect(described_class.quota_exhausted?(error: err)).to eq(true)
+    msg = described_class.quota_message(error: err)
+    expect(msg).to include('no credits')
+    expect(msg).to include('platform.openai.com/settings/organization/billing')
+    expect(msg).to include('ChatGPT')
+  end
+
   {
     'PWN::AI::Grok' => '/opt/pwn/lib/pwn/ai/grok.rb',
     'PWN::AI::OpenAI' => '/opt/pwn/lib/pwn/ai/open_ai.rb',

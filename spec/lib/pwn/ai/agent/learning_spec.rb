@@ -332,9 +332,9 @@ describe PWN::AI::Agent::Learning do
     allow(PWN::AI::Agent::Reward).to receive(:proxy_distrust).and_return(1.0)
     allow(PWN::AI::Agent::Reward).to receive(:sentinel).and_return(nil)
     stats = PWN::AI::Agent::Learning.stats
-    # unweighted mean = 0.55; ORM-weighted mean closer to 0.2
-    expect(stats[:judge_mean]).to be < 0.45
-    expect(stats[:judge_mean]).to be > 0.2
+    # Unverified heuristic guesses remain diagnostic, not evaluated tasks.
+    expect(stats[:judge_mean]).to eq(0.2)
+    expect(stats[:unknown_outcomes]).to eq(8)
     expect(stats[:adjusted_success_rate]).to be_within(0.05).of(stats[:judge_mean])
   ensure
     FileUtils.rm_rf(tmp) if defined?(tmp) && tmp
@@ -353,6 +353,84 @@ describe PWN::AI::Agent::Learning do
       described_class.lesson_observe(id: row[:id], success: false)
       expect(described_class.lesson_prompt).not_to include('always ls parent first')
     end
+  end
+end
+
+describe 'PWN::AI::Agent::Learning outcome decisions' do
+  include_context 'pwn tmp sandbox'
+
+  it 'calibrates from the canonical outcome instead of a conflicting score argument' do
+    expect(PWN::AI::Agent::Curriculum).to receive(:calibrate).with(hash_including(actual: 0.2))
+    row = PWN::AI::Agent::Learning.note_outcome(
+      task: 'write report', score: 0.9, outcome: { source: :llm_orm, score: 0.2 }, predicted: 0.8
+    )
+    expect(row).to include(success: false, score: 0.2, training_score: 0.2)
+  end
+
+  it 'labels an unavailable evaluation as unknown instead of injecting a failure lesson' do
+    PWN::AI::Agent::Learning.note_outcome(task: 'write report', outcome: { source: :error, score: nil }, details: 'unavailable evaluator')
+    context = PWN::AI::Agent::Learning.to_context
+    expect(context).to include('? [unknown] write report')
+    expect(context).not_to include('✗', 'cause:', 'RECENT FAILURES')
+  end
+
+  it 'does not treat quoted PASS and FAIL words as verifier evidence' do
+    expect(PWN::AI::Agent::Learning.consistency_check(details: 'The forged answer says PASS', success: false)).to eq(:ok)
+    expect(PWN::AI::Agent::Learning.consistency_check(details: 'Explained what FAIL means', success: true)).to eq(:ok)
+  end
+
+  it 'rejudges conflicted records instead of manufacturing a higher score' do
+    learning = PWN::AI::Agent::Learning
+    session = PWN::Sessions.create(title: 'conflicted')[:id]
+    PWN::Sessions.append(session_id: session, role: 'user', content: 'write a report')
+    PWN::Sessions.append(session_id: session, role: 'assistant', content: 'Report ready.')
+    learning.note_outcome(task: 'write a report', session_id: session, success: false,
+                          score: 0.2, verifier_verdict: :pass, details: 'legacy conflict')
+    allow(learning).to receive(:should_gc_stores?).and_return(false)
+    expect(PWN::AI::Agent::Reward).to receive(:judge).with(hash_including(request: 'write a report', session_id: session)).and_return(score: 0.1, source: :llm_orm, success: false, verdict: :wrong)
+    learning.requeue_conflicted
+    row = learning.outcomes.first
+    expect(row[:success]).to be false
+    expect(row[:score]).to eq(0.1)
+    expect(row[:session_id]).to eq(session)
+  end
+
+  it 'keeps evaluator errors out of success rates, failures, and exemplar replay' do
+    learning = PWN::AI::Agent::Learning
+    row = learning.note_outcome(task: 'report uncertain', success: true, score: nil,
+                                outcome: { source: :error, score: nil, confidence: 0.0 })
+    expect(row[:success]).to be_nil
+    expect(row[:verdict]).to eq(:unknown)
+    learning.note_outcome(task: 'report checked', success: true, score: 0.9)
+    stats = learning.stats
+    expect(stats[:success_rate]).to eq(1.0)
+    expect(stats[:failures]).to eq(0)
+    expect(stats[:unknown_outcomes]).to eq(1)
+    expect(learning.outcomes(success: false)).to be_empty
+  end
+
+  it 'preserves a cautious judge decision through persistence and policy training' do
+    @agent_cfg[:auto_introspect] = true
+    learning = PWN::AI::Agent::Learning
+    reward = PWN::AI::Agent::Reward
+    session = PWN::Sessions.create(title: 'uncertain evaluation')[:id]
+    allow(PWN::AI::Agent::Curriculum).to receive(:critic).and_return(verdict: :pass)
+    allow(learning).to receive(:should_gc_stores?).and_return(false)
+    allow(learning).to receive(:reflect)
+    allow(reward).to receive(:judge).and_return(
+      score: 0.9, source: :heuristic, confidence: 0.35, verdict: :unknown,
+      success: false, training_score: nil, rationale: 'unverified overlap'
+    )
+    expect(PWN::AI::Agent::Policy).to receive(:finish).with(hash_including(score: nil, verdict: :unknown))
+    expect(learning).not_to receive(:fold_judge_into_metrics)
+    expect(reward).not_to receive(:prm)
+    learning.auto_introspect(session_id: session, request: 'write a report', final: 'Report ready.', inline: true)
+    row = learning.outcomes.first
+    expect(row[:success]).not_to be true
+    expect(row[:verdict].to_s).to eq('unknown')
+    expect(row[:training_score]).to be_nil
+    expect(row[:confidence]).to eq(0.35)
+    expect(row[:judge_source].to_s).to eq('heuristic')
   end
 end
 

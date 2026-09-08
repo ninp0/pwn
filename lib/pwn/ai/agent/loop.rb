@@ -171,7 +171,7 @@ module PWN
           return unless debug_on?(opts)
           return unless defined?(PWN::Plugins::Log)
 
-          if defined?(TurnFinalizer) && TurnFinalizer.user_path?
+          if opts[:nested] || (defined?(TurnFinalizer) && TurnFinalizer.user_path?)
             debug_progress(msg: 'nested Loop.run skip_roll', debug: opts[:debug])
             return
           end
@@ -704,7 +704,7 @@ module PWN
           request = opts[:request].to_s
           unmet = []
           files = Array(contract[:paths]) + Array(contract[:proofs])
-          files.each { |path| unmet << "file_exists:#{path}" if deliverable_missing?(path: path) }
+          files.each { |path| unmet << "deliverable_missing:#{path}" if deliverable_missing?(path: path) }
           trace_files = session_files(messages: opts[:messages])
           unmet << 'issue_work_proofs' if contract[:issue_work] && Array(contract[:proofs]).empty? && files.empty? && trace_files.empty?
           unmet << 'skills' if declared_skills_missing?(skills: contract[:skills], request: request)
@@ -713,6 +713,7 @@ module PWN
           asked_tech = Array(contract[:techniques]).select { |tech| request.downcase.include?(tech.to_s.downcase) }
           unmet << 'hosts' if evidence_tokens_missing?(tokens: asked_hosts, blob: blob)
           unmet << 'techniques' if evidence_tokens_missing?(tokens: asked_tech, blob: blob)
+          Array(Swarm.honesty_unmet(swarm_id: Thread.current[:pwn_swarm_id])).each { |u| unmet << u } if defined?(Swarm)
           unmet
         rescue StandardError
           []
@@ -1063,6 +1064,9 @@ module PWN
         end
 
         private_class_method def self.active_engine
+          tl = Thread.current[:pwn_swarm_engine].to_s
+          return tl.downcase.to_sym unless tl.empty?
+
           e = (PWN::Env.dig(:ai, :active) if defined?(PWN::Env)).to_s.downcase.to_sym
           e == :'' ? :openai : e
         rescue StandardError
@@ -1117,9 +1121,16 @@ module PWN
           Metrics.record(name: name, success: sem[:semantic_ok], duration: dur, error: sem[:err], engine: opts[:engine]) if defined?(Metrics)
           # R5 — live MDP step. Hygiene reward only; terminal credit is judge.
           if defined?(PWN::AI::Agent::Policy) && Policy.respond_to?(:observe_step)
+            policy_args = begin
+              opts[:args].is_a?(String) ? JSON.parse(opts[:args]) : opts[:args]
+            rescue JSON::ParserError
+              nil
+            end
             Policy.observe_step(
               session_id: opts[:session_id],
               action: name,
+              args: policy_args,
+              result_type: sem[:shape],
               ok: sem[:semantic_ok],
               duration: dur,
               engine: opts[:engine],
@@ -1394,7 +1405,9 @@ module PWN
           hint = Swarm.ask(
             name: persona.to_s,
             request: "Local agent is stuck on: #{request}\nFailed attempts: #{summary}\n" \
-                     'Give a 3-line corrective hint (which tool, which args, why). Reply with the hint ONLY.'
+                     'Give a 3-line corrective hint (which tool, which args, why). Reply with the hint ONLY.',
+            swarm_id: Thread.current[:pwn_swarm_id],
+            text_only: true
           )
           reply = hint.is_a?(Hash) ? hint[:reply].to_s : hint.to_s
           Mistakes.record(tool: 'escalation', error: "local stuck after #{turn_fails.values.sum} fails; frontier hint requested", session_id: opts[:session_id], source: :loop) if defined?(Mistakes)
@@ -1702,10 +1715,12 @@ module PWN
 
           mod = Object.const_get(mod_name)
           if mod.respond_to?(:chat_with_tools)
-            # xAI/OpenAI reject Hash function.arguments / Hash content (422 map→string).
+            # xAI rejects Hash function.arguments / Hash content (422 map→string).
+            # OpenAI sanitizes inside its provider so native Responses reasoning
+            # survives until the credential-specific transport is selected.
             # Ollama / Open WebUI reject *string* function.arguments (HTTP 400
             # "can't find closing '}' symbol") — opposite of OpenAI wire form.
-            wire_msgs = if %i[grok openai].include?(engine)
+            wire_msgs = if engine == :grok
                           openai_wire_messages(messages: messages)
                         elsif local_engine?(engine: engine)
                           ollama_wire_messages(messages: messages)
@@ -2727,7 +2742,7 @@ module PWN
           loud_debug_tui!(debug: opts[:debug])
           debug_progress(msg: "Loop.run start request=#{request[0, 240]}", debug: opts[:debug])
           ToolGuard.reset_timeout_budget! if defined?(ToolGuard) && ToolGuard.respond_to?(:reset_timeout_budget!)
-          nested = defined?(TurnFinalizer) && TurnFinalizer.user_path?
+          nested = opts[:nested] == true || Thread.current[:pwn_swarm_depth].to_i.positive? || (defined?(TurnFinalizer) && TurnFinalizer.user_path?)
           TurnFinalizer.enter_user_path! if defined?(TurnFinalizer)
           Thread.current[:pwn_loop_nested] = nested
           bound = operator_bound_refusal(from: opts[:from] || opts[:account])
@@ -2942,6 +2957,14 @@ module PWN
 
             t0 = Time.now
             begin
+              # Observations update the policy's context during execution.
+              # Refresh exposure for the next hop without widening its scope
+              # or substituting a generated goal for the original request.
+              if tools_called.positive?
+                tools = Registry.definitions(enabled: opts[:enabled_toolsets], relevance: request, core_only: core_only, intent: intent)
+                no_tools = Array(tools).empty?
+                Thread.current[:pwn_loop_no_tools] = no_tools
+              end
               repair_tool_history!(messages: messages)
               msg = call_engine(messages: messages, tools: tools, ts_state: ts_state)
             rescue StandardError => e
@@ -3161,6 +3184,11 @@ module PWN
           end
           raise
         rescue StandardError => e
+          if defined?(PWN::AI::HttpRetry) && PWN::AI::HttpRetry.quota_exhausted?(error: e)
+            msg = PWN::AI::HttpRetry.quota_message(error: e)
+            debug_progress(msg: "engine quota: #{msg}")
+            return msg
+          end
           if defined?(PWN::Plugins::Log) && PWN::Plugins::Log.respond_to?(:note_exception!)
             PWN::Plugins::Log.note_exception!(error: e, where: 'Loop.run', which_self: self)
           else
@@ -3260,7 +3288,11 @@ module PWN
               debug: 'optional - debug value consumed by #run',
               from: 'optional - sender account or address to bind as operator',
               account: 'optional - operator account id to bind',
-              force_tools: 'optional - force tools value consumed by #run'
+              force_tools: 'optional - force tools value consumed by #run',
+              nested: 'optional - true for Swarm/child Loop.run (skip RN footer)',
+              core_only: 'optional - restrict to CORE_TOOLS when true',
+              trace: 'optional - enable TracePoint debug for this run',
+              debug_tee: 'optional - IO to tee debug logs'
             )
 
             # Remaining time/token/mutation budget for the current loop.

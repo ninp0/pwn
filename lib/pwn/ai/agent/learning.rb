@@ -103,18 +103,20 @@ module PWN
 
           tags = Array(opts[:tags]).map(&:to_s)
           details = opts[:details].to_s[0, OUTCOME_DETAILS_MAX]
-          # Refuse solved-at-fail (and the reverse): when a score is present,
-          # tags / details / boolean success must match verdict_for_score.
-          # Soft HER stays soft so C3 positives are not flipped to true/false.
-          if opts.key?(:score)
-            score = opts[:score].to_f
-            want = verdict_for_score(score: score).to_s
+          decision = if opts[:outcome].is_a?(Hash)
+                       Reward.resolve_outcome(outcome: opts[:outcome])
+                     elsif opts.key?(:score) && success != 'soft'
+                       Reward.resolve_outcome(outcome: { score: opts[:score], source: opts[:judge_source] || :manual, confidence: opts[:confidence] })
+                     end
+          if decision || opts.key?(:score)
+            score = decision ? decision[:score] : opts[:score].to_f
+            want = (decision ? decision[:verdict] : verdict_for_score(score: score)).to_s
             tags = (tags - %w[solved partial wrong unknown]) << want
             details = details.sub(
               /\A(solved|partial|wrong|unknown)\(\d+(?:\.\d+)?\)/i,
-              "#{want}(#{format('%.2f', score)})"
+              "#{want}(#{score.nil? ? 'unknown' : format('%.2f', score)})"
             )
-            success = (score >= 0.6) if [true, false].include?(success)
+            success = decision[:success] if decision
           end
 
           entry = {
@@ -126,19 +128,22 @@ module PWN
             tags: tags,
             timestamp: Time.now.utc.iso8601
           }
-          entry[:score] = opts[:score].to_f if opts.key?(:score)
+          entry[:score] = score if decision || opts.key?(:score)
+          if decision
+            %i[verdict confidence training_score decision_version verification verifier_verdict grounded critic_pass judge_score].each do |key|
+              entry[key] = decision[key] if decision.key?(key)
+            end
+            entry[:status] = 'unverified' if decision[:training_score].nil?
+          end
           src = opts[:judge_source].to_s
+          src = decision[:source].to_s if decision && decision[:source]
           entry[:judge_source] = src unless src.empty?
-          vv = (opts[:verifier_verdict] || opts['verifier_verdict']).to_s
+          vv = (decision ? decision[:verifier_verdict] : opts[:verifier_verdict] || opts['verifier_verdict']).to_s
           entry[:verifier_verdict] = vv unless vv.empty?
           vc = (opts[:verdict_class] || opts['verdict_class']).to_s
           entry[:verdict_class] = vc unless vc.empty?
           entry[:remediation_hint] = opts[:remediation_hint].to_s unless opts[:remediation_hint].to_s.empty?
-          if vv == 'pass' && opts.key?(:score) && opts[:score].to_f < 0.6
-            entry[:status] = 'conflicted'
-            entry[:success] = true
-            success = true
-          end
+          entry[:status] = 'conflicted' if opts[:verifier_verdict].to_s == 'pass' && !entry[:verification] && opts[:score].to_f < 0.6
           check = consistency_check(details: details, success: success, rationale: opts[:rationale])
           if check == :disputed
             entry[:status] = 'disputed'
@@ -154,23 +159,22 @@ module PWN
           # are promoted into PWN::Memory[:lesson] so PromptBuilder recall
           # survives across sessions. Without this, the agent re-learns
           # "run rubocop after every patch" every turn (empty memory.json).
-          promote_process_lesson(entry: entry) if defined?(PWN::Memory) && entry[:status].to_s != 'conflicted'
-          if opts.key?(:score) && defined?(Curriculum) && Curriculum.respond_to?(:calibrate)
+          promote_process_lesson(entry: entry) if defined?(PWN::Memory) && !%w[conflicted unverified].include?(entry[:status].to_s)
+          if opts.key?(:score) && (!decision || !decision[:training_score].nil?) && defined?(Curriculum) && Curriculum.respond_to?(:calibrate)
             pred = opts[:predicted]
             pred = Thread.current[:pwn_plan_predicted] if pred.nil?
             pred = opts[:confidence] if pred.nil?
             eng = opts[:engine]
             eng = (PWN::Env.dig(:ai, :active) if defined?(PWN::Env)) if eng.to_s.empty?
-            Curriculum.calibrate(predicted: pred, actual: opts[:score], engine: eng)
+            Curriculum.calibrate(predicted: pred, actual: decision ? decision[:training_score] : opts[:score], engine: eng)
           end
           entry
         end
 
         public_class_method def self.consistency_check(opts = {})
-          details = "#{opts[:details]} #{opts[:rationale]}"
-          success = opts[:success]
-          return :disputed if details.match?(/\bPASS\b/) && success == false
-          return :disputed if details.match?(/\bFAIL\b/) && success == true && !details.match?(/\bPASS\b/)
+          outcome = opts[:outcome]
+          return :ok unless outcome.is_a?(Hash)
+          return :disputed if Reward.resolve_outcome(outcome: outcome)[:success] != opts[:success]
 
           :ok
         end
@@ -201,6 +205,7 @@ module PWN
             nil
           end
           rows.compact!
+          rows.reject! { |r| r[:decision_version] && r[:training_score].nil? } unless want_ok.nil?
           rows.select! { |r| want_ok == true ? r[:success] == true : r[:success] == want_ok } unless want_ok.nil?
           rows.select! { |r| Array(r[:tags]).any? { |t| t.to_s.downcase.include?(tag) } } unless tag.empty?
           rows.reverse.first(limit)
@@ -212,11 +217,13 @@ module PWN
         public_class_method def self.stats
           rows   = outcomes(limit: 10_000)
           total  = rows.length
+          rows = rows.reject { |r| (r[:decision_version] && r[:training_score].nil?) || r[:success].nil? }
+          evaluated = rows.length
           ok     = rows.count { |r| r[:success] == true }
           skills = defined?(PWN::Skills) && PWN::Skills.is_a?(Hash) ? PWN::Skills.keys.length : 0
           mem    = defined?(PWN::Memory) ? PWN::Memory.load.keys.length : 0
-          raw    = total.positive? ? (ok.to_f / total).round(3) : 0.0
-          jmean  = total.positive? ? weighted_judge_mean(rows: rows) : nil
+          raw    = evaluated.positive? ? (ok.to_f / evaluated).round(3) : 0.0
+          jmean  = evaluated.positive? ? weighted_judge_mean(rows: rows) : nil
           distrust = 0.0
           distrust = Reward.proxy_distrust.to_f.clamp(0.0, 1.0) if defined?(Reward) && Reward.respond_to?(:proxy_distrust)
           orm = rows.select { |r| r[:judge_source].to_s != 'heuristic' && r[:source].to_s != 'heuristic' }
@@ -227,8 +234,9 @@ module PWN
           heur_ok = heur.count { |r| r[:success] == true }
           {
             total_outcomes: total,
+            unknown_outcomes: total - evaluated,
             successes: ok,
-            failures: total - ok,
+            failures: rows.count { |r| r[:success] == false },
             success_rate: raw,
             success_rate_orm: orm_n.positive? ? (orm_ok.to_f / orm_n).round(3) : 0.0,
             success_rate_heur: heur_n.positive? ? (heur_ok.to_f / heur_n).round(3) : 0.0,
@@ -274,17 +282,22 @@ module PWN
           return '' if rows.empty? && fails.empty?
 
           fmt = lambda do |r|
+            unknown = r[:status].to_s == 'unverified' || (r[:decision_version] && r[:training_score].nil?)
             flag = case r[:success]
                    when true then '✓'
                    when 'soft', :soft then '∼'
                    else '✗'
                    end
             score = r.key?(:score) ? format('%.2f', r[:score].to_f) : '-'
+            if unknown
+              flag = '?'
+              score = 'unknown'
+            end
             task  = display_task(task: r[:task])
             line  = "  #{flag} [#{score}] #{task} (#{r[:timestamp]})"
             # Surface a one-line cause crumb so the agent can actually learn
             # from failures instead of only seeing that they failed.
-            if r[:success] != true
+            if r[:success] != true && !unknown
               if r[:verdict_class].to_s == ''
                 crumb = cause_crumb(details: r[:details])
                 line += "\n      cause: #{crumb}" unless crumb.empty?
@@ -632,14 +645,10 @@ module PWN
 
           # R1 judge — always attempt (heuristic is cheap; LLM gated inside)
           stages_run << :judge
-          v = Reward.judge(request: opts[:request], final: opts[:final], session_id: session_id, proxy_ok: proxy_ok, predicted: opts[:predicted]) if defined?(Reward)
-          v ||= { score: proxy_ok ? 1.0 : 0.0, success: proxy_ok, verdict: proxy_ok ? :solved : :wrong }
-          v[:score] = [v[:score], 0.3].min if crit[:verdict] == :flaw && v[:score].to_f < 0.6
-          # P29 — critic floor used to leave stale verdict=:solved at score=0.3,
-          # producing learning.jsonl rows tagged "solved" with success=false
-          # (116+ rows). Always resync verdict/success from the final score.
-          v[:verdict] = verdict_for_score(score: v[:score])
-          v[:success] = v[:score].to_f >= 0.6
+          critic_pass = crit[:verdict] == :flaw ? false : nil
+          v = Reward.judge(request: opts[:request], final: opts[:final], session_id: session_id, proxy_ok: proxy_ok, predicted: opts[:predicted], critic_pass: critic_pass) if defined?(Reward)
+          v ||= { score: nil, source: :error, verdict: :unknown, success: nil }
+          v = Reward.resolve_outcome(outcome: v, critic_pass: critic_pass)
           ok = v[:success]
 
           # W1 pending user_correction pair
@@ -687,20 +696,23 @@ module PWN
             task: task_txt,
             success: ok,
             score: v[:score],
+            outcome: v,
             details: "#{v[:verdict]}(#{v[:score].to_f.round(2)}) #{v[:rationale]} | #{opts[:final].to_s[0, 200]}",
             session_id: session_id,
             tags: outcome_tags,
             judge_source: v[:source]
           )
 
-          stages_run << :fold_judge
-          fold_judge_into_metrics(session_id: session_id, score: v[:score], confidence: v[:confidence])
+          unless v[:training_score].nil?
+            stages_run << :fold_judge
+            fold_judge_into_metrics(session_id: session_id, score: v[:training_score], confidence: v[:confidence])
+          end
           # R5 — close the live MDP episode with the ORM terminal reward.
           if defined?(PWN::AI::Agent::Policy) && Policy.respond_to?(:finish)
             stages_run << :policy
             Policy.finish(
               session_id: session_id,
-              score: v[:score],
+              score: v[:training_score],
               confidence: v[:confidence],
               verdict: v[:verdict],
               proxy_ok: ok,
@@ -710,7 +722,7 @@ module PWN
           end
 
           # R2 PRM — skip under hard cap (expensive LLM); keep under soft if heuristic path
-          if over_hard.call || !defined?(Reward) || v[:score].to_f < 0.6
+          if over_hard.call || !defined?(Reward) || v[:training_score].nil? || !ok
             stages_skipped << :prm
           else
             stages_run << :prm
@@ -718,7 +730,7 @@ module PWN
           end
 
           # C3 HER — only on failure; skip hard
-          if !ok && defined?(Curriculum) && !over_hard.call
+          if !ok && !v[:training_score].nil? && defined?(Curriculum) && !over_hard.call
             stages_run << :hindsight
             Curriculum.hindsight(request: opts[:request], final: opts[:final], session_id: session_id)
           else
@@ -734,7 +746,7 @@ module PWN
           # M4.1 — also reflect when the request/final is a process SOP
           # (code hygiene) even if judge score < 0.6, so rubocop/rake
           # lessons still land in PWN::Memory.
-          process_sop = process_sop_text?(text: "#{opts[:request]} #{opts[:final]}")
+          process_sop = !v[:training_score].nil? && process_sop_text?(text: "#{opts[:request]} #{opts[:final]}")
           if (ok || process_sop) && !over_soft.call
             stages_run << :reflect
             reflect(session_id: session_id)
@@ -1128,6 +1140,8 @@ module PWN
           lines = File.readlines(LEARNING_FILE)
           out = lines.map do |l|
             r = JSON.parse(l, symbolize_names: true)
+            next l if r[:decision_version]
+
             score = r.key?(:score) ? r[:score].to_f : nil
             next l if score.nil?
 
@@ -1897,14 +1911,31 @@ module PWN
 
           n = 0
           rows.each do |r|
-            note_outcome(
-              task: "requeue:#{r[:task]}",
-              success: true,
-              score: [r[:score].to_f, 0.7].max,
-              verifier_verdict: :pass,
-              details: 'rescored after verifier precedence',
-              tags: %w[requeue]
+            next if r[:session_id].to_s.empty?
+
+            transcript = PWN::Sessions.load(session_id: r[:session_id])
+            user_idx = transcript.rindex { |entry| entry[:role].to_s == 'user' }
+            next unless user_idx
+
+            request = transcript[user_idx][:content].to_s
+            final = transcript[(user_idx + 1)..].reverse.find { |entry| entry[:role].to_s == 'assistant' }
+            next unless final && (request == r[:task].to_s || display_task(task: request) == r[:task].to_s)
+
+            outcome = Reward.judge(request: request, final: final[:content], session_id: r[:session_id], commit: false)
+            fresh = note_outcome(
+              task: request,
+              session_id: r[:session_id],
+              outcome: outcome,
+              details: outcome[:rationale].to_s,
+              tags: %w[requeue],
+              judge_source: outcome[:source]
             )
+            updated = File.readlines(LEARNING_FILE).map do |line|
+              row = JSON.parse(line, symbolize_names: true)
+              row.merge!(status: 'rejudged', rescore_id: fresh[:id]) if row[:id] == r[:id]
+              "#{JSON.generate(row)}\n"
+            end
+            File.write(LEARNING_FILE, updated.join)
             n += 1
           end
           { rescored: n, dry_run: false }
@@ -1938,14 +1969,16 @@ module PWN
               task: 'required - short description of what was attempted',
               success: 'required - Boolean, did the attempt achieve its goal',
               details: 'optional - free-form notes / error / evidence',
+              rationale: 'optional - judge explanation retained for consistency checks',
               session_id: 'optional - PWN::Sessions id this outcome belongs to',
               tags: 'optional - Array of String labels for later retrieval',
               score: 'optional - score value consumed by #note_outcome',
+              outcome: 'optional - canonical Reward outcome; preserves evidence, verdict and training eligibility',
               judge_source: 'required - judge source value consumed by #note_outcome',
               predicted: 'optional - predicted value consumed by #note_outcome',
               confidence: 'optional - confidence value consumed by #note_outcome',
               engine: 'optional - engine value consumed by #note_outcome',
-              verifier_verdict: 'optional - pass|fail from a deterministic verifier',
+              verifier_verdict: 'optional - legacy diagnostic flag; cannot prove completion',
               verdict_class: 'optional - missing_artifact|wrong_path|unverified_claim|scope_miss|partial_coverage|style_only',
               remediation_hint: 'optional - one-line fix hint'
             )
@@ -1955,7 +1988,7 @@ module PWN
               limit: 'optional - max entries (defaults to 50)'
             )
 
-            # Rescore conflicted outcomes after verifier-precedence lands.
+            # Rejudge conflicted outcomes from the original session; never boost scores blindly.
             #{self}.requeue_conflicted(
               dry_run: 'optional - true to count without writing'
             )
@@ -2104,10 +2137,9 @@ module PWN
               include_demoted: 'optional - include demoted lessons (defaults to false)'
             )
 
-            # Refuse PASS+success:false rows; they go to the disputed queue.
+            # Compare structured decisions, never infer verification from prose.
             #{self}.consistency_check(
-              details: 'optional - details string that may contain PASS/FAIL',
-              rationale: 'optional - judge rationale text',
+              outcome: 'optional - canonical outcome to compare against success',
               success: 'required - boolean success flag'
             )
 

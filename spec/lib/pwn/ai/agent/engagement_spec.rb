@@ -24,4 +24,16 @@ describe PWN::AI::Agent::Engagement do
       expect(described_class.in_scope?(ip: '10.0.0.5')).to eq(true)
     end
   end
+
+  it 'enforces ~/.pwn/roe.yaml allow/deny when present' do
+    Dir.mktmpdir do |dir|
+      allow(Dir).to receive(:home).and_return(dir)
+      FileUtils.mkdir_p(File.join(dir, '.pwn'))
+      File.write(File.join(dir, '.pwn', 'roe.yaml'), "targets_allow:\n  - 10.0.0.0/8\ntargets_deny:\n  - evil.example\ntechniques_deny:\n  - dos\n")
+      expect(described_class.in_scope?(host: '10.1.2.3')).to eq(true)
+      expect(described_class.in_scope?(host: 'evil.example')).to eq(false)
+      deny = described_class.deny_if_out_of_scope(command: 'launch dos flood')
+      expect(deny[:code]).to eq('ROE_DENY')
+    end
+  end
 end

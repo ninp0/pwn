@@ -78,13 +78,14 @@ RSpec.describe 'PWN::AI::Agent reinforced feedback loop', :aggregate_failures do
   # ═══════════════════════════════════════════════════════════════════════
 
   describe 'R1 · Reward.judge (Outcome Reward Model)' do
-    it 'scores {0..1, verdict:} via heuristic fallback and feeds the sentinel' do
+    it 'retains heuristic diagnostics without feeding the sentinel' do
       v = reward.judge(request: 'scan the host', final: 'done — 3 hosts up',
                        trace: [ok_trace, ok_trace], proxy_ok: true)
       expect(v[:score]).to be_between(0.0, 1.0)
       expect(%i[solved partial wrong unknown]).to include(v[:verdict])
       expect(v[:success]).to eq(v[:source].to_s != 'heuristic' && v[:score] >= 0.6)
-      expect(JSON.parse(File.read(reward::SENTINEL_FILE))['samples']).to eq 1
+      expect(v[:training_score]).to be_nil
+      expect(reward.sentinel[:samples]).to eq 0
     end
 
     it 'floors self-reported failure language at 0.0' do
@@ -113,6 +114,7 @@ RSpec.describe 'PWN::AI::Agent reinforced feedback loop', :aggregate_failures do
   describe 'R3 · Reward.sentinel (reward-hacking guard)' do
     it 'flags proxy↔judge divergence >SENTINEL_GAP as a Mistake(tool: reward_signal)' do
       stub_const('PWN::AI::Agent::Reward::SENTINEL_WINDOW', 5)
+      allow(reward).to receive(:llm_judge).and_return(score: 0.1, source: :llm_orm, rationale: 'independently judged failure')
       5.times do
         reward.judge(request: 'x', final: 'ok', trace: [bad_trace, bad_trace], proxy_ok: true)
       end
@@ -314,7 +316,7 @@ RSpec.describe 'PWN::AI::Agent reinforced feedback loop', :aggregate_failures do
       allow(curriculum).to receive(:reflect_available?).and_return(false)
       # 2.4 — N≥2 solved holdouts required; practice bumps prompts_per to ≥2
       allow(curriculum).to receive(:self_play).and_return(
-        score: 0.85, verdict: :solved,
+        score: 0.85, verdict: :solved, success: true, training_score: 0.85,
         final: 'use `nmap` (typo: nmpa→nmap)',
         prompt: 'fix nmap typo',
         trace: "shell → nmap -sn 10.0.0.0/24\nshell → true\npwn_eval → :ok"
@@ -611,6 +613,7 @@ RSpec.describe 'PWN::AI::Agent reinforced feedback loop', :aggregate_failures do
       PWN::Sessions.append(session_id: s[:id], role: 'user', content: 'enumerate hosts')
       PWN::Sessions.append(session_id: s[:id], role: 'tool', content: "shell → #{ok_trace}")
 
+      allow(reward).to receive(:llm_judge).and_return(score: 0.8, source: :llm_orm, verdict: :solved, rationale: 'request covered')
       expect(reward).to receive(:judge).and_call_original
       expect(reward).to receive(:prm).and_call_original
       expect(reward).to receive(:sentinel).and_call_original
@@ -643,7 +646,7 @@ RSpec.describe 'PWN::AI::Agent reinforced feedback loop', :aggregate_failures do
       expect(row[:score]).to be <= 0.3
     end
 
-    it 'does not let critic :flaw floor a high-evidence judge score' do
+    it 'keeps a high judge score diagnostic when the critic disagrees rather than training the conflict' do
       @agent_cfg[:auto_introspect] = true
       @agent_cfg[:critic]          = true
       allow(curriculum).to receive(:critic).and_return(verdict: :flaw, flaw: 'plan_cover_low')
@@ -654,8 +657,10 @@ RSpec.describe 'PWN::AI::Agent reinforced feedback loop', :aggregate_failures do
       s = PWN::Sessions.create(title: 'e2e_critic_keep')
       learning.auto_introspect(session_id: s[:id], request: 'x', final: 'path-backed complete answer')
       row = learning.outcomes.first
-      expect(row[:success]).to be true
-      expect(row[:score]).to be >= 0.6
+      expect(row[:success]).to be_nil
+      expect(row[:score]).to eq(0.87)
+      expect(row[:verdict].to_s).to eq('unknown')
+      expect(row[:training_score]).to be_nil
     end
   end
 
@@ -751,11 +756,11 @@ RSpec.describe 'PWN::AI::Agent reinforced feedback loop', :aggregate_failures do
         evalset = Array(o[:evalset])
         if evalset.any? { |e| e[:signature].to_s.start_with?('smoke_') }
           # smoke equal
-          { resolved: 3, mean_score: 0.9, scores: [0.9, 0.9, 0.9] }
+          { resolved: 3, mean_score: 0.9, scores: [0.9, 0.9, 0.9], unknown: 0 }
         elsif tag.include?('cand') || tag == 'cand'
-          { resolved: 8, mean_score: 0.85, scores: [0.85] * 10 }
+          { resolved: 8, mean_score: 0.85, scores: [0.85] * 10, unknown: 0 }
         else
-          { resolved: 5, mean_score: 0.70, scores: [0.7] * 10 }
+          { resolved: 5, mean_score: 0.70, scores: [0.7] * 10, unknown: 0 }
         end
       end
       allow(curriculum).to receive(:smoke_eval_set).and_return(
@@ -776,14 +781,14 @@ RSpec.describe 'PWN::AI::Agent reinforced feedback loop', :aggregate_failures do
         if evalset.any? { |e| e[:signature].to_s.start_with?('smoke_') }
           tag = o[:tag].to_s
           if tag == 'cand'
-            { resolved: 0, mean_score: 0.1, scores: [0.1] }
+            { resolved: 0, mean_score: 0.1, scores: [0.1], unknown: 0 }
           else
-            { resolved: 3, mean_score: 0.9, scores: [0.9] }
+            { resolved: 3, mean_score: 0.9, scores: [0.9], unknown: 0 }
           end
         elsif o[:tag].to_s == 'cand'
-          { resolved: 9, mean_score: 0.95, scores: [0.95] * 10 }
+          { resolved: 9, mean_score: 0.95, scores: [0.95] * 10, unknown: 0 }
         else
-          { resolved: 5, mean_score: 0.70, scores: [0.7] * 10 }
+          { resolved: 5, mean_score: 0.70, scores: [0.7] * 10, unknown: 0 }
         end
       end
       allow(curriculum).to receive(:smoke_eval_set).and_return(
@@ -856,6 +861,7 @@ RSpec.describe 'PWN::AI::Agent reinforced feedback loop', :aggregate_failures do
       PWN::Sessions.append(session_id: s[:id], role: 'tool', content: ok_trace)
       PWN::Sessions.append(session_id: s[:id], role: 'assistant', content: '3 hosts up')
 
+      allow(reward).to receive(:llm_judge).and_return(score: 0.8, source: :llm_orm, verdict: :solved, rationale: 'trace matches request')
       r = curriculum.offline_judge(since_hours: 24, limit: 10, prm: true, commit: true)
       expect(r[:scored]).to be >= 1
       row = learning.outcomes(tag: 'offline_judge').first
@@ -928,6 +934,7 @@ RSpec.describe 'PWN::AI::Agent reinforced feedback loop', :aggregate_failures do
       allow(curriculum).to receive(:self_play).and_return(
         score: 0.9, verdict: :solved,
         final: "fixed with nmap\nsecond line\nthird",
+        success: true, training_score: 0.9,
         prompt: 'scan the lab safely',
         trace: "shell → nmap -sn 10.0.0.0/24\nshell → true"
       )

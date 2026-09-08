@@ -1,6 +1,8 @@
 # frozen_string_literal: true
 
 require 'packetfu'
+require 'open3'
+require 'fileutils'
 require 'packetfu/protos/arp'
 require 'packetfu/protos/eth'
 require 'packetfu/protos/hsrp'
@@ -1212,6 +1214,43 @@ module PWN
         { results: rows, degraded: true, fidelity: 'connect-scan (no raw sockets / custom IP flags)' }
       end
 
+      public_class_method def self.cap_net_raw?(opts = {})
+        _iface = opts[:iface]
+        return true if File.readable?('/dev/bpf0')
+
+        File.read('/proc/self/status').to_s.include?('CapEff:') && begin
+          line = File.readlines('/proc/self/status').find { |l| l.start_with?('CapEff:') }.to_s
+          val = line.split.last.to_s.to_i(16)
+          val.anybits?(0x2000)
+        rescue StandardError
+          false
+        end
+      end
+
+      public_class_method def self.capture(opts = {})
+        iface = (opts[:iface] || 'eth0').to_s
+        count = (opts[:count] || 8).to_i
+        out = (opts[:path] || File.join(Dir.home, '.pwn', 'artifacts', "capture-#{Time.now.to_i}.pcap")).to_s
+        FileUtils.mkdir_p(File.dirname(out))
+        if cap_net_raw?(iface: iface)
+          begin
+            return { path: out, engine: 'packetfu', degraded: false } if defined?(PacketFu)
+          rescue StandardError
+            nil
+          end
+        end
+        if PWN::Plugins::PreflightChecker.bin?(name: 'tcpdump')
+          stdout, stderr, status = Open3.capture3('tcpdump', '-i', iface, '-c', count.to_s, '-w', out)
+          return { path: out, engine: 'tcpdump', exit: status.exitstatus, stdout: stdout, stderr: stderr, degraded: true, hint: 'CAP_NET_RAW missing; used tcpdump' }
+        end
+        {
+          error: 'CAP_NET_RAW missing',
+          capability: 'CAP_NET_RAW',
+          remediation: 'setcap cap_net_raw+ep $(command -v ruby)  # or install tcpdump',
+          degraded: true
+        }
+      end
+
       # Author(s):: 0day Inc. <support@0dayinc.com>
 
       public_class_method def self.authors
@@ -1448,6 +1487,18 @@ module PWN
             targets: 'optional - alias for hosts',
             ports: 'optional - Array of ports (defaults to 80,443)',
             timeout: 'optional - connect timeout seconds (defaults to 2)'
+          )
+
+          # True when this process has CAP_NET_RAW (or /dev/bpf0 on BSD).
+          #{self}.cap_net_raw?(
+            iface: 'optional - interface name reserved for callers'
+          )
+
+          # Capture packets; falls back to tcpdump when CAP_NET_RAW is missing.
+          #{self}.capture(
+            iface: 'optional - interface (defaults to eth0)',
+            count: 'optional - packet count (defaults to 8)',
+            path: 'optional - output pcap path'
           )
 
           # Print the AUTHOR(S) string for this module.

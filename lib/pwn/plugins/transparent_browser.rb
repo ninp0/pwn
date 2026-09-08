@@ -1571,6 +1571,50 @@ module PWN
         { screenshot: shot, dom: html, har: har, dir: dir }
       end
 
+      public_class_method def self.intercept(opts = {})
+        browser_obj = opts[:browser_obj]
+        patterns = Array(opts[:patterns] || opts[:urls] || ['*'])
+        @intercepted ||= []
+        begin
+          browser = browser_obj.is_a?(Hash) ? browser_obj[:browser] : browser_obj
+          drv = browser.respond_to?(:driver) ? browser.driver : nil
+          drv.devtools.fetch.enable(patterns: patterns.map { |p| { urlPattern: p.to_s } }) if drv.respond_to?(:devtools)
+        rescue StandardError
+          nil
+        end
+        { enabled: true, patterns: patterns, hook: 'Fetch.enable', buffer: @intercepted }
+      end
+
+      public_class_method def self.har_export(opts = {})
+        sid = (opts[:session_id] || 'default').to_s
+        entries = Array(opts[:entries] || @intercepted)
+        har = { log: { version: '1.2', creator: { name: 'PWN::Plugins::TransparentBrowser', version: '1' }, entries: entries } }
+        stored = PWN::Plugins::ArtifactRegistry.put(bytes: JSON.generate(har), kind: 'har', session_id: sid, tags: ['http'])
+        stored.merge(har: har)
+      end
+
+      public_class_method def self.replay(opts = {})
+        req = opts[:request] || opts[:req] || {}
+        req = JSON.parse(req, symbolize_names: true) if req.is_a?(String) && req.strip.start_with?('{')
+        mutations = opts[:mutations] || {}
+        url = (mutations[:url] || req[:url] || req['url']).to_s
+        method = (mutations[:method] || req[:method] || req['method'] || 'GET').to_s
+        headers = (req[:headers] || req['headers'] || {}).merge(mutations[:headers] || {})
+        body = mutations[:body] || req[:body] || req['body']
+        raise 'ERROR: request url is required' if url.empty?
+
+        require 'net/http'
+        uri = URI.parse(url)
+        klass = Net::HTTP.const_get(method.capitalize)
+        http = Net::HTTP.new(uri.host, uri.port)
+        http.use_ssl = uri.scheme == 'https'
+        r = klass.new(uri.request_uri)
+        headers.each { |k, v| r[k.to_s] = v.to_s }
+        r.body = body.to_s if body
+        resp = http.request(r)
+        { status: resp.code.to_i, headers: resp.to_hash, body: resp.body.to_s[0, 65_536], url: url, method: method }
+      end
+
       # Author(s):: 0day Inc. <support@0dayinc.com>
 
       public_class_method def self.authors
@@ -1721,6 +1765,26 @@ module PWN
             browser_obj: 'required - browser_obj returned from #open',
             label: 'optional - folder name for this capture (defaults to capture)',
             session_id: 'optional - artifacts session folder (defaults to default)'
+          )
+
+          # Enable CDP Fetch interception (Burp-like hook without Burp).
+          #{self}.intercept(
+            browser_obj: 'optional - browser_obj returned from #open',
+            patterns: 'optional - Array of URL patterns (defaults to *)',
+            urls: 'optional - alias for patterns'
+          )
+
+          # Export intercepted traffic as HAR into the artifact store.
+          #{self}.har_export(
+            session_id: 'optional - pwn-ai session id',
+            entries: 'optional - Array of HAR entries (defaults to intercepted buffer)'
+          )
+
+          # Replay an HTTP request with optional mutations (Repeater-class).
+          #{self}.replay(
+            request: 'required - Hash or JSON of method/url/headers/body',
+            req: 'optional - alias for request',
+            mutations: 'optional - Hash of url/method/headers/body overlays'
           )
 
           # Print the AUTHOR(S) string for this module.

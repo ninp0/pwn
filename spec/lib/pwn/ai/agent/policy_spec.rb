@@ -271,6 +271,109 @@ describe PWN::AI::Agent::Policy do
     described_class.reset
     FileUtils.remove_entry(tmp) if tmp && Dir.exist?(tmp)
   end
+end
+
+describe PWN::AI::Agent::Policy do
+  describe 'outcome-gated contextual learning' do
+    around do |example|
+      Dir.mktmpdir do |tmp|
+        @policy_dir = tmp
+        example.run
+      ensure
+        described_class.attach_episode!(episode: nil)
+      end
+    end
+
+    before do
+      stub_const('PWN::AI::Agent::Policy::POLICY_FILE', File.join(@policy_dir, 'policy.json'))
+      stub_const('PWN::AI::Agent::Policy::TRAJECTORY_FILE', File.join(@policy_dir, 'policy_traj.jsonl'))
+      allow(described_class).to receive(:enabled?).and_return(true)
+    end
+
+    it 'does not train or count an unjudged episode even when step costs accrue' do
+      described_class.begin_episode(request: 'inspect host')
+      10.times { described_class.observe_step(action: 'shell', ok: true) }
+      report = described_class.finish(score: nil, proxy_ok: true)
+
+      expect(report).to include(td_updates: 0, pg_updates: 0, return: nil)
+      expect(described_class.load).to include(q: {}, h: {}, visits: {}, returns: [])
+      expect(described_class.current_episode).to be_nil
+      expect(described_class.trajectories.first).to include(score: nil, return: nil)
+      (described_class::COLD_EPISODES - 1).times do
+        described_class.begin_episode(request: 'inspect host')
+        described_class.finish(score: nil)
+      end
+      expect(described_class.warmup!).to include(td_updates: 0, replayed: 0)
+      expect(described_class.stats[:n_episodes]).to eq(0)
+      expect(described_class.evaluate[:n]).to eq(0)
+      expect(described_class.episode_budget_met?).to be(false)
+    end
+
+    it 'backs off sparse, missing, or mismatched context to broad scores' do
+      described_class.begin_episode(request: 'inspect')
+      described_class.observe_step(action: 'file', operation: 'read', ok: true)
+      state = described_class.current_state
+      context = described_class.current_context_state
+      table = described_class.load
+      table[:q][state.to_sym] = { alpha: 0.5, beta: 0.0 }
+      table[:visits][state.to_sym] = { alpha: 5, beta: 5 }
+      table[:q][context.to_sym] = { alpha: -1.0, beta: 1.0 }
+      table[:visits][context.to_sym] = { alpha: 2, beta: 2 }
+      described_class.save(table: table)
+      options = { state: state, actions: %w[alpha beta], epsilon: 0.0 }
+
+      expect(described_class.recommend(options)[:action]).to eq('alpha')
+      expect(described_class.advantage(state: state, action: 'beta', context_state: context)).to eq(described_class.advantage(state: state, action: 'beta'))
+      table[:visits][context.to_sym] = { alpha: 3, beta: 3 }
+      described_class.save(table: table)
+      expect(described_class.recommend(options)[:action]).to eq('beta')
+      expect(described_class.recommend(options.merge(context_state: nil))[:action]).to eq('alpha')
+      other_state = described_class.state(request: 'scan')
+      expect(described_class.recommend(options.merge(state: other_state, context_state: context))[:action]).to eq('alpha')
+    end
+
+    it 'replays contextual values without manufacturing extra contextual samples' do
+      described_class.begin_episode(request: 'inspect')
+      described_class.observe_step(action: 'file', args: { action: 'read', path: '/not-stored' }, ok: true)
+      context = described_class.current_context_state
+      described_class.observe_step(action: 'shell', ok: true)
+      described_class.finish(score: 1.0)
+      table = described_class.load
+      table[:q] = {}
+      table[:visits] = {}
+      described_class.save(table: table)
+
+      2.times do
+        described_class.warmup!
+        expect(described_class.q(state: context, action: 'shell')).to be_positive
+        expect(described_class.load[:visits].dig(context.to_sym, :shell)).to eq(1)
+      end
+    end
+
+    it 'records only bounded action features while retaining the complete original request in memory' do
+      request = "inspect #{'private-request ' * 30}"
+      args = { action: 'read', path: '/private/credential-location', token: 'private-token', 'private-key-name' => { nested: 'private-value' } }
+      described_class.begin_episode(request: request)
+      step = described_class.observe_step(action: 'file', args: args, result_type: :enoent, ok: false)
+
+      expect(step[:action_context]).to eq(
+        operation: 'read',
+        arguments: { shape: 'object', size: 'few', features: %w[operation:string other:object other:string path:string] },
+        result_type: 'enoent'
+      )
+      expect(described_class.current_episode[:request]).to eq(request)
+      expect(args[:token]).to eq('private-token')
+      described_class.finish(score: 0.0)
+      persisted = File.read(described_class::TRAJECTORY_FILE) + File.read(described_class::POLICY_FILE)
+      expect(persisted).not_to include('private-', '/private/')
+      expect(described_class.trajectories.first[:request_family]).to eq('misc')
+
+      described_class.begin_episode(request: 'inspect')
+      unknown = described_class.observe_step(action: 'file', operation: 'private-operation', args: 'private-argument', result_type: 'private-result', ok: true)
+      expect(unknown[:action_context]).to include(operation: 'other', result_type: 'other')
+      expect(unknown[:action_context][:arguments]).to eq(shape: 'string')
+    end
+  end
 
   it 'terminal reward is judge score scaled by confidence, not step hygiene' do
     expect(described_class.send(:terminal_reward, score: 1.0, confidence: 0.5)).to be_within(0.01).of(0.5)

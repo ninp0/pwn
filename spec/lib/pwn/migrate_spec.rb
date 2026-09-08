@@ -68,6 +68,30 @@ describe PWN::Migrate do
       end
     end
 
+    it 'schema 2 patches stock escalator/scribe toolsets and leaves engines alone' do
+      File.write(File.join(@tmp, 'agents.yml'), <<~YML)
+        ---
+        scribe:
+          role: report
+          engine: grok
+          toolsets: [memory, skills, learning, sessions]
+        escalator:
+          role: hint
+          engine: grok
+          toolsets: [terminal, pwn, memory]
+        custom_coach:
+          role: keep my tools
+          engine: grok
+          toolsets: [terminal, pwn, memory]
+      YML
+      PWN::Migrate.run(fix: false, backup: false, io: io)
+      raw = YAML.safe_load_file(File.join(@tmp, 'agents.yml'), permitted_classes: [Symbol], symbolize_names: true)
+      expect(Array(raw[:escalator][:toolsets] || raw[:escalator]['toolsets'])).to eq([])
+      expect(Array(raw[:scribe][:toolsets] || raw[:scribe]['toolsets'])).to include('pwn')
+      expect(raw[:escalator][:engine] || raw[:escalator]['engine']).to eq('grok')
+      expect(Array(raw[:custom_coach][:toolsets] || raw[:custom_coach]['toolsets'])).to include('terminal')
+    end
+
     it 'detects & autofixes a corrupt JSON store (quarantine)' do
       File.write(File.join(@tmp, 'metrics.json'), '{{{ not json')
       st = PWN::Migrate.status

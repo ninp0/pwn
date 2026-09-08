@@ -12,5 +12,7 @@ describe 'PWN::AI::Agent::Tools job_run' do
     expect(PWN::AI::Agent::Registry.lookup(name: 'job_run')).not_to be_nil
     expect(PWN::AI::Agent::Registry.lookup(name: 'job_status')).not_to be_nil
     expect(PWN::AI::Agent::Registry.lookup(name: 'job_result')).not_to be_nil
+    expect(PWN::AI::Agent::Registry.lookup(name: 'job_tail')).not_to be_nil
+    expect(PWN::AI::Agent::Registry.lookup(name: 'job_kill')).not_to be_nil
   end
 end

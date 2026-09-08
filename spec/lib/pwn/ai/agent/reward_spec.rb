@@ -271,12 +271,14 @@ describe PWN::AI::Agent::Reward do
     expect(v[:rationale].to_s).not_to match(/heuristic overlap/)
   end
 
-  it 'sentinel window_means weights llm_orm above heuristic overlap' do
+  it 'sentinel window_means weights llm_orm above verified heuristic outcomes' do
     tmp = Dir.mktmpdir
     stub_const('PWN::AI::Agent::Reward::SENTINEL_FILE', File.join(tmp, 's.json'))
-    20.times { described_class.send(:record_sentinel, proxy: true, judge: 0.9, source: :heuristic) }
+    20.times { described_class.send(:record_sentinel, proxy: true, judge: 0.9, source: :heuristic, training_score: 0.9) }
     20.times { described_class.send(:record_sentinel, proxy: true, judge: 0.2, source: :llm_orm) }
-    means = described_class.send(:window_means, window: described_class.send(:load_sentinel)[:window])
+    window = described_class.send(:load_sentinel)[:window]
+    expect(window.length).to eq(40)
+    means = described_class.send(:window_means, window: window)
     # equal counts: unweighted mean would be 0.55; ORM-weighted mean is closer to 0.2
     expect(means[:judge]).to be < 0.45
     expect(means[:judge]).to be > 0.2
@@ -329,6 +331,146 @@ describe PWN::AI::Agent::Reward do
   end
 end
 
+describe 'PWN::AI::Agent::Reward request verification' do
+  include_context 'pwn tmp sandbox'
+
+  it 'invalidates verification when another tool runs after the checks' do
+    klass = PWN::AI::Agent::Reward
+    session = PWN::Sessions.create(title: 'changed artifact')[:id]
+    request = 'write the correct report'
+    PWN::Sessions.append(session_id: session, role: 'user', content: request)
+    klass.record_verification(request: request, session_id: session,
+                              checks: [{ criterion: request, passed: true, evidence: 'independent readback' }])
+    PWN::Sessions.append(session_id: session, role: 'tool', content: '{"success":true,"effect":"write"}')
+    allow(klass).to receive(:llm_judge).and_return(score: 0.2, source: :llm_orm, rationale: 'report changed')
+    allow(klass).to receive(:verify_as_reward).and_return(nil)
+    v = klass.judge(request: request, session_id: session, final: 'PASS', commit: false)
+    expect(v[:verification]).to be_nil
+    expect(v[:success]).to be false
+  end
+
+  it 'does not calibrate or persist a heuristic guess as a known outcome' do
+    klass = PWN::AI::Agent::Reward
+    allow(klass).to receive(:llm_judge).and_return(score: 0.9, source: :heuristic, rationale: 'overlap')
+    allow(klass).to receive(:verify_as_reward).and_return(nil)
+    expect(PWN::AI::Agent::Curriculum).not_to receive(:calibrate)
+    v = klass.judge(request: 'write a report', final: 'PASS report written',
+                    trace: ['{"success":true}'], persist_components: true)
+    row = PWN::AI::Agent::Learning.outcomes.first
+    expect(row[:verdict].to_s).to eq('unknown')
+    expect(row[:confidence]).to eq(v[:confidence])
+    expect(row[:training_score]).to be_nil
+  end
+
+  it 'keeps unknown live judgments out of sentinel calibration and routing distrust' do
+    klass = PWN::AI::Agent::Reward
+    allow(klass).to receive(:llm_judge).and_return(score: 0.1, source: :heuristic, rationale: 'overlap')
+    allow(klass).to receive(:verify_as_reward).and_return(nil)
+    allow(PWN::AI::Agent::Curriculum).to receive(:calibrate)
+
+    klass::SENTINEL_WINDOW.times do
+      v = klass.judge(request: 'write a report', final: 'unrelated', proxy_ok: true)
+      expect(v).to include(verdict: :unknown, training_score: nil)
+    end
+    snapshot = klass.sentinel
+
+    expect(snapshot).to include(samples: 0, status: :insufficient)
+    expect(PWN::AI::Agent::Curriculum).not_to have_received(:calibrate)
+    expect(klass.proxy_distrust).to eq(0.0)
+  end
+
+  it 'does not warm the sentinel from unknown canonical or legacy heuristic outcomes' do
+    klass = PWN::AI::Agent::Reward
+    unknowns = [
+      klass.resolve_outcome(outcome: { score: 0.1, source: :heuristic }),
+      klass.resolve_outcome(outcome: { score: 0.9, source: :llm_orm }, critic_pass: false),
+      klass.resolve_outcome(outcome: { source: :error }),
+      { score: 0.1, success: true, judge_source: 'heuristic' },
+      { score: 0.1, success: true, verdict: 'unknown' }
+    ]
+    File.write(PWN::AI::Agent::Learning::LEARNING_FILE, (unknowns * klass::SENTINEL_WINDOW).map(&:to_json).join("\n"))
+    allow(PWN::AI::Agent::Curriculum).to receive(:calibrate)
+
+    result = klass.warm_sentinel(limit: 200)
+
+    expect(result).to include(added: 0, samples: 0)
+    expect(klass.sentinel).to include(samples: 0, status: :insufficient)
+    expect(PWN::AI::Agent::Curriculum).not_to have_received(:calibrate)
+    expect(klass.proxy_distrust).to eq(0.0)
+  end
+
+  it 'warms known legacy engine scores and canonical verified failures' do
+    klass = PWN::AI::Agent::Reward
+    failed = klass.resolve_outcome(outcome: {
+                                     score: 0.0, source: :heuristic,
+                                     verification: { checks: [{ criterion: 'report', passed: false, evidence: 'report absent' }] }
+                                   })
+    rows = [{ score: 0.7, success: true, judge_source: 'llm_orm' }, failed]
+    File.write(PWN::AI::Agent::Learning::LEARNING_FILE, rows.map(&:to_json).join("\n"))
+
+    expect(klass.warm_sentinel).to include(added: 2, samples: 2)
+    expect(klass.send(:load_sentinel)[:window].map { |row| row[:judge] }).to contain_exactly(0.0, 0.7)
+  end
+
+  it 'removes unknown persisted sentinel rows and their stale routing distrust' do
+    klass = PWN::AI::Agent::Reward
+    window = [
+      { judge: 0.7, proxy: 1.0, source: 'llm_orm' },
+      { judge: 0.1, proxy: 1.0, source: 'heuristic' },
+      { judge: 0.9, proxy: 1.0, source: 'llm_orm', training_score: nil, decision_version: 1 },
+      { judge: 0.1, proxy: 1.0, verdict: 'unknown' }
+    ]
+    File.write(klass::SENTINEL_FILE, JSON.generate(window: window, proxy_distrust: 0.85, distrust_at: Time.now.utc.iso8601))
+
+    expect(klass.sentinel).to include(samples: 1, status: :insufficient)
+    expect(klass.send(:load_sentinel)[:window]).to eq([window.first])
+    expect(klass.proxy_distrust).to eq(0.0)
+  end
+
+  it 'keeps verified heuristic failures in the live sentinel and calibration' do
+    klass = PWN::AI::Agent::Reward
+    request = 'write the required report'
+    session = PWN::Sessions.create(title: request)[:id]
+    PWN::Sessions.append(session_id: session, role: 'user', content: request)
+    klass.record_verification(request: request, session_id: session,
+                              checks: [{ criterion: request, passed: false, evidence: 'required report is absent' }])
+    allow(klass).to receive(:llm_judge).and_return(score: 0.9, source: :heuristic, rationale: 'overlap')
+    allow(klass).to receive(:verify_as_reward).and_return(nil)
+    allow(PWN::AI::Agent::Curriculum).to receive(:calibrate)
+
+    v = klass.judge(request: request, session_id: session, final: 'report written', proxy_ok: true)
+
+    expect(v).to include(success: false, training_score: 0.2)
+    expect(klass.sentinel).to include(samples: 1, status: :insufficient)
+    expect(PWN::AI::Agent::Curriculum).to have_received(:calibrate).with(hash_including(actual: 0.2))
+  end
+
+  it 'uses only a verifier record bound to the current request and session' do
+    klass = PWN::AI::Agent::Reward
+    session = PWN::Sessions.create(title: 'verified request')[:id]
+    request = 'write the exact report content'
+    PWN::Sessions.append(session_id: session, role: 'user', content: request)
+    path = File.join(@tmp, 'report.txt')
+    File.write(path, 'checked content')
+    checks = [{ criterion: request, passed: File.read(path) == 'checked content', evidence: path }]
+    klass.record_verification(request: request, session_id: session, checks: checks)
+    allow(klass).to receive(:llm_judge).and_return(score: 0.0, source: :heuristic, rationale: 'weak overlap')
+    allow(klass).to receive(:verify_as_reward).and_return(nil)
+    v = klass.judge(request: request, session_id: session, final: 'Report written.', commit: false)
+    expect(v[:success]).to be true
+    expect(v[:verdict]).to eq(:solved)
+    expect(v[:judge_score]).to eq(0.0)
+    expect(v[:confidence]).to eq(1.0)
+    expect(v[:training_score]).to be >= 0.6
+    expect(v[:verification][:checks]).to eq(checks)
+
+    PWN::Sessions.append(session_id: session, role: 'user', content: 'another task')
+    stale = klass.judge(request: request, session_id: session, final: 'PASS', commit: false)
+    expect(stale[:success]).not_to be true
+    expect(stale[:verification]).to be_nil
+  end
+end
+
 describe 'PWN::AI::Agent::Reward vs TUI plan' do
   it 'does not let a TUI plan_cover_low haircut a high-evidence original-request answer' do
     stub_const('PWN::AI::Agent::Reward::SENTINEL_FILE', File.join(Dir.mktmpdir, 's.json'))
@@ -364,7 +506,8 @@ describe 'PWN::AI::Agent::Reward vs TUI plan' do
     )
     expect(v[:source].to_s).to eq 'heuristic'
     expect(v[:score]).to be >= 0.6
-    expect(v[:verdict].to_s).to eq 'solved'
+    expect(v[:verdict].to_s).to eq 'unknown'
+    expect(v[:training_score]).to be_nil
     args = {
       request: 'what live hosts can you find on this box and write /tmp/pwn-eval-hosts.json',
       final: final,
@@ -397,7 +540,8 @@ describe 'PWN::AI::Agent::Reward vs TUI plan' do
     expect(a[:score]).to eq(b[:score])
     expect(b[:score]).to eq(c[:score])
     expect(a[:score]).to be >= 0.6
-    expect(a[:verdict].to_s).to eq('solved')
+    expect(a[:verdict].to_s).to eq('unknown')
+    expect(a[:training_score]).to be_nil
   end
 
   it 'does not drag a long analytical PASS to partial on zero token overlap' do
@@ -409,10 +553,17 @@ describe 'PWN::AI::Agent::Reward vs TUI plan' do
     expect(v[:score]).to be > 0.35
   end
 
-  it 'floors verified PASS analytical answers at 0.6' do
-    src = File.read(PWN::AI::Agent::Reward.method(:judge).source_location.first)
-    expect(src).to include('[score, 0.6].max')
-    expect(src).to include('\bPASS\b')
+  it 'does not turn self-reported PASS or an unrelated successful command into verification' do
+    klass = PWN::AI::Agent::Reward
+    allow(klass).to receive(:llm_judge).and_return(
+      { score: 0.2, source: :llm_orm, verdict: :wrong, rationale: 'missing requested artifact' }
+    )
+    allow(klass).to receive(:verify_as_reward).and_return(nil)
+    v = klass.judge(request: 'write the requested report', final: 'PASS all done',
+                    trace: ['{"success":true,"result":{"exit":0}}'], commit: false)
+    expect(v[:score]).to eq(0.2)
+    expect(v[:success]).to be false
+    expect(v[:verifier_verdict]).to be_nil
   end
 
   it 'prefers model_routes.judge when selecting a judge model' do
@@ -423,7 +574,7 @@ describe 'PWN::AI::Agent::Reward vs TUI plan' do
     expect(m).to eq('local-judge')
   end
 
-  it 'records verifier PASS as success even when the judge scores 0.0' do
+  it 'does not accept an unbound verifier PASS option as completion evidence' do
     allow(PWN::AI::Agent::Reward).to receive(:llm_judge).and_return(
       { score: 0.0, source: 'heuristic', verdict: :wrong, rationale: 'overlap=0.01', confidence: 0.3 }
     )
@@ -434,8 +585,8 @@ describe 'PWN::AI::Agent::Reward vs TUI plan' do
       commit: false,
       verifier_verdict: :pass
     )
-    expect(v[:success]).to eq(true)
-    expect(v[:verifier_verdict]).to eq(:pass)
+    expect(v[:success]).not_to eq(true)
+    expect(v[:verifier_verdict]).to be_nil
     expect(v[:judge_score]).to be < 0.6
   end
 

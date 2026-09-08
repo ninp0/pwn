@@ -67,3 +67,21 @@ PWN::AI::Agent::Registry.register(
     PWN::Plugins::Findings.report
   }
 )
+PWN::AI::Agent::Registry.register(
+  name: 'chain_score',
+  toolset: 'pwn',
+  schema: {
+    name: 'chain_score',
+    description: 'Recompute combined severity when findings are chained (e.g. SSRF + metadata).',
+    parameters: {
+      type: 'object',
+      properties: {
+        ids: { type: 'array', items: { type: 'string' } },
+        chain_refs: { type: 'array', items: { type: 'string' } }
+      }
+    }
+  },
+  handler: lambda { |args|
+    PWN::Plugins::Findings.chain_score(ids: args[:ids] || args['ids'], chain_refs: args[:chain_refs] || args['chain_refs'])
+  }
+)

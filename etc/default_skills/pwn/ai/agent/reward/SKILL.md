@@ -34,6 +34,8 @@ PWN::AI::Agent::Reward.judge(opts)
 ## Public methods
 
 - `judge`
+- `resolve_outcome`
+- `record_verification`
 - `promote_to_success`
 - `prm`
 - `plan_coverage`

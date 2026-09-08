@@ -35,6 +35,50 @@ describe PWN::AI::Agent::Metrics do
     expect(rate).to be > 0.2
   end
 
+  describe '.scoreboard' do
+    before do
+      allow(described_class).to receive(:summary).and_return([])
+      allow(described_class).to receive(:calibration).and_return(mean_actual: 0.4)
+    end
+
+    it 'does not override a rejected outcome with a high raw score' do
+      allow(PWN::AI::Agent::Learning).to receive(:outcomes).with(limit: 200).and_return([
+                                                                                          { success: true, score: 0.8, training_score: 0.8, decision_version: 1 },
+                                                                                          { success: false, score: 0.99, training_score: 0.2, decision_version: 1 }
+                                                                                        ])
+
+      expect(described_class.scoreboard[:task_ok]).to eq(0.5)
+    end
+
+    it 'excludes canonical unknown outcomes from the task success denominator' do
+      Dir.mktmpdir do |dir|
+        stub_const('PWN::AI::Agent::Learning::LEARNING_FILE', File.join(dir, 'learning.jsonl'))
+        allow(PWN::AI::Agent::Learning).to receive(:promote_process_lesson)
+        [
+          { score: 0.8, source: :llm_orm },
+          { score: 0.2, source: :llm_orm },
+          { score: 0.99, source: :heuristic },
+          { score: nil, source: :self_report }
+        ].each do |outcome|
+          PWN::AI::Agent::Learning.note_outcome(task: 'Check outcome', outcome: outcome)
+        end
+
+        expect(described_class.scoreboard[:task_ok]).to eq(0.5)
+      end
+    end
+
+    it 'returns no task rate when every outcome is unknown or unverified' do
+      allow(PWN::AI::Agent::Learning).to receive(:outcomes).with(limit: 200).and_return([
+                                                                                          { success: nil, score: 0.99 },
+                                                                                          { success: false, score: 0.99, verdict: 'unknown' },
+                                                                                          { success: true, score: 0.99, status: 'unverified' },
+                                                                                          { success: true, score: 0.99, decision_version: 1, training_score: nil }
+                                                                                        ])
+
+      expect(described_class.scoreboard[:task_ok]).to be_nil
+    end
+  end
+
   it 'temperature-scales overconfident predictions toward realised actual' do
     stub_const('PWN::AI::Agent::Metrics::METRICS_FILE', File.join(Dir.mktmpdir, 'metrics.json'))
     described_class.reset

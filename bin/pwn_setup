@@ -25,8 +25,10 @@ pwn_driver = PWN::Driver::Parser.new do |options|
   end
 
   options.on('-l', '--list-profiles',
-             '<Optional - List capability profiles and exit>') do |o|
-    opts[:list] = o
+             '<Optional - List capability profiles and exit>') do
+    # Public metadata, like --help: no environment decryption or bootstrap.
+    PWN::Setup.list_profiles
+    exit 0
   end
 
   options.on('-m', '--migrate',
@@ -66,9 +68,7 @@ pwn_driver.parse!
 begin
   status = 0
 
-  if opts[:list]
-    PWN::Setup.list_profiles
-  elsif opts[:migrate]
+  if opts[:migrate]
     r = PWN::Setup.migrate(
       fix: opts[:fix] || opts[:yes],
       dry_run: opts[:dry_run]

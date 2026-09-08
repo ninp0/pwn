@@ -49,7 +49,7 @@ module PWN
     # Bump this whenever the shape of any file under ~/.pwn changes in a
     # way that requires a one-time transform.  Add the transform as an
     # entry in MIGRATIONS keyed by the NEW schema number.
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
 
     OK   = "\e[32mok\e[0m"
     BAD  = "\e[31mFAIL\e[0m"
@@ -212,6 +212,15 @@ module PWN
         io.puts "    · migrate_legacy_skills → #{r[:migrated]} converted" if r[:migrated].to_i.positive?
         PWN::Config.install_default_skills if defined?(PWN::Config)
         PWN::Cron.install_defaults if defined?(PWN::Cron)
+      },
+      2 => lambda { |root, io|
+        path = File.join(root, 'agents.yml')
+        r = if defined?(PWN::AI::Agent::Swarm) && PWN::AI::Agent::Swarm.respond_to?(:migrate_personas)
+              PWN::AI::Agent::Swarm.migrate_personas(path: path)
+            else
+              { changed: false }
+            end
+        io.puts "    · agents.yml #{Array(r[:patched]).join(', ')}" if r[:changed]
       }
     }.freeze
 

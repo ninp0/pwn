@@ -47,6 +47,12 @@ PWN::AI::Agent::Swarm.personas(opts)
 - `fact_record`
 - `facts_prompt`
 - `claim`
+- `pack_specialist`
+- `child_inbox`
+- `child_honesty`
+- `honesty_unmet`
+- `view_graph`
+- `migrate_personas`
 - `authors`
 - `help`
 

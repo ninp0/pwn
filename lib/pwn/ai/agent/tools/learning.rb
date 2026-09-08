@@ -14,10 +14,9 @@ PWN::AI::Agent::Registry.register(
   toolset: 'learning',
   schema: {
     name: 'learning_note_outcome',
-    description: 'Record the outcome of a task attempt so future pwn-ai ' \
-                 'runs learn from it. Successes reinforce approaches; ' \
-                 'failures become avoidance lessons injected into every ' \
-                 'subsequent system prompt.',
+    description: 'Record an unverified, self-reported note about a task attempt. ' \
+                 'Preserves the claimed result for later review, but does not ' \
+                 'count as verified success or train future approaches.',
     parameters: {
       type: 'object',
       properties: {
@@ -33,8 +32,8 @@ PWN::AI::Agent::Registry.register(
   handler: lambda { |args|
     PWN::AI::Agent::Learning.note_outcome(
       task: args[:task],
-      success: args[:success],
-      details: args[:details],
+      outcome: { score: nil, source: :self_report, confidence: 0.0, reported_success: args[:success] },
+      details: "Self-reported claim (unverified): reported_success=#{args[:success]}. #{args[:details]}",
       tags: args[:tags]
     )
   }

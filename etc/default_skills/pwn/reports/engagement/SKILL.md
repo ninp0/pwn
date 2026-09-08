@@ -28,11 +28,12 @@ Class methods take `(opts = {})` and read `opts`.
 
 ```ruby
 PWN::Reports::Engagement.help
-PWN::Reports::Engagement.generate(opts)
+PWN::Reports::Engagement.render(opts)
 ```
 
 ## Public methods
 
+- `render`
 - `generate`
 - `authors`
 - `help`
@@ -43,5 +44,5 @@ PWN::Reports::Engagement.generate(opts)
 
 ## Verification
 
-`PWN::Reports::Engagement.respond_to?(:generate)` after the
+`PWN::Reports::Engagement.respond_to?(:render)` after the
 module is loaded. Read the source for parameter names.

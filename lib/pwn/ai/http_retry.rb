@@ -38,11 +38,45 @@ module PWN
 
       public_class_method def self.retry_after_s(opts = {})
         retry_count = [opts[:retry_count].to_i, 1].max
-        retry_after = 0
+        headers = {}
         resp = opts[:response]
-        retry_after = resp.headers[:retry_after].to_i if resp.respond_to?(:headers) && resp.headers
-        retry_after = (0.5 * retry_count) if retry_after.to_f <= 0
-        retry_after
+        headers = resp.headers if resp.respond_to?(:headers) && resp.headers
+        ra = headers[:retry_after] || headers['retry-after'] || headers['Retry-After']
+        if ra.to_s.match?(/\A\d+(\.\d+)?\z/)
+          n = ra.to_f
+          return n if n.positive?
+        end
+
+        [2**retry_count, 60].min.to_f
+      end
+
+      public_class_method def self.quota_exhausted?(opts = {})
+        err = opts[:error]
+        blob = err.respond_to?(:message) ? err.message.to_s : err.to_s
+        blob = opts[:message].to_s if blob.empty?
+        if err.respond_to?(:response) && err.response
+          blob = "#{blob} #{err.response}"
+          blob = "#{blob} #{err.response.body}" if err.response.respond_to?(:body)
+        end
+        blob.match?(/insufficient_quota|credit_balance_exhausted|exceeded your current quota|billing_not_active|spend.?limit|no credits remaining/i)
+      rescue StandardError
+        false
+      end
+
+      public_class_method def self.quota_message(opts = {})
+        err = opts[:error]
+        blob = ''
+        blob = err.message.to_s if err.respond_to?(:message)
+        if err.respond_to?(:response) && err.response
+          blob = "#{blob} #{err.response}"
+          blob = "#{blob} #{err.response.body}" if err.response.respond_to?(:body)
+        end
+        blob = opts[:message].to_s if blob.strip.empty?
+        url = blob[%r{https://platform\.openai\.com/settings/organization/billing/?}] ||
+              'https://platform.openai.com/settings/organization/billing/'
+        'OpenAI API has no credits (insufficient_quota / credit_balance_exhausted). ' \
+          "Add prepaid API credits at #{url} — a ChatGPT Plus/Pro plan does not fund api.openai.com. " \
+          'Then retry; /model openai stays selected.'
       end
 
       # Tees provider REST events into the open pwn-ai DEBUG RN log and STDERR.
@@ -88,10 +122,22 @@ module PWN
             message: 'required - message value consumed by #retryable?'
           )
 
-          # Run retry after s and return its result
+          # Seconds to sleep after a 429 (Retry-After, else exponential 2..60).
           #{self}.retry_after_s(
-            retry_count: 'optional - retry count value consumed by #retry_after_s',
-            response: 'optional - response value consumed by #retry_after_s'
+            retry_count: 'optional - 1-based attempt used for exponential fallback',
+            response: 'optional - RestClient response with Retry-After header'
+          )
+
+          # True when a 429 body is billing/quota, not a retryable rate limit.
+          #{self}.quota_exhausted?(
+            error: 'optional - exception whose message/response body is inspected',
+            message: 'optional - raw error text when error is omitted'
+          )
+
+          # Operator-facing line for a billing/quota 429 (do not retry).
+          #{self}.quota_message(
+            error: 'optional - exception whose response body may contain the billing URL',
+            message: 'optional - raw error text when error is omitted'
           )
 
           # Tees provider REST events into the open pwn-ai DEBUG RN log and STDERR

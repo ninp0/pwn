@@ -188,9 +188,17 @@ module PWN
           opts[:args] || {}
         end
 
+        MAX_PAYLOAD_BYTES = 1_048_576
+
         public_class_method def self.invalid_payload(opts = {})
           hint = opts[:hint].to_s
           tok = opts[:offending_token].to_s
+          text = opts[:text].to_s
+          range = opts[:byte_range]
+          if range.nil? && !tok.empty? && !text.empty?
+            idx = text.index(tok)
+            range = [idx, idx + tok.bytesize] if idx
+          end
           {
             stdout: '',
             stderr: hint,
@@ -199,6 +207,8 @@ module PWN
             code: (opts[:code] || 'SYNTAX_DENY').to_s,
             rule_id: (opts[:rule_id] || 'payload').to_s,
             offending_token: tok,
+            byte_range: range,
+            max_payload_bytes: MAX_PAYLOAD_BYTES,
             suggestion: opts[:suggestion].to_s,
             hint: hint,
             shell: opts[:shell] || shell_name
@@ -649,7 +659,9 @@ module PWN
               code: 'optional - denial code (defaults to SYNTAX_DENY)',
               rule_id: 'optional - rule identifier (defaults to payload)',
               offending_token: 'optional - exact rejected token span',
-              suggestion: 'optional - how to rewrite the payload'
+              suggestion: 'optional - how to rewrite the payload',
+              text: 'optional - original payload used to compute byte_range',
+              byte_range: 'optional - [start, stop] byte offsets of the offending span'
             )
 
             # Build a machine-readable guard denial (SCOPE_DENY, CANARY_DENY, ...).

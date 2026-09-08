@@ -45,8 +45,11 @@ PWN::Plugins::Packet.open_pcap_file(opts)
 - `construct_udp`
 - `send`
 - `tcp_connect_scan`
+- `cap_net_raw`
+- `capture`
 - `authors`
 - `help`
+- `cap_net_raw?`
 
 ## Source
 

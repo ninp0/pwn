@@ -37,10 +37,17 @@ PWN::AI::HttpRetry.timeout_s(opts)
 - `max_attempts`
 - `retryable`
 - `retry_after_s`
+- `quota_exhausted`
+- `quota_message`
 - `report_event`
 - `authors`
 - `help`
+- `quota_exhausted?`
 - `retryable?`
+
+## References
+
+- `references/urls.md` — URLs from source
 
 ## Source
 
