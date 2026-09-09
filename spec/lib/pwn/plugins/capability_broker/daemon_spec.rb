@@ -4,6 +4,7 @@ require 'spec_helper'
 require 'pwn/plugins/capability_broker'
 require 'tmpdir'
 require 'rbconfig'
+require 'etc'
 
 describe 'Native capability broker daemon' do
   def daemon
@@ -85,41 +86,100 @@ describe 'Native capability broker daemon' do
     client&.close
   end
 
-  it 'runs the real native executable without privileges and cleans up its protected socket' do
-    expect(Process.euid).not_to eq(0)
-    Dir.mktmpdir('capd-spec-') do |directory|
-      path = File.join(directory, 'control.sock')
-      log = File.join(directory, 'daemon.log')
-      pid = Process.spawn(RbConfig.ruby, File.expand_path('../../../../../bin/pwn-capd', __dir__), '--uid', Process.uid.to_s, '--interface', 'lo', '--socket', path, out: log, err: log)
-      begin
-        Timeout.timeout(5) do
-          until File.socket?(path)
-            raise File.read(log) if Process.waitpid(pid, Process::WNOHANG)
+  # Fork the complete smoke so both daemon and authenticated client use the
+  # same unprivileged identity, without changing the RSpec runner's credentials.
+  def unprivileged_smoke(directory)
+    account = Etc.getpwnam('nobody') if Process.euid.zero?
+    if account
+      raise 'smoke account must have nonzero UID and GID' if account.uid.zero? || account.gid.zero?
 
-            sleep 0.01
-          end
-        end
-        expect(File.readlink("/proc/#{pid}/exe")).to include('ruby')
-        expect(File.stat(path).mode & 0o777).to eq(0o600)
-        status = File.read("/proc/#{pid}/status")
-        expect(status[/^NoNewPrivs:\s+(\d+)/, 1]).to eq('1')
-        expect(status[/^CapEff:\s+(\h+)/, 1].to_i(16) & ~((1 << 12) | (1 << 13))).to eq(0)
-        expect(status[/^CapInh:\s+(\h+)/, 1].to_i(16)).to eq(0)
-        expect(PWN::Plugins::CapabilityBroker.request(socket: path, operation: 'status')).to include(ok: true, interfaces: ['lo'])
-        expect(PWN::Plugins::CapabilityBroker.request(socket: path, operation: 'exec')[:ok]).to eq(false)
-      ensure
+      File.chown(account.uid, account.gid, directory)
+    end
+    report = File.join(directory, 'smoke.log')
+    File.open(report, 'w') do |output|
+      worker = fork do
+        Process.setpgrp
         begin
-          Process.kill('TERM', pid)
-        rescue StandardError
+          if account
+            Process.groups = []
+            Process::GID.change_privilege(account.gid)
+            Process::UID.change_privilege(account.uid)
+            expect(Process.groups).to eq([])
+          end
+          expect(Process.uid).not_to eq(0)
+          expect(Process.euid).not_to eq(0)
+          yield
+          exit! 0
+        rescue StandardError, RSpec::Expectations::ExpectationNotMetError => e
+          output.write(e.full_message)
+          output.flush
+          exit! 1
+        end
+      end
+      begin
+        _, result = Timeout.timeout(15) { Process.wait2(worker) }
+        expect(result.success?).to eq(true), File.read(report)
+      ensure
+        # Kill the private process group on failure/timeout, including a daemon
+        # left behind if the smoke worker died before reaching its own ensure.
+        begin
+          Process.kill('KILL', -worker)
+        rescue Errno::ESRCH
           nil
         end
         begin
-          Process.wait(pid)
-        rescue StandardError
+          Process.wait(worker)
+        rescue Errno::ECHILD
           nil
         end
       end
-      expect(File.exist?(path)).to eq(false)
+    end
+  end
+
+  it 'runs the real native executable without privileges and cleans up its protected socket' do
+    Dir.mktmpdir('capd-spec-') do |directory|
+      unprivileged_smoke(directory) do
+        path = File.join(directory, 'control.sock')
+        log = File.join(directory, 'daemon.log')
+        pid = Process.spawn(RbConfig.ruby, File.expand_path('../../../../../bin/pwn-capd', __dir__), '--uid', Process.uid.to_s, '--interface', 'lo', '--socket', path, out: log, err: log)
+        begin
+          Timeout.timeout(5) do
+            until File.socket?(path)
+              raise File.read(log) if Process.waitpid(pid, Process::WNOHANG)
+
+              sleep 0.01
+            end
+          end
+          expect(File.readlink("/proc/#{pid}/exe")).to include('ruby')
+          expect(File.stat(path).mode & 0o777).to eq(0o600)
+          expect(PWN::Plugins::CapabilityBroker.request(socket: path, operation: 'status')).to include(ok: true, interfaces: ['lo'])
+          expect(File.stat(path).uid).to eq(Process.uid)
+          expect(File.stat(directory).mode & 0o777).to eq(0o700)
+          status = File.read("/proc/#{pid}/status")
+          expect(status[/^Uid:\s+(.+)/, 1].split.map(&:to_i)).to eq([Process.uid] * 4)
+          expect(status[/^Gid:\s+(.+)/, 1].split.map(&:to_i)).to eq([Process.gid] * 4)
+          expect(status[/^Groups:[^\S\n]*([^\n]*)/, 1].split.map(&:to_i)).to eq(Process.groups.sort)
+          expect(status[/^NoNewPrivs:\s+(\d+)/, 1]).to eq('1')
+          expect(status[/^CapEff:\s+(\h+)/, 1].to_i(16) & ~((1 << 12) | (1 << 13))).to eq(0)
+          expect(status[/^CapPrm:\s+(\h+)/, 1].to_i(16) & ~((1 << 12) | (1 << 13))).to eq(0)
+          expect(status[/^CapInh:\s+(\h+)/, 1].to_i(16)).to eq(0)
+          expect(PWN::Plugins::CapabilityBroker.request(socket: path, operation: 'exec')[:ok]).to eq(false)
+        ensure
+          begin
+            Process.kill('TERM', pid)
+            _, result = Timeout.timeout(5) { Process.wait2(pid) }
+          rescue Errno::ESRCH, Errno::ECHILD
+            nil
+          rescue Timeout::Error
+            Process.kill('KILL', pid)
+            Process.wait(pid)
+            raise
+          end
+        end
+        expect(result.success?).to eq(true), File.read(log)
+        expect { Process.waitpid(pid, Process::WNOHANG) }.to raise_error(Errno::ECHILD)
+        expect(File.exist?(path)).to eq(false)
+      end
     end
   end
 
