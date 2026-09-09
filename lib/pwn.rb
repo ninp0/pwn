@@ -22,6 +22,8 @@ module PWN
   autoload :Migrate, 'pwn/migrate'
   autoload :ModuleSkills, 'pwn/module_skills'
   autoload :Sessions, 'pwn/sessions'
+  autoload :SessionTrace, 'pwn/session_trace'
+  autoload :Redaction, 'pwn/redaction'
   autoload :Setup, 'pwn/setup'
   autoload :Driver, 'pwn/driver'
   autoload :FFI, 'pwn/ffi'

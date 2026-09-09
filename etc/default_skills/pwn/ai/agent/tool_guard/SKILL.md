@@ -28,11 +28,12 @@ Class methods take `(opts = {})` and read `opts`.
 
 ```ruby
 PWN::AI::Agent::ToolGuard.help
-PWN::AI::Agent::ToolGuard.present(opts)
+PWN::AI::Agent::ToolGuard.unwrap_payload(opts)
 ```
 
 ## Public methods
 
+- `unwrap_payload`
 - `present`
 - `placeholder`
 - `bashism`
@@ -91,5 +92,5 @@ PWN::AI::Agent::ToolGuard.present(opts)
 
 ## Verification
 
-`PWN::AI::Agent::ToolGuard.respond_to?(:present)` after the
+`PWN::AI::Agent::ToolGuard.respond_to?(:unwrap_payload)` after the
 module is loaded. Read the source for parameter names.

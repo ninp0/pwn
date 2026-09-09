@@ -17,7 +17,7 @@ PWN::AI::Agent::Registry.register(
   schema: {
     name: 'agent_list',
     description: 'List defined multi-agent personas from ~/.pwn/agents.yml ' \
-                 '(name, role summary, engine, toolsets, max_iters). Use ' \
+                 '(name, role summary, engine, model, toolsets, max_iters). Use ' \
                  'before agent_ask / agent_debate to see who you can ' \
                  'delegate to. Define new ones with agent_spawn.',
     parameters: { type: 'object', properties: {}, required: [] }
@@ -29,6 +29,7 @@ PWN::AI::Agent::Registry.register(
         name: name,
         role: p[:role].to_s[0, 200],
         engine: p[:engine],
+        model: p[:model],
         toolsets: p[:toolsets],
         max_iters: p[:max_iters]
       }
@@ -43,7 +44,7 @@ PWN::AI::Agent::Registry.register(
     name: 'agent_spawn',
     description: 'Define (or overwrite) a persona in ~/.pwn/agents.yml so ' \
                  'it can be used with agent_ask / agent_debate. A persona ' \
-                 'is a system-role overlay + toolset allow-list + engine ' \
+                 'is a system-role overlay + toolset allow-list + engine/model ' \
                  'override. Omit "swarm" from toolsets to prevent that ' \
                  'persona from recursively spawning further sub-agents.',
     parameters: {
@@ -58,13 +59,17 @@ PWN::AI::Agent::Registry.register(
                        'Default: everything except swarm/cron.'
         },
         engine: {
-          type: 'string', enum: %w[openai anthropic grok gemini ollama],
+          type: 'string', enum: %w[openai anthropic grok gemini ollama openwebui],
           description: 'Override AI engine for this persona (model diversity ' \
                        '= real antagonism). Default: inherit active engine.'
         },
         max_iters: {
           type: 'integer',
           description: 'Per-turn tool-loop cap for this persona (default 25).'
+        },
+        model: {
+          type: 'string',
+          description: 'Exact model identifier for the selected engine. Omit to use that provider configured default.'
         }
       },
       required: %w[name role]
@@ -77,6 +82,7 @@ PWN::AI::Agent::Registry.register(
       role: args[:role],
       toolsets: args[:toolsets],
       engine: args[:engine],
+      model: args[:model],
       max_iters: args[:max_iters]
     )
   }

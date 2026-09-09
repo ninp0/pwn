@@ -13,6 +13,16 @@ describe PWN::Config do
     expect(help_response).to respond_to :help
   end
 
+  it 'defaults root ai_profiles without overwriting configured profiles' do
+    expect(described_class.env_template[:ai_profiles]).to eq({})
+    env = { ai: { active: 'ollama' } }
+    described_class.send(:merge_ai_defaults!, env: env)
+    expect(env[:ai_profiles]).to eq({})
+    env[:ai_profiles][:local] = { model: 'fixture' }
+    described_class.send(:merge_ai_defaults!, env: env)
+    expect(env[:ai_profiles][:local]).to eq(model: 'fixture')
+  end
+
   describe '.env_template AI providers' do
     let(:ai) { described_class.env_template[:ai] }
 

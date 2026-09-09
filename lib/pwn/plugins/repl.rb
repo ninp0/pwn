@@ -260,7 +260,9 @@ module PWN
             # Reline handles multi-line pastes by splitting on \n in-buffer.
             @line_buffer = Reline.readmultiline(prompt, true) do |buffer|
               !buffer.split("\n", -1).last.to_s.rstrip.end_with?('\\')
-            end || ''
+            end
+            return nil if @line_buffer.nil?
+
             # Strip the continuation markers before handing off to the caller.
             @line_buffer = @line_buffer.gsub(/\\[ \t]*\n/, "\n")
           ensure
@@ -476,7 +478,7 @@ module PWN
             PWN::Config.load_memory
             mem_count = (PWN.const_defined?(:Memory) ? PWN::Memory.load.keys.length : 0)
             sess = begin
-              PWN::Sessions.create(title: "pwn-ai #{Time.now.strftime('%Y-%m-%d %H:%M')}", source: 'pwn-ai')
+              PWN::Plugins::REPL.pwn_ai_activation_session(pry: pi)
             rescue StandardError
               nil
             end
@@ -489,7 +491,7 @@ module PWN
             puts "    'Use NmapIt to port scan target.com then use TransparentBrowser to spider and SAST::TestCaseEngine to analyze code if cloned. Generate report with PWN::Reports.'"
             puts "    'Execute CLI nmap -sV target.com and summarize findings using PWN modules.'"
             puts "[*] Skills loaded from #{skills_path} (#{skills_count} available) + memory/sessions/cron to expand autonomous capabilities."
-            puts "[*] Type 'back' to exit pwn-ai mode."
+            puts "[*] Type 'back' or CTRL+D to exit pwn-ai mode."
             puts '[*] MULTILINE in pwn-ai: SHIFT+ENTER (or ALT+ENTER, or trailing `\\`) inserts a newline; ENTER submits to the AI.'
             puts '[*] TAB menus: leading `/` = commands (/cron /skills /sessions …); `/` later = host paths; otherwise Ruby completion (same as the pwn REPL).'
             puts "[*] tmux + terminator users: Ensure ~/.tmux.conf has 'set -s extended-keys on' and 'set -g xterm-keys on', then restart tmux. Use TERM=xterm-256color."
@@ -500,6 +502,22 @@ module PWN
             dbg_lvl = 'debug' if pi.config.pwn_ai_debug && !pi.config.pwn_ai_trace
 
             puts "\n\n\npwn-ai #{dbg_lvl} ON → ~/.pwn/logs/pwn-ai-DEBUG-#{tag}-R<REQUEST_NUMBER>.log" unless dbg_lvl.empty?
+          end
+        end
+
+        Pry::Commands.create_command 'ai.profile' do
+          description 'Select a session routing profile: ai.profile NAME (no args lists names).'
+
+          def process
+            PWN::Plugins::REPL.pwn_ai_profile_command(pry: pry_instance, args: args, output: output)
+          end
+        end
+
+        Pry::Commands.create_command 'ai.memory' do
+          description 'View/edit pinned engagement memory: ai.memory [view|edit TEXT|clear].'
+
+          def process
+            PWN::Plugins::REPL.pwn_ai_memory_command(pry: pry_instance, args: args, output: output)
           end
         end
 
@@ -1108,56 +1126,10 @@ module PWN
         end
 
         Pry::Commands.create_command 'back' do
-          description 'Jump back to pwn REPL when in pwn-asm || pwn-ai.'
+          description 'Jump back to pwn REPL when in pwn-asm || pwn-ai. CTRL+D does the same in those modes.'
 
           def process
-            pi = pry_instance
-            pi.config.color = true
-            pi.config.pwn_asm = false if pi.config.pwn_asm
-            pi.config.pwn_ai = false if pi.config.pwn_ai
-            pi.config.pwn_ai_agent = false if pi.config.pwn_ai_agent
-            # pi.config.pwn_ai_debug = false if pi.config.pwn_ai_debug
-            pi.config.pwn_ai_speak = false if pi.config.pwn_ai_speak
-            pi.config.completer = Pry::InputCompleter
-            PWN::Plugins::REPL.restore_pwn_ai_completer!
-            # pi.config.pwn_ai_original_input ||= Pry.config.input.clone
-            if pi.config.pwn_ai_original_input
-              pi.config.input = pi.config.pwn_ai_original_input
-              pi.config.pwn_ai_original_input = nil
-            end
-            return unless pi.config.pwn_mesh
-
-            pi.config.pwn_mesh = false
-            # Stop echo thread
-            if PWN.const_defined?(:MeshTxEchoThread)
-              PWN.const_get(:MeshTxEchoThread).kill
-              PWN.send(:remove_const, :MeshTxEchoThread)
-            end
-
-            if PWN.const_defined?(:MqttObj)
-              Meshtastic::MQTT.disconnect(mqtt_obj: PWN.const_get(:MqttObj))
-              PWN.send(:remove_const, :MqttObj)
-            end
-
-            if PWN.const_defined?(:MeshRxHeaderWin)
-              PWN.const_get(:MeshRxHeaderWin).close
-              PWN.send(:remove_const, :MeshRxHeaderWin)
-            end
-
-            if PWN.const_defined?(:MeshRxBodyWin)
-              PWN.const_get(:MeshRxBodyWin).close
-              PWN.send(:remove_const, :MeshRxBodyWin)
-            end
-
-            if PWN.const_defined?(:MeshTxWin)
-              PWN.const_get(:MeshTxWin).close
-              PWN.send(:remove_const, :MeshTxWin)
-            end
-            PWN.send(:remove_const, :MeshColors) if PWN.const_defined?(:MeshColors)
-            PWN.send(:remove_const, :MeshLastColor) if PWN.const_defined?(:MeshLastColor)
-            PWN.send(:remove_const, :MeshMutex) if PWN.const_defined?(:MeshMutex)
-            PWN.send(:remove_const, :MqttSubThread) if PWN.const_defined?(:MqttSubThread)
-            Curses.close_screen
+            PWN::Plugins::REPL.leave_special_mode!(pry: pry_instance)
           end
         end
       rescue StandardError => e
@@ -1740,10 +1712,122 @@ module PWN
         Reline.completion_proc
       end
 
+      # Leave pwn-ai / pwn-asm / pwn-mesh and restore the host REPL (also CTRL+D).
+      public_class_method def self.leave_special_mode!(opts = {})
+        pi = opts[:pry]
+        return nil unless pi.respond_to?(:config)
+
+        pi.config.color = true
+        pi.config.pwn_asm = false if pi.config.pwn_asm
+        pi.config.pwn_ai = false if pi.config.pwn_ai
+        pi.config.pwn_ai_agent = false if pi.config.pwn_ai_agent
+        pi.config.pwn_ai_speak = false if pi.config.pwn_ai_speak
+        pi.config.completer = Pry::InputCompleter
+        restore_pwn_ai_completer!
+        if pi.config.pwn_ai_original_input
+          pi.config.input = pi.config.pwn_ai_original_input
+          pi.config.pwn_ai_original_input = nil
+        end
+        return pi unless pi.config.pwn_mesh
+
+        pi.config.pwn_mesh = false
+        if PWN.const_defined?(:MeshTxEchoThread)
+          PWN.const_get(:MeshTxEchoThread).kill
+          PWN.send(:remove_const, :MeshTxEchoThread)
+        end
+        if PWN.const_defined?(:MqttObj)
+          Meshtastic::MQTT.disconnect(mqtt_obj: PWN.const_get(:MqttObj))
+          PWN.send(:remove_const, :MqttObj)
+        end
+        if PWN.const_defined?(:MeshRxHeaderWin)
+          PWN.const_get(:MeshRxHeaderWin).close
+          PWN.send(:remove_const, :MeshRxHeaderWin)
+        end
+        if PWN.const_defined?(:MeshRxBodyWin)
+          PWN.const_get(:MeshRxBodyWin).close
+          PWN.send(:remove_const, :MeshRxBodyWin)
+        end
+        if PWN.const_defined?(:MeshTxWin)
+          PWN.const_get(:MeshTxWin).close
+          PWN.send(:remove_const, :MeshTxWin)
+        end
+        PWN.send(:remove_const, :MeshColors) if PWN.const_defined?(:MeshColors)
+        PWN.send(:remove_const, :MeshLastColor) if PWN.const_defined?(:MeshLastColor)
+        PWN.send(:remove_const, :MeshMutex) if PWN.const_defined?(:MeshMutex)
+        PWN.send(:remove_const, :MqttSubThread) if PWN.const_defined?(:MqttSubThread)
+        Curses.close_screen
+        pi
+      end
+
+      # Consume a CLI-prepared session once; ordinary activation creates one.
+      public_class_method def self.pwn_ai_activation_session(opts = {})
+        config = opts[:pry].config
+        sid = config.pwn_ai_startup_session_id
+        config.pwn_ai_startup_session_id = nil
+        return { id: sid } if sid
+
+        PWN::Sessions.create(title: "pwn-ai #{Time.now.strftime('%Y-%m-%d %H:%M')}", source: 'pwn-ai')
+      end
+
+      # Validate selection before changing request-local routing state.
+      public_class_method def self.pwn_ai_profile_command(opts = {})
+        require 'pwn/ai/agent/profiles'
+        env = opts[:env] || PWN::Env
+        profiles = env[:ai_profiles] || {}
+        router = PWN::AI::Agent::Profiles.new(profiles: profiles)
+        args = Array(opts[:args])
+        output = opts[:output] || $stdout
+        if args.empty?
+          output.puts("AI profiles: #{profiles.keys.map(&:to_s).sort.join(', ')}")
+          return profiles.keys.map(&:to_s).sort
+        end
+        raise ArgumentError, 'Usage: ai.profile NAME' unless args.length == 1
+
+        route = router.lookup(name: args.first)
+        opts.fetch(:pry).config.pwn_ai_profile = args.first.to_s
+        output.puts("AI profile: #{route[:name]} (#{route[:provider]} / #{route[:model]})")
+        route
+      end
+
+      # View/edit the session's pinned block, separate from cross-session facts.
+      public_class_method def self.pwn_ai_memory_command(opts = {})
+        require 'pwn/ai/agent/engagement_memory'
+        sid = opts[:pry]&.config&.pwn_ai_session_id.to_s
+        raise ArgumentError, 'Start pwn-ai before using ai.memory' if sid.empty?
+
+        goal = PWN::Sessions.load(session_id: sid).find { |entry| entry[:role].to_s == 'user' }
+        settings = { original_goal: goal ? goal[:content] : '', session_id: sid }
+        settings[:root] = opts[:root] if opts[:root]
+        memory = PWN::AI::Agent::EngagementMemory.new(**settings)
+        args = Array(opts[:args])
+        case args.first
+        when nil, 'view'
+          text = memory.view
+        when 'edit'
+          raise ArgumentError, 'Usage: ai.memory edit TEXT (or ai.memory clear)' if args.length < 2
+
+          text = memory.edit(text: args.drop(1).join(' '))
+        when 'clear'
+          text = memory.edit(text: '')
+        else
+          raise ArgumentError, 'Usage: ai.memory [view|edit TEXT|clear]'
+        end
+        (opts[:output] || $stdout).puts(text)
+        text
+      end
+
       # Run a leading-slash pwn-ai command locally. Returns true when handled
       # (caller should not send the line to Loop.run).
       public_class_method def self.pwn_ai_dispatch_slash!(opts = {})
         request = opts[:request].to_s
+        if request.strip.match?(/\Aai\.profile(?:\s|$)/)
+          pwn_ai_profile_command(pry: opts[:pry], args: request.strip.split(/\s+/).drop(1))
+          return true
+        end
+        if request.strip.match?(/\Aai\.memory(?:\s|$)/)
+          pwn_ai_memory_command(pry: opts[:pry], args: request.strip.split(/\s+/).drop(1))
+          return true
+        end
         return false unless pwn_ai_complete_kind(line: request) == :command
 
         tokens = request.strip.split(/\s+/)
@@ -1842,7 +1926,7 @@ module PWN
                end
         Array(rows).filter_map do |row|
           if row.is_a?(Hash)
-            row[:id] || row['id'] || row[:name] || row['name'] || row[:model] || row['model']
+            row[:id] || row['id'] || row[:slug] || row['slug'] || row[:name] || row['name'] || row[:model] || row['model']
           else
             row.to_s
           end
@@ -2108,8 +2192,9 @@ module PWN
       # Supported Method Parameters::
       # PWN::Plugins::REPL.start
 
-      public_class_method def self.start
-        opts = PWN::Env[:driver_opts]
+      public_class_method def self.start(opts = {})
+        ai_session_id = opts[:ai_session_id]
+        settings = PWN::Env[:driver_opts]
 
         # Monkey Patch Pry, add commands, && hooks
         PWN::Plugins::MonkeyPatch.pry
@@ -2121,23 +2206,32 @@ module PWN
 
         # IRB-style suggest-as-you-type dropdown (off via
         # PWN::Env[:driver_opts][:autocomplete] = false in pwn.yaml).
-        ac = opts.key?(:autocomplete) ? opts[:autocomplete] : true
+        ac = settings.key?(:autocomplete) ? settings[:autocomplete] : true
         enable_autocomplete(enabled: ac)
 
         # Define PS1 Prompt
         Pry.config.pwn_repl_line = 0
         Pry.config.prompt_name = :pwn
-        arrow_ps1_proc = refresh_ps1_proc(opts)
+        arrow_ps1_proc = refresh_ps1_proc(settings)
 
-        opts[:mode] = :splat
-        splat_ps1_proc = refresh_ps1_proc(opts)
+        settings[:mode] = :splat
+        splat_ps1_proc = refresh_ps1_proc(settings)
 
         ps1 = [arrow_ps1_proc, splat_ps1_proc]
         prompt = Pry::Prompt.new(:pwn, 'PWN Prototyping REPL', ps1)
 
         # Start PWN REPL
         # Pry.start(self, prompt: prompt)
-        Pry.start(Pry.main, prompt: prompt)
+        if ai_session_id
+          hooks = Pry.config.hooks.dup
+          hooks.add_hook(:before_session, :pwn_ai_cli) do |_output, _binding, pi|
+            pi.config.pwn_ai_startup_session_id = ai_session_id
+            pi.run_command('pwn-ai')
+          end
+          Pry.start(Pry.main, prompt: prompt, hooks: hooks)
+        else
+          Pry.start(Pry.main, prompt: prompt)
+        end
       rescue StandardError => e
         raise e
       end
@@ -2172,6 +2266,11 @@ module PWN
 
           # Run add commands and return its result
           #{self}.add_commands
+
+          # Leave pwn-ai, pwn-asm, or pwn-mesh (also invoked by CTRL+D).
+          #{self}.leave_special_mode!(
+            pry: 'required - Pry instance whose special mode should end'
+          )
 
           # Run add hooks and return its result
           #{self}.add_hooks
@@ -2285,8 +2384,23 @@ module PWN
             graph: 'optional - constants (PWN::Plugins::Nm<TAB>), instance methods'
           )
 
+          # Consume a prepared CLI session or create a new interactive session.
+          #{self}.pwn_ai_activation_session(pry: 'required - Pry instance')
+
+          # Validate/select a named model profile without changing provider defaults.
+          #{self}.pwn_ai_profile_command(
+            pry: 'required - Pry instance', args: ['profile-name'],
+            env: 'optional - configuration hash', output: 'optional - output IO'
+          )
+
+          # View/edit the current session pinned engagement notes.
+          #{self}.pwn_ai_memory_command(
+            pry: 'required - Pry instance', args: ['edit', 'evidence notes'],
+            root: 'optional - artifacts root', output: 'optional - output IO'
+          )
+
           # Run start and return its result
-          #{self}.start
+          #{self}.start(ai_session_id: 'optional - prepared CLI session id')
 
           # Print the AUTHOR(S) string for this module.
           #{self}.authors

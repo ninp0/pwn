@@ -36,6 +36,10 @@ module PWN
         { id: id, host: host, port: port }
       end
 
+      public_class_method def self.send_line(opts = {})
+        write_line(opts)
+      end
+
       public_class_method def self.write_line(opts = {})
         t = tube!(opts)
         line = opts[:line] || opts[:data] || ''
@@ -149,6 +153,14 @@ module PWN
             host: 'required - hostname or IP address (defaults to opts[:target])',
             target: 'optional - hostname, IP, or CIDR to scan',
             port: 'required - TCP/UDP port number'
+          )
+
+          # Expect-style alias of write_line.
+          #{self}.send_line(
+            id: 'required - tube id from spawn or connect',
+            name: 'optional - alias for id',
+            line: 'optional - line to write (newline appended)',
+            data: 'optional - alias for line'
           )
 
           # Run write line and return its result

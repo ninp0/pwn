@@ -34,6 +34,7 @@ PWN::Plugins::Findings.required_bins(opts)
 ## Public methods
 
 - `required_bins`
+- `record_structured`
 - `record`
 - `evidence_verify`
 - `report`

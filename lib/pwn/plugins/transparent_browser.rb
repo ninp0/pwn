@@ -63,8 +63,16 @@ module PWN
       public_class_method def self.open(opts = {})
         browser_type = opts[:browser_type] ||= :chrome
         proxy = opts[:proxy].to_s unless opts[:proxy].nil?
+        capture_proxy = opts[:capture_proxy]
+        if capture_proxy
+          raise ArgumentError, 'capture_proxy requires a MitmProxy.start descriptor' unless capture_proxy.is_a?(Hash) && capture_proxy[:url]
+          raise ArgumentError, 'proxy and capture_proxy are mutually exclusive' if proxy
+
+          proxy = capture_proxy[:url]
+        end
 
         browser_obj = {}
+        browser_obj[:capture_proxy] = capture_proxy if capture_proxy
         browser_obj[:type] = browser_type
 
         tor_obj = nil
@@ -202,6 +210,7 @@ module PWN
           if proxy
             args.push("--host-resolver-rules='MAP * 0.0.0.0 , EXCLUDE #{tor_obj[:ip]}'") if tor_obj
             args.push("--proxy-server=#{proxy}")
+            args.push('--proxy-bypass-list=<-loopback>') if capture_proxy
           end
 
           # Incognito browsing mode
@@ -297,6 +306,7 @@ module PWN
           if proxy
             args.push("--host-resolver-rules='MAP * 0.0.0.0 , EXCLUDE #{tor_obj[:ip]}'") if tor_obj
             args.push("--proxy-server=#{proxy}")
+            args.push('--proxy-bypass-list=<-loopback>') if capture_proxy
           end
 
           args.push('--headless')
@@ -1631,6 +1641,7 @@ module PWN
           #{self}.open(
             browser_type: 'optional - :firefox|:chrome|:headless|:rest|:websocket (defaults to :chrome)',
             proxy: 'optional - scheme://proxy_host:port || tor (defaults to nil)',
+            capture_proxy: 'optional - MitmProxy.start descriptor; caller owns stop lifecycle',
             devtools: 'optional - boolean (defaults to false)'
           )
 

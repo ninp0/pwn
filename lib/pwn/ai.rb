@@ -6,6 +6,7 @@ module PWN
   # http://www.rubyinside.com/ruby-techniques-revealed-autoload-1652.html
   module AI
     autoload :Agent, 'pwn/ai/agent'
+    autoload :CLI, 'pwn/ai/cli'
     autoload :Context, 'pwn/ai/context'
     autoload :Anthropic, 'pwn/ai/anthropic'
     autoload :Gemini, 'pwn/ai/gemini'

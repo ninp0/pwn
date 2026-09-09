@@ -27,6 +27,7 @@ module PWN
             system_role_content: 'You are an ethically hacking xAI Grok agent.',
             temp: 'optional - Grok temperature',
             max_prompt_length: 256_000,
+            reasoning_effort: 'optional - Grok reasoning effort (default medium; none disables)',
             # OAuth support for xAI SuperGrok subscriptions (in addition to API key)
             # Populate via pwn-vault command (values stored encrypted in ~/.pwn/pwn.yaml)
             oauth: {
@@ -48,6 +49,7 @@ module PWN
             model: 'optional - OpenAI model to use',
             system_role_content: 'You are an ethically hacking OpenAI agent.',
             temp: 'optional - OpenAI temperature',
+            reasoning_effort: 'optional - OpenAI reasoning effort (default medium)',
             max_tokens: 'optional - Max output tokens per response (default 16384). Mapped to OpenAI wire param max_completion_tokens.',
             max_prompt_length: 128_000,
             # OAuth support for ChatGPT / Codex subscriptions (in addition to API key)
@@ -79,6 +81,7 @@ module PWN
             # Cap decode length so thinking models cannot stream forever
             # (Net::HTTP read_timeout only fires on idle gaps between chunks).
             num_predict: 4_096,
+            think: true,
             keep_alive: '30m',
             # tighten each PromptBuilder block for the local model (nil = engine defaults)
             prompt_budget: { memory: 6, metrics: 3, mistakes: 3, learning: 2, extro: false },
@@ -98,6 +101,7 @@ module PWN
             tool_temp: 0.1, # lower temperature when tools are present (chat_with_tools)
             num_ctx: 32_768,
             num_predict: 4_096,
+            think: true,
             keep_alive: '30m',
             prompt_budget: { memory: 6, metrics: 3, mistakes: 3, learning: 2, extro: false },
             result_max: 4_000,
@@ -136,6 +140,7 @@ module PWN
             model: 'optional - Gemini model id to use (see provider docs for currently-supported ids)',
             system_role_content: 'You are an ethically hacking Gemini agent.',
             temp: 'optional - Gemini temperature',
+            think: true,
             max_prompt_length: 1_000_000
           },
           # teacher-student reflection: execute on :active, write durable lessons via this engine (nil = same as :active)
@@ -223,6 +228,7 @@ module PWN
           # multi-agent personas : ~/.pwn/agents.yml  (see PWN::AI::Agent::Swarm.help)
           # swarm bus            : ~/.pwn/swarm/<swarm_id>/bus.jsonl
         },
+        ai_profiles: {},
         plugins: {
           asm: { arch: PWN::Plugins::DetectOS.arch, endian: PWN::Plugins::DetectOS.endian.to_s },
           blockchain: {
@@ -446,6 +452,7 @@ module PWN
       env = opts[:env]
       return env unless env.is_a?(Hash) && env[:ai].is_a?(Hash)
 
+      env[:ai_profiles] = {} unless env.key?(:ai_profiles)
       ai_tmpl = env_template[:ai]
       return env unless ai_tmpl.is_a?(Hash)
 

@@ -1,0 +1,20 @@
+# Existing general-purpose handlers retain their functionality. Scope applies
+# only to declared target parameters, never strings embedded in code/command.
+- name: shell
+  description: Execute an opaque shell command on the local host.
+  risk_level: high
+  params:
+    type: object
+    required: [command]
+    properties:
+      command: {type: string, minLength: 1}
+      timeout: {type: integer, minimum: 1, maximum: 10800}
+- name: pwn_eval
+  description: Evaluate opaque Ruby in the live local PWN binding.
+  risk_level: high
+  params:
+    type: object
+    required: [code]
+    properties:
+      code: {type: string, minLength: 1}
+      timeout: {type: integer, minimum: 1, maximum: 10800}

@@ -67,6 +67,8 @@ module PWN
         public_class_method def self.evidence_satisfied?(opts = {})
           messages = Array(opts[:messages] || opts[:trace])
           text = opts[:text].to_s
+          return false if TurnFinalizer.output_paths(request: opts[:request]).any? && completion_unmet(request: opts[:request], messages: messages).any?
+
           if defined?(TurnFinalizer) && TurnFinalizer.respond_to?(:arbitrate)
             row = TurnFinalizer.arbitrate(request: opts[:request].to_s, messages: messages, paths: [])
             return true if row[:complete] && row[:unmet].empty? && row[:ledger].any? { |_p, v| v[:write] && v[:read] }
@@ -690,21 +692,19 @@ module PWN
         end
 
         private_class_method def self.declared_contract_unsatisfied?(opts = {})
-          return false if verify_passed?(messages: opts[:messages])
-
           completion_unmet(opts).any?
         rescue StandardError
           false
         end
 
         private_class_method def self.completion_unmet(opts = {})
-          return [] if verify_passed?(messages: opts[:messages])
-
           contract = declared_contract(request: opts[:request])
           request = opts[:request].to_s
           unmet = []
           files = Array(contract[:paths]) + Array(contract[:proofs])
           files.each { |path| unmet << "deliverable_missing:#{path}" if deliverable_missing?(path: path) }
+          artifact = TurnFinalizer.arbitrate(request: request, paths: contract[:paths], messages: opts[:messages])
+          artifact[:unmet].each { |row| unmet << "#{row[:criterion]}:#{row[:detail]}" }
           trace_files = session_files(messages: opts[:messages])
           unmet << 'issue_work_proofs' if contract[:issue_work] && Array(contract[:proofs]).empty? && files.empty? && trace_files.empty?
           unmet << 'skills' if declared_skills_missing?(skills: contract[:skills], request: request)
@@ -717,22 +717,6 @@ module PWN
           unmet
         rescue StandardError
           []
-        end
-
-        private_class_method def self.verify_passed?(opts = {})
-          Array(opts[:messages]).reverse_each do |msg|
-            next unless msg.is_a?(Hash) && msg[:role].to_s == 'tool'
-
-            raw = unwrap_untrusted(text: msg[:content].to_s)
-            parsed = JSON.parse(raw)
-            parsed = parsed['result'] || parsed[:result] || parsed
-            next unless parsed.is_a?(Hash)
-
-            return true if parsed[:passed] == true || parsed['passed'] == true
-          rescue StandardError
-            next
-          end
-          false
         end
 
         private_class_method def self.write_or_read_evidenced?(opts = {})
@@ -796,19 +780,25 @@ module PWN
         end
 
         private_class_method def self.declared_contract(opts = {})
+          literals = TurnFinalizer.output_paths(request: opts[:request])
           cached = Thread.current[:pwn_loop_deliverables]
-          return normalize_contract(raw: cached) if cached.is_a?(Array) || cached.is_a?(Hash)
-          return EMPTY_CONTRACT.dup if Thread.current[:pwn_loop_nested]
-          return EMPTY_CONTRACT.dup unless Thread.current[:pwn_loop_active]
-
-          contract = infer_deliverables(request: opts[:request])
-          Thread.current[:pwn_loop_deliverables] = contract
+          contract = if cached.is_a?(Array) || cached.is_a?(Hash)
+                       normalize_contract(raw: cached)
+                     elsif Thread.current[:pwn_loop_nested] || !Thread.current[:pwn_loop_active]
+                       EMPTY_CONTRACT.dup
+                     else
+                       infer_deliverables(request: opts[:request])
+                     end
+          # Paths are user-owned. Inference cannot invent a destination or
+          # convert the source document into a write obligation.
+          contract = contract.merge(paths: literals.any? ? literals : contract[:paths])
+          Thread.current[:pwn_loop_deliverables] = contract if Thread.current[:pwn_loop_active]
           contract
         end
 
         private_class_method def self.normalize_contract(opts = {})
           raw = opts[:raw]
-          return EMPTY_CONTRACT.merge(paths: raw.map(&:to_s).select { |p| p.start_with?('/') }) if raw.is_a?(Array)
+          return EMPTY_CONTRACT.merge(paths: abs_paths(rows: raw)) if raw.is_a?(Array)
           return EMPTY_CONTRACT.dup unless raw.is_a?(Hash)
 
           hours = raw[:hours] || raw['hours']
@@ -848,7 +838,7 @@ module PWN
         end
 
         private_class_method def self.abs_paths(opts = {})
-          Array(opts[:rows]).map(&:to_s).select { |path| path.start_with?('/') }.uniq
+          Array(opts[:rows]).map(&:to_s).reject(&:empty?).map { |path| File.expand_path(path) }.uniq
         end
 
         private_class_method def self.infer_deliverables(opts = {})
@@ -906,6 +896,14 @@ module PWN
         end
 
         private_class_method def self.may_finalize?(opts = {})
+          paths = TurnFinalizer.output_paths(request: opts[:request])
+          if paths.any?
+            artifact = TurnFinalizer.arbitrate(request: opts[:request], paths: paths, messages: opts[:messages])
+            unless artifact[:complete]
+              record_artifact_bounce(request: opts[:request], unmet: artifact[:unmet])
+              return false
+            end
+          end
           return true if evidence_satisfied?(messages: opts[:messages], text: opts[:text], request: opts[:request])
           return false if incomplete_final?(text: opts[:text], last_iter: false)
           return false if request_unsatisfied?(
@@ -917,6 +915,15 @@ module PWN
           true
         rescue StandardError
           false
+        end
+
+        private_class_method def self.record_artifact_bounce(opts = {})
+          return unless defined?(Mistakes)
+
+          Mistakes.record(tool: 'artifact_contract', error: 'False delivery: requested artifact lacks a successful write and stat/head-tail readback',
+                          source: :model, meta: { request: opts[:request], unmet: opts[:unmet] })
+        rescue StandardError
+          nil
         end
 
         # A text-only policy/authorization refusal is never "truly blocked".
@@ -1681,7 +1688,8 @@ module PWN
           # them exactly on the next iteration (e.g. Anthropic requires the
           # original tool_use block to precede a tool_result).
           out[:_native_content] = msg[:_native_content] if msg[:_native_content]
-          out[:thinking] = msg[:thinking] if msg[:thinking]
+          thinking = msg[:thinking] || msg[:reasoning_content]
+          out[:thinking] = thinking if thinking.to_s.strip != ''
           # Local/abliterated models sometimes emit shell(...) as plain content
           # with empty tool_calls. Coerce registered call-shaped text into
           # structured tool_calls so Loop dispatches instead of FINAL-answering.
@@ -1707,6 +1715,18 @@ module PWN
         #     tool_calls: [ {id:, type:'function', function:{name:, arguments:}} ],
         #     _native_content: <provider raw>  (when adapter needs round-trip) }
 
+        private_class_method def self.thinking_effort(opts = {})
+          engine_name = (opts[:engine] || active_engine).to_s.to_sym
+          slot = defined?(PWN::Env) ? PWN::Env.dig(:ai, engine_name) : nil
+          slot = {} unless slot.is_a?(Hash)
+          value = opts[:effort] || slot[:reasoning_effort] || slot[:think]
+          text = value.to_s.strip
+          return nil if %w[none false 0 off].include?(text.downcase)
+          return 'medium' if text.empty? || text.match?(/\A(optional|required)\b/i)
+
+          text
+        end
+
         private_class_method def self.call_engine(opts = {})
           messages = opts[:messages]
           tools = opts[:tools]
@@ -1714,17 +1734,25 @@ module PWN
             msg: "call_engine #{debug_tools_line(tools: tools)} #{debug_msgs_line(messages: messages)}"
           )
 
-          engine = active_engine
+          runtime = Thread.current[:pwn_request_runtime]
+          if runtime.respond_to?(:call)
+            return runtime.call(messages: messages, tools: tools) do |prepared, route|
+              invoke_provider_chat(engine: (route || {})[:provider] || active_engine, messages: prepared, tools: tools, model: (route || {})[:model], temp: (route || {})[:temperature])
+            end
+          end
+
+          invoke_provider_chat(engine: active_engine, messages: messages, tools: tools)
+        end
+
+        private_class_method def self.invoke_provider_chat(opts = {})
+          engine = opts[:engine].to_s.to_sym
+          messages = opts[:messages]
+          tools = opts[:tools]
           mod_name = ENGINE_MODS[engine]
           raise "ERROR: Unsupported AI engine for agent loop: #{engine}" unless mod_name
 
           mod = Object.const_get(mod_name)
           if mod.respond_to?(:chat_with_tools)
-            # xAI rejects Hash function.arguments / Hash content (422 map→string).
-            # OpenAI sanitizes inside its provider so native Responses reasoning
-            # survives until the credential-specific transport is selected.
-            # Ollama / Open WebUI reject *string* function.arguments (HTTP 400
-            # "can't find closing '}' symbol") — opposite of OpenAI wire form.
             wire_msgs = if engine == :grok
                           openai_wire_messages(messages: messages)
                         elsif local_engine?(engine: engine)
@@ -1737,12 +1765,16 @@ module PWN
               tools: tools,
               spinner: true
             }
-            # Ollama + abliterated / weak chat-templates often ignore tools: and
-            # answer in prose (or print shell(...) as text). Force native
-
-            # tool_calls until at least one tool result is already in history;
-            # after that, auto so the model can emit a real final answer.
-            # Respect explicit PWN::Env[:ai][:ollama][:tool_choice] override.
+            effort = thinking_effort(engine: engine)
+            if effort
+              cwt_opts[:reasoning_effort] = effort
+              cwt_opts[:think] = true
+            else
+              cwt_opts[:think] = false
+            end
+            model = opts[:model] || Thread.current[:pwn_swarm_model]
+            cwt_opts[:model] = model unless model.to_s.strip.empty?
+            cwt_opts[:temp] = opts[:temp] unless opts[:temp].nil?
             if tools && !tools.empty?
               env_tc = begin
                 PWN::Env.dig(:ai, engine, :tool_choice)
@@ -1752,8 +1784,6 @@ module PWN
               if env_tc && !env_tc.to_s.empty?
                 cwt_opts[:tool_choice] = env_tc
               else
-                # After the first tool result, auto so the model can emit a
-                # real final. Leftover English tasks do not keep required.
                 has_tool_result = Array(messages).any? { |m| m[:role].to_s == 'tool' }
                 need_tools = needs_host_work?(request: Array(messages).find { |m| m[:role].to_s == 'user' }&.[](:content))
                 cwt_opts[:tool_choice] = has_tool_result || !need_tools ? 'auto' : 'required'
@@ -2009,13 +2039,18 @@ module PWN
           state = opts[:state]
           return nil unless state && defined?(TaskSummarizer) && TaskSummarizer.enabled?
 
-          line = TaskSummarizer.about_to(
-            name: opts[:name],
-            args: opts[:args],
-            state: state,
-            request: opts[:request],
-            tools: opts[:tools]
-          )
+          thinking = opts[:thinking].to_s.strip
+          line = if thinking.empty?
+                   TaskSummarizer.about_to(
+                     name: opts[:name],
+                     args: opts[:args],
+                     state: state,
+                     request: opts[:request],
+                     tools: opts[:tools]
+                   )
+                 else
+                   thinking
+                 end
           # about_to returns nil when the brief is a duplicate of the last one
           emit_task_summary(line: line, on_tool: opts[:on_tool]) if line
           line
@@ -3083,12 +3118,19 @@ module PWN
                   unmet = completion_unmet(request: request, messages: messages)
                   warn "[pwn-ai/loop] original request not evidenced on iter=#{i} unmet=#{unmet.join(',')}; continuing"
                   debug_progress(msg: "bounce unsatisfied unmet=#{unmet.join(',')} snippet=#{debug_snippet(text: text)}")
+                  missing = unmet.any? { |row| row.to_s.start_with?('deliverable_missing:') }
+                  nudge = if missing
+                            "[pwn-ai] artifact not written; write it now. unmet=#{unmet.join(',')} " \
+                              'Keep calling CORE_TOOLS (shell, pwn_eval) until that path exists and is non-empty.'
+                          else
+                            "[pwn-ai] The original request is not evidenced yet. unmet=#{unmet.join(',')} " \
+                              'Keep calling CORE_TOOLS (shell, pwn_eval) until that request is ' \
+                              'done or a tool returned failure evidence. pwn-ai does not decide ' \
+                              'authorization. Do not declare completion from a listing or a refusal.'
+                          end
                   messages << {
                     role: 'user',
-                    content: "[pwn-ai] The original request is not evidenced yet. unmet=#{unmet.join(',')} " \
-                             'Keep calling CORE_TOOLS (shell, pwn_eval) until that request is ' \
-                             'done or a tool returned failure evidence. pwn-ai does not decide ' \
-                             'authorization. Do not declare completion from a listing or a refusal.'
+                    content: nudge
                   }
                   next
                 end
@@ -3124,6 +3166,7 @@ module PWN
                 }
               end,
               request: request,
+              thinking: msg[:thinking] || msg[:reasoning_content],
               on_tool: on_tool
             )
 

@@ -327,6 +327,8 @@ module PWN
               warn "[pwn-ai] failed to load tool #{File.basename(f)}: #{e.class}: #{e.message}"
             end
           end
+          require 'pwn/ai/agent/manifest'
+          Manifest.register
           @discovered = true
           @entries.keys
         end

@@ -12,4 +12,11 @@ describe PWN::Plugins::MonkeyPatch do
     help_response = PWN::Plugins::MonkeyPatch
     expect(help_response).to respond_to :help
   end
+
+  it 'routes CTRL+D in pwn-ai to leave_special_mode instead of exiting Pry' do
+    src = File.read(described_class.method(:pry).source_location.first)
+    expect(src).to include('leave_special_mode!')
+    expect(src).to include('config.pwn_ai')
+    expect(src).to include('control_d_handler')
+  end
 end

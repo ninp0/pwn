@@ -182,6 +182,7 @@ module PWN
             maxOutputTokens: opts[:max_tokens] || 8192
           }
         }
+        http_body[:generationConfig][:thinkingConfig] = { includeThoughts: true } unless opts[:think] == false
         if system_str && !system_str.empty?
           if defined?(PWN::AI::Agent::PromptCache) &&
              PWN::AI::Agent::PromptCache.enabled?(engine: :gemini)
@@ -298,7 +299,8 @@ module PWN
         cand  = Array(resp[:candidates]).first || {}
         parts = Array(cand.dig(:content, :parts))
 
-        text = parts.select { |p| p.key?(:text) }.map { |p| p[:text] }.join
+        text = parts.reject { |p| p[:thought] }.select { |p| p.key?(:text) }.map { |p| p[:text] }.join
+        thinking = parts.select { |p| p[:thought] }.map { |p| p[:text] }.join
         tool_calls = parts.select { |p| p.key?(:functionCall) }.map do |p|
           fc = p[:functionCall]
           id = "call_#{SecureRandom.hex(8)}"
@@ -317,6 +319,7 @@ module PWN
           tool_calls: tool_calls,
           _native_content: parts
         }
+        msg[:thinking] = thinking unless thinking.to_s.strip.empty?
 
         usage = resp[:usageMetadata] || {}
         {
@@ -467,7 +470,8 @@ module PWN
             temp: 'optional - temperature (defaults to PWN::Env[:ai][:gemini][:temp] || 1)',
             max_tokens: 'optional - maxOutputTokens (defaults to 8192)',
             timeout: 'optional - seconds (default 900)',
-            spinner: 'optional - display spinner (default false)'
+            spinner: 'optional - display spinner (default false)',
+            think: 'optional - true includes Gemini thought parts (default true; false disables)'
           )
 
           # Run chat and return its result

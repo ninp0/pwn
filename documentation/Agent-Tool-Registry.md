@@ -10,10 +10,11 @@ toolsets; the JSON-Schema for each tool is what the model actually sees.
 
 | Toolset | Tools | Backed by |
 |---|---|---|
+| `http` | `http_proxy_start` · `http_proxy_stop` · `http_proxy_entries` · `http_proxy_rules` · `http_replay` | `PWN::Plugins::MitmProxy`: native HTTP HAR capture/replay; opaque CONNECT tunnels |
 | `terminal` | `shell` | `Open3.capture3` on the host, after `PWN::AI::Agent::ToolGuard` |
 | `pwn` | `pwn_eval` | `TOPLEVEL_BINDING.eval` in the live REPL process, after `ToolGuard` |
 | `memory` | `memory_remember` · `memory_recall` · `memory_forget` · `memory_clear` · **`memory_lean`** | `PWN::Memory` → `~/.pwn/memory.json` |
-| `skills` | **`skills_recall`** · `skill_list` · `skill_view` · `skill_create` · `skill_add_reference` · `skill_delete` · `skill_migrate_legacy` | `~/.pwn/skills/<name>/SKILL.md` (**[agentskills.io](https://agentskills.io) spec**; legacy flat `*.md` auto-migrated) |
+| `skills` | `skills_consolidate` · **`skills_recall`** · `skill_list` · `skill_view` · `skill_create` · `skill_add_reference` · `skill_delete` · `skill_migrate_legacy` | `~/.pwn/skills/<name>/SKILL.md` (**[agentskills.io](https://agentskills.io) spec**; legacy flat `*.md` auto-migrated) |
 | `sessions` | **`session_recall`** · `sessions_list` · `sessions_view` · `sessions_current` · `sessions_delete` · `sessions_stats` · **`sessions_lean`** | `PWN::Sessions` → `~/.pwn/sessions/` |
 | `learning` | `learning_note_outcome` · `learning_reflect` · `learning_distill_skill` · `learning_stats` · `learning_outcomes` · `learning_consolidate` · `learning_reset` · `learning_auto_introspect_toggle` · **`learning_gc_stores`** · **`learning_purge_noise`** · **`mistakes_list`** · **`mistakes_record`** · **`mistakes_resolve`** · **`mistakes_reset`** · **`mistakes_lean`** · **`reward_judge`** · **`reward_prm`** · **`reward_sentinel`** · **`reward_preferences`** · **`reward_export_dpo`** · **`reward_warm_sentinel`** · **`reward_scrub_preferences`** · **`reward_preference_balance`** · **`curriculum_practice`** · **`curriculum_train`** · **`curriculum_hindsight`** · **`curriculum_offline_judge`** · **`curriculum_preference_balance`** | `PWN::AI::Agent::Learning` + `Mistakes` + `Reward` + `Curriculum` → `~/.pwn/learning.jsonl` + `~/.pwn/mistakes.json` + `~/.pwn/preferences.jsonl` + `~/.pwn/curriculum/` + `~/.pwn/finetune/` |
 | `reward` | **`reward_generator_mix`** | `PWN::AI::Agent::Reward.generator_mix` → online preference source-mix controller (`preferences.jsonl`) |
@@ -23,6 +24,7 @@ toolsets; the JSON-Schema for each tool is what the model actually sees.
 | `extrospection` | `extro_snapshot` · `extro_drift` · `extro_observe` · `extro_observations` · `extro_intel` · **`extro_watch`** · **`extro_verify`** · **`extro_rf_tune`** · **`extro_osint`** · **`extro_serial`** · **`extro_telecomm`** · **`extro_packet`** · **`extro_vision`** · **`extro_voice`** · `extro_correlate` · `extro_stats` · `extro_reset` · `extro_auto_toggle` | `PWN::AI::Agent::Extrospection` (+ Serial/Packet/OCR/Voice/BareSIP/TransparentBrowser/GQRX) → `~/.pwn/extrospection.json` |
 | `cron` | `cron_list` · `cron_create` · `cron_run` · `cron_enable` · `cron_disable` · `cron_remove` | `PWN::Cron` → `~/.pwn/cron/jobs.yml` |
 | `swarm` | `agent_list` · `agent_spawn` · `agent_ask` · `agent_debate` · `agent_broadcast` · `swarm_bus` · `swarm_list` | `PWN::AI::Agent::Swarm` → `~/.pwn/agents.yml` + `~/.pwn/swarm/` |
+| `manifest` | `host_os_type` | YAML tool declarations in `lib/pwn/ai/tools/*.yaml` via `PWN::AI::Agent::Manifest` |
 
 The `learning` toolset is deliberately large: **Mistakes** (negative feedback),
 **Reward** (outcome and process judges, sentinel, preference ledger) and

@@ -38,7 +38,8 @@ describe PWN::Plugins::Findings do
       expect(child[:chain_parent_id]).to eq(parent[:id])
       expect(child[:composite_severity]).to eq('high')
       score = described_class.chain_score(ids: [parent[:id], child[:id]])
-      expect(score[:combined_severity]).to eq('critical')
+      expect(score[:combined_severity]).to eq('high')
+      expect(score[:rationale]).to include('No automatic escalation')
     end
   end
 

@@ -4,6 +4,7 @@ require 'json'
 require 'fileutils'
 require 'securerandom'
 require 'digest'
+require 'time'
 
 module PWN
   module Plugins
@@ -13,6 +14,87 @@ module PWN
 
       public_class_method def self.required_bins
         []
+      end
+
+      # Strict P10 boundary. Legacy record remains available for older callers.
+      public_class_method def self.record_structured(opts = {})
+        opts = opts.transform_keys(&:to_sym)
+        %i[title cwe cvss_vector affected_asset poc remediation].each do |key|
+          raise ArgumentError, "#{key} must be a non-empty string" unless opts[key].is_a?(String) && !opts[key].strip.empty?
+        end
+        raise ArgumentError, 'cwe must be CWE-<positive integer>' unless opts[:cwe].match?(/\ACWE-[1-9]\d*\z/)
+
+        engagement = opts[:engagement_id].to_s
+        raise ArgumentError, 'engagement_id must be a simple identifier' unless engagement.empty? || engagement.match?(/\A[a-zA-Z0-9_-]+\z/)
+
+        validate_cvss(opts)
+        confidence = opts[:confidence]
+        raise ArgumentError, 'confidence must be numeric in 0..1' unless confidence.is_a?(Numeric) && confidence.finite? && confidence.between?(0, 1)
+
+        paths = opts[:evidence_paths]
+        raise ArgumentError, 'evidence_paths must contain existing readable absolute file paths' unless paths.is_a?(Array) && !paths.empty? && paths.all? { |path| path.is_a?(String) && path.start_with?('/') && File.file?(path) && File.readable?(path) }
+
+        refs = opts[:attack_chain_refs]
+        rows = report(engagement_id: opts[:engagement_id].to_s)
+        raise ArgumentError, 'attack_chain_refs must reference existing findings in this engagement' unless refs.is_a?(Array) && refs.all? { |id| id.is_a?(String) && rows.any? { |row| row[:id] == id } }
+
+        score = opts[:cvss_score]
+        severity = if score.zero?
+                     'info'
+                   elsif score < 4
+                     'low'
+                   elsif score < 7
+                     'medium'
+                   elsif score < 9
+                     'high'
+                   else
+                     'critical'
+                   end
+        row = opts.slice(:title, :cwe, :cvss_vector, :cvss_score, :affected_asset, :evidence_paths, :poc,
+                         :attack_chain_refs, :remediation, :confidence, :engagement_id, :session_id)
+        row = row.merge(id: SecureRandom.hex(6), severity: severity, status: 'open', verification_status: 'not_executed',
+                        chain_refs: refs, host: opts[:affected_asset], evidence: paths.map { |path| Digest::SHA256.file(path).hexdigest },
+                        poc_artifacts: [], at: Time.now.utc.iso8601)
+        FileUtils.mkdir_p(File.dirname(FILE))
+        File.open(FILE, 'a') do |file|
+          file.flock(File::LOCK_EX)
+          file.puts(JSON.generate(row))
+        end
+        evidence_anchor(row: row, arts: paths)
+        row
+      end
+
+      private_class_method def self.validate_cvss(opts = {})
+        score = opts[:cvss_score]
+        raise ArgumentError, 'cvss_score must be numeric in 0..10' unless score.is_a?(Numeric) && score.finite? && score.between?(0, 10)
+
+        parts = opts[:cvss_vector].split('/')
+        version = parts.shift
+        values = { 'AV' => %w[N A L P], 'AC' => %w[L H], 'PR' => %w[N L H], 'UI' => %w[N R],
+                   'S' => %w[U C], 'C' => %w[N L H], 'I' => %w[N L H], 'A' => %w[N L H] }
+        metrics = parts.map { |part| part.split(':', -1) }
+        raise ArgumentError, 'cvss_vector contains malformed metrics' unless metrics.all? { |metric| metric.length == 2 }
+
+        valid = %w[CVSS:3.0 CVSS:3.1].include?(version) && metrics.length == values.length &&
+                metrics.map(&:first).uniq.length == values.length && metrics.all? { |key, value| values[key]&.include?(value) }
+        raise ArgumentError, 'cvss_vector must be a complete CVSS 3.0/3.1 base vector' unless valid
+
+        metrics = metrics.to_h
+        changed = metrics['S'] == 'C'
+        impact_values = { 'N' => 0.0, 'L' => 0.22, 'H' => 0.56 }
+        iss = 1 - %w[C I A].map { |key| 1 - impact_values.fetch(metrics[key]) }.inject(:*)
+        impact = changed ? ((7.52 * (iss - 0.029)) - (3.25 * ((iss - 0.02)**15))) : 6.42 * iss
+        av = { 'N' => 0.85, 'A' => 0.62, 'L' => 0.55, 'P' => 0.2 }.fetch(metrics['AV'])
+        ac = metrics['AC'] == 'L' ? 0.77 : 0.44
+        pr = { 'N' => 0.85, 'L' => changed ? 0.68 : 0.62, 'H' => changed ? 0.5 : 0.27 }.fetch(metrics['PR'])
+        ui = metrics['UI'] == 'N' ? 0.85 : 0.62
+        base = if impact <= 0
+                 0
+               else
+                 [10, (impact + (8.22 * av * ac * pr * ui)) * (changed ? 1.08 : 1)].min
+               end
+        calculated = ((base * 10).round(8).ceil / 10.0)
+        raise ArgumentError, "cvss_score must match cvss_vector (#{calculated})" unless score == calculated
       end
 
       public_class_method def self.record(opts = {})
@@ -72,7 +154,10 @@ module PWN
         File.readlines(path).each do |ln|
           row = JSON.parse(ln, symbolize_names: true)
           n += 1
-          next unless File.file?(row[:path].to_s)
+          unless File.file?(row[:path].to_s)
+            mismatches << row[:path]
+            next
+          end
 
           sha = Digest::SHA256.file(row[:path]).hexdigest
           mismatches << row[:path] unless sha == row[:sha256].to_s
@@ -90,6 +175,7 @@ module PWN
         end
         host = opts[:host].to_s
         rows = rows.select { |r| r[:host].to_s == host } unless host.empty?
+        rows = rows.select { |r| r[:engagement_id].to_s == opts[:engagement_id].to_s } if opts.key?(:engagement_id)
         rows
       end
 
@@ -119,13 +205,9 @@ module PWN
         rows = report if rows.empty? && ids.empty?
         ranks = { 'info' => 0, 'low' => 1, 'medium' => 2, 'high' => 3, 'critical' => 4, 'unproven' => 0 }
         peak = rows.map { |r| ranks[r[:severity].to_s] || 0 }.max || 0
-        linked = rows.length >= 2
-        sev = if linked && peak >= 2
-                'critical'
-              else
-                %w[info low medium high critical][peak] || 'info'
-              end
-        { chain_refs: rows.map { |r| r[:id] }, score: sev, combined_severity: sev, n: rows.length }
+        sev = %w[info low medium high critical][peak] || 'info'
+        { chain_refs: rows.map { |r| r[:id] }, score: sev, combined_severity: sev, n: rows.length,
+          rationale: 'Maximum recorded constituent severity. No automatic escalation; linking is not proof of combined exploitability.' }
       end
 
       public_class_method def self.render(opts = {})
@@ -133,7 +215,7 @@ module PWN
         dir = File.join(Dir.home, '.pwn', 'exports') if dir.empty?
         name = opts[:report_name].to_s
         name = 'findings' if name.empty?
-        payload = { title: 'Findings', findings: report }
+        payload = { title: 'Findings', findings: report(opts) }
         {
           markdown: PWN::Reports::Markdown.generate(results_hash: payload, dir_path: dir, report_name: name),
           html: PWN::Reports::HTML.generate(results_hash: payload, dir_path: dir, report_name: name),
@@ -172,7 +254,23 @@ module PWN
           # List host binaries this module expects to be installed.
           #{self}.required_bins
 
-          # Append a finding row to ~/.pwn/findings.jsonl.
+          # Strict structured finding boundary; accepted input is not execution proof.
+          #{self}.record_structured(
+            title: 'required - finding title',
+            cwe: 'required - CWE identifier',
+            cvss_vector: 'required - complete CVSS 3.0/3.1 base vector',
+            cvss_score: 'required - numeric score matching vector',
+            affected_asset: 'required - recon asset ID or asset identifier',
+            evidence_paths: 'required - existing readable absolute paths',
+            poc: 'required - command or code string',
+            attack_chain_refs: 'required - Array of existing same-engagement finding IDs',
+            remediation: 'required - remediation instructions',
+            confidence: 'required - numeric 0..1',
+            engagement_id: 'optional - simple engagement identifier',
+            session_id: 'optional - session identifier'
+          )
+
+          # Append a legacy finding row to ~/.pwn/findings.jsonl.
           #{self}.record(
             title: 'required - short finding title',
             severity: 'optional - info|low|medium|high|critical (defaults to info)',

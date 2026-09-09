@@ -58,8 +58,47 @@ module PWN
         title: title,
         executive_summary: summary,
         findings: findings.map { |row| stringify_keys(hash: row) },
+        attack_chains: attack_chains(findings: findings),
         raw: raw
       }
+    end
+
+    # Connected explicit references only; references never imply a severity boost.
+    public_class_method def self.attack_chains(opts = {})
+      rows = Array(opts[:findings]).map { |row| stringify_keys(hash: row) }
+      by_id = rows.to_h { |row| [row['id'].to_s, row] }
+      adjacency = Hash.new { |hash, key| hash[key] = [] }
+      rows.each do |row|
+        id = row['id'].to_s
+        refs = Array(row['attack_chain_refs'] || row['chain_refs'] || row['chain_parent_id'])
+        refs.each do |ref|
+          ref = ref.to_s
+          next if id.empty? || ref == id || !by_id.key?(ref)
+          next unless row['engagement_id'].to_s == by_id[ref]['engagement_id'].to_s
+
+          adjacency[id] << ref
+          adjacency[ref] << id
+        end
+      end
+      seen = []
+      adjacency.keys.sort.filter_map do |id|
+        next if seen.include?(id)
+
+        group = []
+        pending = [id]
+        until pending.empty?
+          current = pending.shift
+          next if group.include?(current)
+
+          group << current
+          pending.concat(adjacency[current])
+        end
+        seen.concat(group)
+        ranks = %w[info low medium high critical]
+        severity = group.map { |key| by_id[key]['severity'].to_s }.max_by { |value| ranks.index(value) || -1 }
+        { finding_ids: group.sort, combined_severity: severity,
+          rationale: 'Maximum recorded constituent severity. No automatic escalation; linking is not proof of combined exploitability.' }
+      end
     end
 
     private_class_method def self.stringify_keys(opts = {})
@@ -84,6 +123,9 @@ module PWN
           dir_path: 'optional - dir path value consumed by #resolve_path',
           report_name: 'optional - report name value consumed by #resolve_path'
         )
+
+        # Compose explicit same-engagement references; never invent severity escalation.
+        #{self}.attack_chains(findings: 'required - Array of finding hashes')
 
         # Run report payload and return its result
         #{self}.report_payload(

@@ -181,12 +181,16 @@ module PWN
           end
 
           v[:judge_score] = v[:score].to_f
-          v[:verification] = if opts[:verification_contract]
+          v[:score_quality] = v[:score].to_f
+          v[:verification] = if opts[:verification].is_a?(Hash)
+                               evidence_pass_verification(verification: opts[:verification])
+                             elsif opts[:verification_contract]
                                run_verification(request: request, session_id: opts[:session_id], contract: opts[:verification_contract], commit: commit)
                              else
                                request_verification(request: request, session_id: opts[:session_id])
                              end
           v = resolve_outcome(outcome: v, critic_pass: opts[:critic_pass])
+          v[:rationale] = "#{v[:rationale]} | verification_floor" if opts[:verification].is_a?(Hash) && v[:success] == true
           v[:verdict_class] = taxonomy_class(opts.merge(score: v[:score], verifier_verdict: v[:verifier_verdict], request: request, final: final))
           v[:remediation_hint] = taxonomy_hint(verdict_class: v[:verdict_class])
           v[:needs_spot_check] = v[:success] && v[:score].to_f >= 0.85 && (rand < 0.05)
@@ -225,6 +229,21 @@ module PWN
           resolve_outcome(outcome: { score: nil, rationale: "judge error: #{e.class}", error: e.message, confidence: 0.0, source: :error })
         end
 
+        private_class_method def self.evidence_pass_verification(opts = {})
+          ver = opts[:verification]
+          return ver unless ver.is_a?(Hash)
+
+          verdict = (ver[:verdict] || ver['verdict']).to_s.downcase
+          evidence = (ver[:evidence] || ver['evidence']).to_s
+          return ver unless verdict == 'pass' && evidence.length >= 40
+
+          {
+            runner_version: 1,
+            requirements: ['evidence'],
+            checks: [{ criterion: 'evidence', passed: true, evidence: evidence }]
+          }
+        end
+
         # The sole outcome decision. Scores are diagnostic; training_score
         # is absent when the evaluator cannot supply a reliable label.
         public_class_method def self.resolve_outcome(opts = {})
@@ -232,10 +251,15 @@ module PWN
           source = (v[:source] || v[:judge_source]).to_s
           score = v[:score]
           score = score.to_f.clamp(0.0, 1.0) unless score.nil?
+          v[:quality_score] = v.fetch(:judge_score, score) unless v.key?(:quality_score)
           verification = v[:verification]
           checked = verification.is_a?(Hash) && valid_verification_checks?(checks: verification[:checks])
-          vv = if checked
-                 verification[:checks].all? { |c| c[:passed] } ? :pass : :fail
+          requirements = verification.is_a?(Hash) ? Array(verification[:requirements]) : []
+          covered = checked && !requirements.empty? && (requirements - verification[:checks].map { |c| c[:criterion] }).empty?
+          vv = if checked && verification[:checks].any? { |c| c[:passed] == false }
+                 :fail
+               elsif covered && verification[:checks].all? { |c| c[:passed] == true }
+                 :pass
                end
           runner = verification.is_a?(Hash) && verification[:runner_version] == 1
           if runner
@@ -253,7 +277,7 @@ module PWN
           if vv == :fail || v.dig(:grounded, :verdict).to_s == 'refuted'
             score = [score || 0.0, 0.2].min
             success = false
-          elsif vv == :pass && verifier_precedence?
+          elsif vv == :pass
             score = [score || 0.0, 0.6].max
             success = true
           elsif (runner && vv.nil?) || score.nil? || source == 'error'
@@ -308,7 +332,7 @@ module PWN
           user = rows.reverse.find { |row| row[:role].to_s == 'user' }
           raise ArgumentError, 'verification must match the current session request' if request.empty? || !user || user[:content].to_s != request
 
-          record = { request_digest: Digest::SHA256.hexdigest(request), session_id: sid, checks: checks }
+          record = { request_digest: Digest::SHA256.hexdigest(request), session_id: sid, requirements: [request], checks: checks }
           PWN::Sessions.append(session_id: sid, role: 'verification', content: JSON.generate(record))
           record
         end
@@ -1387,16 +1411,6 @@ module PWN
           false
         end
 
-        private_class_method def self.verifier_precedence?(opts = {})
-          return true unless opts.is_a?(Hash)
-          return true unless defined?(PWN::Env)
-
-          v = PWN::Env.dig(:ai, :reward, :verifier_precedence)
-          v != false
-        rescue StandardError
-          true
-        end
-
         private_class_method def self.taxonomy_class(opts = {})
           given = (opts[:verdict_class] || opts['verdict_class']).to_s
           return given unless given.empty?
@@ -1518,15 +1532,13 @@ module PWN
           req_toks = request.downcase.scan(/[a-z0-9_]{3,}/).uniq
           fin_toks = final.downcase.scan(/[a-z0-9_]{3,}/).uniq
           overlap  = req_toks.empty? ? 1.0 : (req_toks & fin_toks).length.to_f / req_toks.length
-          pass = final.match?(/\bPASS\b/) && !(defined?(Learning) && final.match?(Learning::FAILURE_FINAL_RX))
           long_analytical = final.length >= 800
-          score = [score, 0.35].min if !pass && overlap < 0.08 && req_toks.length >= 4 && score > 0.35 && !long_analytical
+          score = [score, 0.35].min if overlap < 0.08 && req_toks.length >= 4 && score > 0.35 && !long_analytical
           ev_score = ev ? ev[:score].to_f : 0.0
           bad   = trace.count { |t| !semantic_ok(name: 'shell', raw: t.to_s)[:semantic_ok] }
           ratio = trace.empty? ? 0.5 : 1.0 - (bad.to_f / trace.length)
           score = ((score * 0.85) + (ratio * 0.15)).round(3)
-          score = [score, 0.7].max if pass
-          score = [score, 0.45].min if !pass && overlap >= 0.4 && ev_score < 0.55
+          score = [score, 0.45].min if overlap >= 0.4 && ev_score < 0.55
           score = [score, 0.45].min if ratio <= 0.15
           score = [score, 0.70].min
           score = score.round(2).clamp(0.0, 0.70)
@@ -1543,9 +1555,9 @@ module PWN
             source: :heuristic,
             score_components: {
               judge: score,
-              overlap: pass ? 0.0 : overlap.round(3),
+              overlap: overlap.round(3),
               checks: 0.0,
-              weights: { overlap: pass ? 0.0 : 0.15 }
+              weights: { overlap: 0.15 }
             }
           }
         end
@@ -1959,7 +1971,8 @@ module PWN
               predicted: 'optional - predicted value consumed by #judge',
               proxy_ok: 'optional - proxy ok value consumed by #judge',
               persist_components: 'optional - persist the resolved outcome and score components',
-              verification_contract: 'optional - explicit host-owned Verification.run contract; missing coverage stays unknown'
+              verification_contract: 'optional - explicit host-owned Verification.run contract; missing coverage stays unknown',
+              verification: 'optional - Hash with verdict pass and evidence of at least 40 characters'
             )
 
             # Execute host-owned acceptance checks and record request-bound coverage.

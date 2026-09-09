@@ -28,11 +28,13 @@ Class methods take `(opts = {})` and read `opts`.
 
 ```ruby
 PWN::Plugins::Vault.help
-PWN::Plugins::Vault.refresh_encryption_secrets(opts)
+PWN::Plugins::Vault.seal_credentials(opts)
 ```
 
 ## Public methods
 
+- `seal_credentials`
+- `open_credentials`
 - `refresh_encryption_secrets`
 - `create`
 - `decrypt`
@@ -54,5 +56,5 @@ PWN::Plugins::Vault.refresh_encryption_secrets(opts)
 
 ## Verification
 
-`PWN::Plugins::Vault.respond_to?(:refresh_encryption_secrets)` after the
+`PWN::Plugins::Vault.respond_to?(:seal_credentials)` after the
 module is loaded. Read the source for parameter names.

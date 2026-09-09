@@ -34,6 +34,7 @@ PWN::Plugins::Recon.required_bins(opts)
 ## Public methods
 
 - `required_bins`
+- `run`
 - `subdomains`
 - `httpx`
 - `masscan`

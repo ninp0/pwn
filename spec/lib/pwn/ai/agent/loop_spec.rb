@@ -15,6 +15,45 @@ describe PWN::AI::Agent::Loop do # rubocop:disable Metrics/BlockLength
     expect(help_response).to respond_to :help
   end
 
+  describe 'swarm model dispatch' do
+    around do |example|
+      keys = %i[pwn_swarm_engine pwn_swarm_model]
+      previous = keys.map { |key| Thread.current[key] }
+      example.run
+    ensure
+      keys.zip(previous).each { |key, value| Thread.current[key] = value }
+    end
+
+    before do
+      allow(described_class).to receive(:publish_usage)
+      allow(described_class).to receive(:debug_progress)
+    end
+
+    PWN::AI::Agent::Loop::ENGINE_MODS.each do |engine, mod_name|
+      it "passes the persona model to #{engine} without changing provider defaults" do
+        stub_const('PWN::Env', { ai: { active: 'openai', engine => { model: 'provider-default' } } })
+        Thread.current[:pwn_swarm_engine] = engine.to_s
+        Thread.current[:pwn_swarm_model] = 'Exact/Model:Tag'
+        provider = Object.const_get(mod_name)
+        expect(provider).to receive(:chat_with_tools).with(hash_including(model: 'Exact/Model:Tag')).and_return(
+          choices: [{ message: { role: 'assistant', content: 'done' } }]
+        )
+        described_class.send(:call_engine, messages: [{ role: 'user', content: 'hello' }], tools: [])
+        expect(PWN::Env[:ai]).to eq(active: 'openai', engine => { model: 'provider-default' })
+      end
+    end
+
+    it 'leaves the provider model default intact when no override is set' do
+      Thread.current[:pwn_swarm_engine] = 'openai'
+      Thread.current[:pwn_swarm_model] = nil
+      expect(PWN::AI::OpenAI).to receive(:chat_with_tools) do |opts|
+        expect(opts).not_to have_key(:model)
+        { choices: [{ message: { role: 'assistant', content: 'done' } }] }
+      end
+      described_class.send(:call_engine, messages: [{ role: 'user', content: 'hello' }], tools: [])
+    end
+  end
+
   describe 'RL-adjacent loop contracts' do # rubocop:disable Metrics/BlockLength
     describe 'host acceptance contracts' do
       include_context 'pwn tmp sandbox'
@@ -431,7 +470,7 @@ describe PWN::AI::Agent::Loop do # rubocop:disable Metrics/BlockLength
           messages: verified,
           last_iter: false
         )
-      ).to eq false
+      ).to eq true
       expect(
         described_class.send(
           :request_unsatisfied?,
@@ -1020,11 +1059,12 @@ describe PWN::AI::Agent::Loop do # rubocop:disable Metrics/BlockLength
       Thread.current[:pwn_loop_t0] = nil
     end
 
-    it 'keeps LLM-declared deliverable paths unsatisfied until those files exist' do
+    it 'keeps user-declared deliverables pending until the write is observed' do
+      allow(PWN::AI::Agent::Mistakes).to receive(:record)
       path = "/tmp/pwn-deliv-#{Process.pid}.bin"
       FileUtils.rm_f(path)
       Thread.current[:pwn_loop_deliverables] = [path]
-      req = 'Exhaustively analyze the docker app. 100% coverage. Store the PDF in /tmp/container_pentest-p4-PWN-122B.pdf'
+      req = "Exhaustively analyze the docker app. 100% coverage. Store the PDF in #{path}"
       recap = 'Good! Let me continue the penetration test with more aggressive testing now.'
       msgs = [
         { role: 'user', content: req },
@@ -1050,7 +1090,11 @@ describe PWN::AI::Agent::Loop do # rubocop:disable Metrics/BlockLength
       ]
       expect(described_class.send(:request_unsatisfied?, request: req, messages: msgs)).to eq(true)
       expect(described_class.send(:may_finalize?, request: req, messages: msgs, text: recap)).to eq(false)
+      before = PWN::AI::Agent::TurnFinalizer.artifact_snapshot(paths: [path])
       File.write(path, 'any bytes')
+      expect(described_class.send(:request_unsatisfied?, request: req, messages: msgs)).to eq(true)
+      observed = PWN::AI::Agent::TurnFinalizer.observe_artifacts(paths: [path], before: before, effect: :write, success: true)
+      msgs << { role: 'tool', artifact_observations: observed }
       expect(described_class.send(:request_unsatisfied?, request: req, messages: msgs)).to eq(false)
     ensure
       FileUtils.rm_f(path)
@@ -1074,9 +1118,9 @@ describe PWN::AI::Agent::Loop do # rubocop:disable Metrics/BlockLength
       allow(described_class).to receive(:call_engine).and_return(payload.to_json)
       Thread.current[:pwn_loop_active] = true
       Thread.current[:pwn_loop_deliverables] = nil
-      paths = described_class.send(:declared_deliverables, request: 'write a report somewhere')
+      paths = described_class.send(:declared_deliverables, request: 'write a report to /tmp/out.json')
       expect(paths).to eq(['/tmp/out.json'])
-      contract = described_class.send(:declared_contract, request: 'write a report somewhere')
+      contract = described_class.send(:declared_contract, request: 'write a report to /tmp/out.json')
       expect(contract[:min_seconds]).to eq(28_800)
       expect(contract[:skills]).to eq(['penetration-testing'])
       expect(contract[:proofs]).to eq(['/tmp/poc.sh'])
@@ -1091,7 +1135,8 @@ describe PWN::AI::Agent::Loop do # rubocop:disable Metrics/BlockLength
 
     it 'does not bounce with empty unmet after a redirected write whose body mentions browsers' do
       Dir.mktmpdir do |dir|
-        path = File.join(dir, 'pwn-ai-DEBUG-2026-09-03.md')
+        path = File.join(dir, 'assessment.md')
+        before = PWN::AI::Agent::TurnFinalizer.artifact_snapshot(paths: [path])
         File.write(path, "# assessment\n" * 40)
         req = "analyze how well pwn-ai enables pentest. Store this list in #{path}."
         write_cmd = "cat >> #{path} <<'EOF'\nTransparentBrowser and devtools are strengths.\nEOF"
@@ -1120,6 +1165,8 @@ describe PWN::AI::Agent::Loop do # rubocop:disable Metrics/BlockLength
             content: { success: true, result: { stdout: File.read(path), exit: 0 }, effect: 'read' }.to_json
           }
         ]
+        observed = PWN::AI::Agent::TurnFinalizer.observe_artifacts(paths: [path], before: before, effect: :write, success: true)
+        msgs << { role: 'tool', artifact_observations: observed }
         expect(described_class.send(:completion_unmet, request: req, messages: msgs)).to eq([])
         expect(described_class.send(:request_unsatisfied?, request: req, messages: msgs)).to eq(false)
         expect(
@@ -1721,5 +1768,38 @@ describe PWN::AI::Agent::Loop do # rubocop:disable Metrics/BlockLength
     src = File.read(described_class.method(:run).source_location.first)
     expect(src).to include('[compacted path=')
     expect(src).to include('byteslice(0, 2_048)')
+  end
+
+  describe 'thinking on the task TUI line' do
+    it 'prefers model thinking over the TaskSummarizer brief' do
+      allow(PWN::AI::Agent::TaskSummarizer).to receive(:enabled?).and_return(true)
+      allow(PWN::AI::Agent::TaskSummarizer).to receive(:about_to).and_return('task 1/3: scan')
+      seen = []
+      described_class.send(
+        :task_summary_about_to!,
+        state: { plan: ['scan'] },
+        tools: [{ name: 'shell' }],
+        request: 'scan the host',
+        thinking: 'Need to fingerprint the service before scanning.',
+        on_tool: ->(name, args, _res) { seen << [name, args] }
+      )
+      expect(seen).to eq([['task', 'Need to fingerprint the service before scanning.']])
+      expect(PWN::AI::Agent::TaskSummarizer).not_to have_received(:about_to)
+    end
+
+    it 'falls back to the TaskSummarizer brief when thinking is blank' do
+      allow(PWN::AI::Agent::TaskSummarizer).to receive(:enabled?).and_return(true)
+      allow(PWN::AI::Agent::TaskSummarizer).to receive(:about_to).and_return('task 1/3: scan')
+      seen = []
+      described_class.send(
+        :task_summary_about_to!,
+        state: { plan: ['scan'] },
+        tools: [{ name: 'shell' }],
+        request: 'scan the host',
+        thinking: '  ',
+        on_tool: ->(name, args, _res) { seen << [name, args] }
+      )
+      expect(seen).to eq([['task', 'task 1/3: scan']])
+    end
   end
 end

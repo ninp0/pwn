@@ -112,13 +112,15 @@ module PWN
 
         public_class_method def self.error_class(opts = {})
           e = opts[:error].to_s
-          return 'docker_daemon' if e.match?(/cannot connect to the docker daemon|docker daemon|is the docker daemon running/i)
+          return 'socket_perm' if e.match?(/permission denied|eacces|eperm|operation not permitted/i) && e.match?(/docker|socket|sock\b/i)
           return 'docker_registry_auth' if e.match?(/unauthorized: authentication required|pull access denied/i)
+          return 'parse_error' if e.match?(/template.*(?:pars|error)|parse error|parsererror|unexpected token/i)
+          return 'docker_daemon' if e.match?(/cannot connect to the docker daemon|is the docker daemon running/i)
           return 'oom' if e.match?(/\boom\b|out of memory|cannot allocate memory/i)
           return 'auth_denied' if e.match?(/access denied|unauthorized|not authorized|\b401\b|\b403\b/i)
           return 'name_conflict' if e.match?(/already (?:in use|exists)|name conflict|Conflict\.|duplicate/i)
           return 'parse_error' if e.match?(/parse error|parsererror|template.*error|unexpected token/i)
-          return 'socket_perm' if e.match?(/docker\.sock|unix(?:\s+|:)socket|eperm.*sock|sock.*permission/i)
+
           return 'missing_path' if e.match?(%r{no such file|enoent|not found: /}i)
           return 'net_unreach' if e.match?(/network is unreachable|no route to host|ehostunreach/i)
           return 'perm_denied' if e.match?(/permission denied|eacces/i)
@@ -279,6 +281,8 @@ module PWN
           key   = sig.to_sym
           raise "ERROR: unknown mistake signature #{sig}" unless store[key]
 
+          raise ArgumentError, 'generic fix does not match this error class' unless applicable_fix?(mistake: store[key], fix: fix)
+
           store[key][:resolved]    = true
           store[key][:regressed]   = false
           store[key][:fix]         = fix.strip[0, FIX_MAX]
@@ -422,6 +426,9 @@ module PWN
 
           shape = (opts[:shape] || m[:shape]).to_s
           recipe = SHAPE_FIXES[shape]
+          klass = error_class(error: "#{m[:snippet]} #{m[:error]}")
+          recipe = nil if shape == 'nonzero_exit' && klass != 'missing_path'
+          recipe = nil if shape == 'eacces' && !"#{m[:snippet]} #{m[:error]}".match?(/open_sockraw|raw socket|CAP_NET_RAW/i)
           count = m[:count].to_i
           force = opts[:force] ? true : false
           hay = "#{m[:error]} #{m[:snippet]} #{m[:tool]}".downcase
@@ -553,7 +560,7 @@ module PWN
                  else
                    []
                  end
-          closed = load.values.select { |m| m[:resolved] && m[:fix] }
+          closed = load.values.select { |m| m[:resolved] && m[:fix] && applicable_fix?(mistake: m, fix: m[:fix]) }
           closed = rank_for_request(rows: closed, request: request, limit: limit)
           return '' if open.empty? && closed.empty?
 
@@ -657,13 +664,31 @@ module PWN
           parts << 'REGRESSED (previous fix did not hold)' if m[:regressed]
           fam = family(error: opts[:error] || m[:error])
           fam_fix = FAMILY_FIXES[fam]
+          raw_error = opts[:error] || m[:snippet] || m[:error]
+          klass = error_class(error: raw_error)
+          if fam == 'permission_capability' && !raw_error.to_s.match?(/open_sockraw|raw socket|CAP_NET_RAW/i)
+            fam_fix = klass == 'socket_perm' ? 'check socket ownership, mode and daemon access for this user' : 'check permissions and ownership of the failing resource'
+          end
           stored = m[:fix].to_s.strip
           stored = '' if stored.match?(%r{ls/test -e the parent}) && fam != 'missing_path'
+          stored = '' if stored.match?(/path missing or command failed/i) && klass != 'missing_path'
+          stored = '' if stored.match?(/CAP_NET_RAW|open_sockraw/) && !raw_error.to_s.match?(/open_sockraw|raw socket|CAP_NET_RAW/i)
           stored = '' if m[:hint_confidence].to_f.negative?
           stored = '' if stored.include?('[UNVERIFIED]')
           hint = stored.empty? ? fam_fix : stored
           parts << "KNOWN FIX: #{hint}" unless hint.to_s.empty?
           "[pwn-ai/mistakes] #{parts.join(' | ')}"
+        end
+
+        private_class_method def self.applicable_fix?(opts = {})
+          m = opts[:mistake]
+          error = "#{m[:snippet]} #{m[:error]}"
+          klass = error_class(error: error)
+          fix = opts[:fix].to_s
+          return false if fix.match?(%r{path missing or command failed|ls/test -e the parent}i) && klass != 'missing_path'
+          return false if fix.match?(/CAP_NET_RAW|open_sockraw/) && !error.match?(/open_sockraw|raw socket|CAP_NET_RAW/i)
+
+          true
         end
 
         public_class_method def self.note_hint_outcome(opts = {})
@@ -675,6 +700,15 @@ module PWN
           return nil unless m
 
           m[:hint_outcomes] = m[:hint_outcomes].to_i + 1
+          session_id = opts[:session_id].to_s
+          if opts[:helped] == true && !session_id.empty?
+            m[:verified_sessions] = (Array(m[:verified_sessions]) + [session_id]).uniq.last(20)
+            m[:last_verified] = Time.now.utc.iso8601
+          elsif !opts[:helped]
+            # A failed hint invalidates the stability evidence, not just its score.
+            m[:verified_sessions] = []
+            m[:last_verified] = nil
+          end
           unless opts[:helped]
             m[:hint_misses] = m[:hint_misses].to_i + 1
             if m[:hint_misses].to_i >= 3
@@ -1051,6 +1085,7 @@ module PWN
               tool: 'optional - tool name',
               error: 'optional - raw error text',
               signature: 'optional - explicit signature',
+              session_id: 'optional - independently verified successful session; required for skill promotion evidence',
               helped: 'optional - true when the hint resolved the failure'
             )
 

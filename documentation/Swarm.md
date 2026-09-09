@@ -12,7 +12,7 @@ self-improvement loop covers the whole swarm.
 
 | Path | Contains |
 |---|---|
-| `~/.pwn/agents.yml` | Persona registry (name → role/engine/toolsets/max_iters) |
+| `~/.pwn/agents.yml` | Persona registry (name → role/engine/model/toolsets/max_iters) |
 | `~/.pwn/swarm/<id>/bus.jsonl` | Append-only chat every persona reads/writes |
 | `~/.pwn/swarm/<id>/personas.json` | persona name → `PWN::Sessions` id |
 
@@ -20,6 +20,41 @@ No daemon. Cross-session / cross-process communication == another `pwn-ai` (or
 a `PWN::Cron` job) calling `Swarm.ask` with the same `swarm_id`.
 
 ## Define personas
+
+Each persona accepts optional `engine` and `model` keys. `model` is the exact
+provider model identifier (case and punctuation are preserved). Omit `engine`
+to inherit the active engine; omit `model` or leave it blank to use the selected
+provider's configured default model. Existing engine-only entries still work.
+
+For example, edit `~/.pwn/agents.yml`:
+
+```yaml
+reviewer:
+  role: Review implementation and tests.
+  engine: openai
+  model: gpt-6-astra
+  toolsets: [terminal, pwn]
+local_reviewer:
+  role: Independently review implementation and tests.
+  engine: ollama
+  model: your-installed-model:tag
+  toolsets: [terminal, pwn]
+```
+
+Replace model identifiers with models available to your configured providers.
+Personas can use different models on the same provider or different providers.
+The selection applies to `ask`, `debate`, and `broadcast`; overrides are scoped
+to each persona execution, restored after nested calls/errors, and do not rewrite
+global provider defaults. An omitted model uses the provider default, not an
+enclosing persona's model override. Provider authentication is unchanged.
+
+`agent_spawn` also accepts `model:` and `agent_list` reports it.
+
+On upgrade, `pwn setup --migrate` applies schema 3: existing persona entries
+without a `model` key receive an unset YAML `model:` field (null, meaning the
+selected provider's default). Existing model values, engine selections, and
+custom persona fields are preserved. Re-running migration makes no further
+changes. A missing `agents.yml` is not created by this migration.
 
 ```ruby
 agent_spawn(name: 'red_team',
@@ -82,8 +117,8 @@ agent_ask(name: 'red_team', swarm_id: tx[:swarm_id],
           request: 'blue_team raised WAF concerns - revise the payload.')
 ```
 
-Because each persona can pin a **different engine**, the debate is real model
-diversity, not one model role-playing.
+Each persona can pin a **different engine and/or model**, rather than requiring
+every persona to use one provider's default model.
 
 **See also:** [pwn-ai Agent](pwn-ai-Agent.md) ·
 [Agent Tool Registry](Agent-Tool-Registry.md) · [Sessions](Sessions.md)

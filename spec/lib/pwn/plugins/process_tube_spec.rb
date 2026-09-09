@@ -33,4 +33,11 @@ describe PWN::Plugins::ProcessTube do
     thr&.kill
     server&.close
   end
+
+  it 'send_line is the expect-style alias of write_line' do
+    expect(described_class.method(:send_line).source_location).not_to be_nil
+    src = File.read(described_class.method(:send_line).source_location.first)
+    expect(src).to match(/def self\.send_line/)
+    expect(src).to match(/write_line\(opts\)/)
+  end
 end

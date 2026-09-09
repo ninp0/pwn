@@ -1,8 +1,11 @@
 # frozen_string_literal: true
 
 require 'json'
+require 'digest'
+require 'json_schemer'
 require 'securerandom'
 require 'pwn/ai/agent/tool_guard'
+require 'pwn/ai/agent/manifest'
 
 module PWN
   module AI
@@ -38,19 +41,35 @@ module PWN
 
           fn   = tool_call[:function] || tool_call['function'] || {}
           name = (fn[:name] || fn['name']).to_s
-          raw  = fn[:arguments] || fn['arguments'] || '{}'
+          raw  = if fn.key?(:arguments) || fn.key?('arguments')
+                   fn[:arguments] || fn['arguments']
+                 else
+                   '{}'
+                 end
 
           entry = Registry.lookup(name: name) || Registry.lookup(name: repair_name(name: name))
           return JSON.generate(error: "unknown tool: #{name}") unless entry
 
           args = parse_args(raw: raw, entry: entry)
-          required = Array(entry.schema&.dig(:parameters, :required))
-          args = ToolGuard.coerce_args(args: args, required: required) if defined?(ToolGuard)
+          args = alias_known_keys(args: args, entry: entry)
+          schema = entry.schema[:parameters] || entry.schema['parameters'] || { type: 'object' }
+          declaration = Manifest.load(directory: opts[:manifest_directory] || Manifest::DIRECTORY)[entry.name]
+          schema = { allOf: [schema, declaration['params']] } if declaration
+          if raw.nil?
+            required = Array(schema[:required] || schema['required']).map(&:to_s)
+            return JSON.generate(success: false, error: 'invalid_payload', code: 'SCHEMA_DENY') if required.any? { |key| !ToolGuard.present?(value: args[key.to_sym] || args[key]) }
+          end
+          type_schema = drop_required(node: schema)
+          return JSON.generate(success: false, error: 'invalid_payload', code: 'SCHEMA_DENY') unless args.is_a?(Hash) && JSONSchemer.schema(JSON.parse(JSON.generate(type_schema))).valid?(JSON.parse(JSON.generate(args)))
+
           blob = args.inspect
           if defined?(PWN::Plugins::Vault)
             blob = PWN::Plugins::Vault.expand(text: blob)
             args = expand_vault_args(args: args)
           end
+          denied = Manifest.check(opts.merge(name: entry.name, args: args))
+          return JSON.generate(denied) if denied
+
           if defined?(Engagement)
             denied = ToolGuard.scope_check!(args: args, command: blob) if defined?(ToolGuard) && ToolGuard.respond_to?(:scope_check!)
             denied ||= Engagement.deny_if_out_of_scope(args: args, command: blob)
@@ -81,7 +100,17 @@ module PWN
               code: 'CAP_DENY'
             )
           end
-          result = entry.handler.call(args)
+          budget = prepare_budget(opts.merge(entry: entry, args: args))
+          return JSON.generate(budget[:denial]) if budget && budget[:denial]
+
+          started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          begin
+            result = entry.handler.call(args)
+          rescue StandardError => e
+            finish_budget(budget: budget, result: { error: e.is_a?(Timeout::Error) ? 'timeout' : e.class.name }, elapsed: Process.clock_gettime(Process::CLOCK_MONOTONIC) - started)
+            raise
+          end
+          telemetry = finish_budget(budget: budget, result: result, elapsed: Process.clock_gettime(Process::CLOCK_MONOTONIC) - started)
           result = ToolGuard.quarantine_output(text: result) if defined?(ToolGuard) && result.is_a?(String) && ToolGuard.respond_to?(:quarantine_output)
           note_taint(text: result)
           if defined?(PWN::Plugins::Vault) && result.is_a?(String)
@@ -89,7 +118,13 @@ module PWN
           elsif defined?(PWN::Plugins::Vault) && result.is_a?(Hash)
             result = JSON.parse(PWN::Plugins::Vault.redact(text: JSON.generate(result)))
           end
-          JSON.generate(success: true, result: result, effect: effect(name: entry.name, args: args))
+          response = { success: true, result: result, effect: effect(name: entry.name, args: args) }
+          response[:budget] = telemetry if telemetry
+          if telemetry && telemetry[:remaining_s].zero?
+            response[:success] = false
+            response[:error] = 'budget_exhausted'
+          end
+          JSON.generate(response)
         rescue StandardError => e
           JSON.generate(
             success: false,
@@ -134,6 +169,70 @@ module PWN
           nil
         end
 
+        # Caller owns task lifecycle. Fallback is thread-local, never process-global.
+        private_class_method def self.prepare_budget(opts = {})
+          entry = opts[:entry]
+          schema = JSON.parse(JSON.generate(entry.schema))
+          return nil unless schema.dig('parameters', 'properties', 'timeout')
+
+          args = opts[:args]
+          ledger = opts[:budget_ledger] || (Thread.current[:pwn_dispatch_budget] ||= {})
+          chains = ledger[:chains] ||= {}
+          key = opts[:budget_key] || entry.name
+          chain = chains[key] ||= { payloads: {} }
+          payload = args.reject { |name, _| name.to_s == 'timeout' }
+          hash = Digest::SHA256.hexdigest(JSON.generate(canonical(value: payload)))
+          active = chain[:active]
+          return { denial: { success: false, error: 'retry_required', payload_hash: active, hint: 'Retry the identical payload; its timeout will increase automatically.' } } if active && active != hash && (10_800 - chain[:payloads][active][:spent_s]).floor >= 1
+
+          record = chain[:payloads][hash] ||= { spent_s: 0.0, timed_out: false }
+          return { denial: { success: false, error: 'budget_exhausted', payload_hash: hash, mutations: ledger[:mutations].to_i, hint: 'Pivot to a different tool or report this blocked approach; other task work remains available.' } } if (10_800 - record[:spent_s]).floor < 1 || (active && active != hash && ledger[:mutations].to_i >= 10)
+
+          ledger[:mutations] = ledger[:mutations].to_i + 1 if active && active != hash
+          timeout = if record[:timed_out]
+                      record[:timeout_s] + 180
+                    else
+                      ToolGuard.deadline_s(timeout: args[:timeout], kind: entry.name == 'shell' ? :shell : :ruby, payload: JSON.generate(payload))
+                    end
+          timeout = [timeout, (10_800 - record[:spent_s]).floor].min
+          args[:timeout] = timeout
+          { ledger: ledger, chain: chain, record: record, hash: hash, timeout: timeout }
+        end
+
+        private_class_method def self.canonical(opts = {})
+          value = opts[:value]
+          case value
+          when Hash then value.keys.sort_by(&:to_s).to_h { |key| [key.to_s, canonical(value: value[key])] }
+          when Array then value.map { |item| canonical(value: item) }
+          else value
+          end
+        end
+
+        private_class_method def self.finish_budget(opts = {})
+          budget = opts[:budget]
+          return nil unless budget
+
+          result = opts[:result]
+          timed_out = result.is_a?(Hash) && (result[:error] || result['error']).to_s.match?(/\Atimeout(?:\b|:)/i)
+          record = budget[:record]
+          record[:spent_s] += timed_out ? budget[:timeout] : opts[:elapsed]
+          record[:timeout_s] = budget[:timeout]
+          record[:timed_out] = timed_out
+          budget[:chain][:active] = timed_out ? budget[:hash] : nil
+          remaining = [10_800 - record[:spent_s], 0].max
+          if timed_out
+            result.delete('next_timeout')
+            result.delete('mutations')
+            result.delete('scenario')
+            result.delete('hint')
+            result[:next_timeout] = [record[:timeout_s] + 180, remaining.floor].min
+            result[:mutations] = budget[:ledger][:mutations].to_i
+            result[:scenario] = remaining.floor.zero? ? 'budget_exhausted' : 'deadline'
+            result[:hint] = remaining.floor.zero? ? 'Payload budget exhausted; mutate this approach or pivot to another tool.' : 'Retry the identical payload; Dispatch increases timeout by 180 seconds.'
+          end
+          { payload_hash: budget[:hash], timeout_s: record[:timeout_s], spent_s: record[:spent_s], remaining_s: remaining, mutations: budget[:ledger][:mutations].to_i }
+        end
+
         private_class_method def self.parse_args(opts = {})
           raw   = opts[:raw]
           entry = opts[:entry]
@@ -142,6 +241,37 @@ module PWN
           when String then parse_string_args(raw: raw, entry: entry)
           when nil    then {}
           else symbolize(hash: raw.to_h)
+          end
+        end
+
+        private_class_method def self.alias_known_keys(opts = {})
+          args = opts[:args]
+          return args unless args.is_a?(Hash)
+
+          schema = opts[:entry]&.schema || {}
+          params = schema[:parameters] || schema['parameters'] || {}
+          required = Array(params[:required] || params['required']).map(&:to_s)
+          return args if required.empty? || !defined?(ToolGuard)
+
+          coerced = ToolGuard.coerce_args(args: args, required: required)
+          coerced.delete(:__schema_error)
+          coerced.delete(:__schema_hint)
+          coerced
+        end
+
+        private_class_method def self.drop_required(opts = {})
+          node = opts[:node]
+          case node
+          when Hash
+            node.each_with_object({}) do |(key, value), acc|
+              next if key.to_s == 'required'
+
+              acc[key] = drop_required(node: value)
+            end
+          when Array
+            node.map { |value| drop_required(node: value) }
+          else
+            node
           end
         end
 
@@ -437,7 +567,14 @@ module PWN
           puts "USAGE:
             # Run call and return its result
             #{self}.call(
-              tool_call: 'required - Hash { id:, type:, function: { name:, arguments: } }'
+              tool_call: 'required - Hash { id:, type:, function: { name:, arguments: } }',
+              manifest_directory: 'optional - trusted manifest YAML directory',
+              budget_ledger: 'optional - caller-owned Hash retained across one task',
+              budget_key: 'optional - trusted approach identifier; defaults to tool name',
+              scope_policy: 'optional - trusted policy Hash',
+              scope_path: 'optional - trusted scope file path',
+              audit_path: 'optional - trusted audit JSONL path',
+              approval_callback: 'optional - trusted callback for prompt risk gates'
             )
 
             # Run repair name and return its result

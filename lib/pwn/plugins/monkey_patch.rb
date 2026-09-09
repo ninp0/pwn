@@ -49,7 +49,11 @@ module PWN
         Pry.class_eval do
           def handle_line(line, options)
             if line.nil?
-              config.control_d_handler.call(self)
+              if config.pwn_ai || config.pwn_asm
+                PWN::Plugins::REPL.leave_special_mode!(pry: self)
+              else
+                config.control_d_handler.call(self)
+              end
               return
             end
 

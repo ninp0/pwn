@@ -6,6 +6,7 @@ require 'time'
 require 'securerandom'
 require 'digest'
 require 'zlib'
+require_relative 'redaction'
 
 module PWN
   # PWN::Sessions provides session management for pwn-ai (and other drivers)
@@ -71,7 +72,8 @@ module PWN
         created_at: Time.now.utc.iso8601
       }
 
-      File.open(path, 'w') do |f|
+      meta = PWN::Redaction.redact(value: meta)
+      File.open(path, File::WRONLY | File::CREAT | File::EXCL, 0o600) do |f|
         f.puts(JSON.dump(role: 'system', content: "Session started: #{meta[:title]}", timestamp: meta[:created_at]))
       end
       { id: id, path: path, meta: meta }
@@ -91,7 +93,7 @@ module PWN
       raise "Session #{sid} not found" unless File.exist?(path)
 
       role = (opts[:role] || 'user').to_s
-      content = opts[:content]
+      content = PWN::Redaction.redact(value: opts[:content])
       if content.is_a?(String)
         # Write-path policy: cap bulk by role using compact limits so append
         # cannot grow transcripts past TOOL_CONTENT_MAX / ASSISTANT_CONTENT_MAX.
@@ -104,7 +106,7 @@ module PWN
         content = redact(content: content)
       end
       entry = {
-        role: role,
+        role: redact(content: role),
         content: content,
         timestamp: Time.now.utc.iso8601
       }
@@ -527,6 +529,9 @@ module PWN
       last_asst_i = rows.rindex { |e| e[:role].to_s == 'assistant' }
       changed = false
       rows.each_with_index do |e, i|
+        clean = PWN::Redaction.redact(value: e)
+        changed = true if clean != e
+        e.replace(clean)
         role = e[:role].to_s
         content = e[:content].to_s
         if role == 'tool' && content.bytesize > tool_max
@@ -543,7 +548,7 @@ module PWN
       return changed if dry || !changed
 
       tmp = "#{path}.#{Process.pid}.tmp"
-      File.open(tmp, File::WRONLY | File::CREAT | File::TRUNC, 0o644) do |f|
+      File.open(tmp, File::WRONLY | File::CREAT | File::TRUNC, 0o600) do |f|
         f.flock(File::LOCK_EX)
         rows.each { |e| f.puts(JSON.generate(e)) }
         f.flush
@@ -567,10 +572,11 @@ module PWN
       dir = File.join(Dir.home, '.pwn', 'exports')
       FileUtils.mkdir_p(dir)
       dest = File.join(dir, "#{sid}.tar.gz")
-      manifest = { File.basename(src) => Digest::SHA256.file(src).hexdigest }
+      manifest = {}
       Dir.mktmpdir do |tmp|
-        body = File.read(src)
-        body = redact(content: body)
+        lines = File.foreach(src).map { |line| JSON.generate(PWN::Redaction.redact(value: JSON.parse(line))) }
+        body = "#{lines.join("\n")}\n"
+        manifest[File.basename(src)] = Digest::SHA256.hexdigest(body)
         File.write(File.join(tmp, File.basename(src)), body)
         eng = opts[:engagement_id].to_s
         unless eng.empty? && opts[:engagement] != true
@@ -596,7 +602,9 @@ module PWN
 
         lines = File.readlines(path)
         keep = lines.first(20) + lines.last(20)
-        Zlib::GzipWriter.open("#{path}.gz") { |gz| gz.write(keep.join) }
+        Zlib::GzipWriter.open("#{path}.gz") do |gz|
+          keep.each { |line| gz.write("#{JSON.generate(PWN::Redaction.redact(value: JSON.parse(line)))}\n") }
+        end
         File.delete(path)
         gzipped += 1
       end
@@ -604,30 +612,7 @@ module PWN
     end
 
     public_class_method def self.redact(opts = {})
-      text = opts[:content].to_s
-      return text if redact_disabled?
-
-      text = text.gsub(/AKIA[0-9A-Z]{16}/) { |m| redacted_token(kind: 'aws', value: m) }
-      text = text.gsub(/\beyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/) { |m| redacted_token(kind: 'jwt', value: m) }
-      text = text.gsub(%r{Bearer\s+[A-Za-z0-9._\-+/=]{12,}}i) { |m| redacted_token(kind: 'bearer', value: m) }
-      text = text.gsub(/-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----/m) { |m| redacted_token(kind: 'pem', value: m) }
-      text = text.gsub(/(password\s*[:=]\s*)\S+/i) { "#{Regexp.last_match(1)}#{redacted_token(kind: 'password', value: Regexp.last_match(0))}" }
-      text = text.gsub(/Set-Cookie:\s*[^\r\n]+/i) { |m| redacted_token(kind: 'cookie', value: m) }
-      text = PWN::Plugins::Vault.redact(text: text) if defined?(PWN::Plugins::Vault)
-      text
-    end
-
-    private_class_method def self.redact_disabled?
-      v = (PWN::Env.dig(:ai, :agent, :redact_transcripts) if defined?(PWN::Env))
-      v == false
-    rescue StandardError
-      false
-    end
-
-    private_class_method def self.redacted_token(opts = {})
-      kind = opts[:kind].to_s
-      digest = Digest::SHA256.hexdigest(opts[:value].to_s)[0, 8]
-      "[REDACTED:#{kind}:#{digest}]"
+      PWN::Redaction.redact(value: opts[:content])
     end
 
     public_class_method def self.authors

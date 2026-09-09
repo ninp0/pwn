@@ -4,6 +4,7 @@ require 'json'
 require 'open3'
 require 'securerandom'
 require 'digest'
+require 'pwn/plugins/binary_analysis'
 
 module PWN
   module Plugins
@@ -122,6 +123,8 @@ module PWN
       #   session: 'required - session id returned by #open'
       # )
       public_class_method def self.strings(opts = {})
+        return analyze_all(opts).then { |result| result.merge(data: result[:strings]) } if opts[:path]
+
         cmdj(opts.merge(cmd: 'izj'))
       end
 
@@ -130,6 +133,8 @@ module PWN
       #   session: 'required - session id returned by #open'
       # )
       public_class_method def self.imports(opts = {})
+        return analyze_all(opts).then { |result| result.merge(data: result[:imports]) } if opts[:path]
+
         cmdj(opts.merge(cmd: 'iij'))
       end
 
@@ -159,6 +164,58 @@ module PWN
         cmd(opts.merge(cmd: "pdg @ #{addr}"))
       rescue StandardError => e
         { error: "#{e.class}: #{e.message}", hint: 'r2ghidra plugin may be absent' }
+      end
+
+      # Normalized read-only entrypoint. Legacy session APIs retain their return shapes.
+      public_class_method def self.analyze_all(opts = {})
+        path = File.realpath(File.expand_path(opts[:path].to_s))
+        return BinaryAnalysis.analyze(opts.merge(path: path)) if opts[:backend] == 'binutils' || !BinaryAnalysis.available?(name: 'r2')
+
+        data = {}
+        { functions: 'aflj', strings: 'izzj', imports: 'iij' }.each do |key, command|
+          raw = BinaryAnalysis.run(argv: ['r2', '-2', '-NN', '-q', '-e', 'scr.color=0', '-c', "aaa;#{command}", path], timeout: opts.fetch(:timeout, 60))
+          data[key] = JSON.parse(raw)
+        end
+        data.merge(backend: 'radare2', status: 'ok', risk_level: 'low', path: path, sha256: Digest::SHA256.file(path).hexdigest, warnings: [])
+      rescue StandardError => e
+        BinaryAnalysis.analyze(opts).tap { |result| result[:warnings] << "radare2: #{e.message}" }
+      end
+
+      public_class_method def self.list_functions(opts = {})
+        analyze_all(opts).then { |result| result.merge(data: result[:functions]) }
+      end
+
+      public_class_method def self.disasm_function(opts = {})
+        normalized_query(opts.merge(command: 'pdfj'))
+      end
+
+      public_class_method def self.xrefs(opts = {})
+        normalized_query(opts.merge(command: 'axtj'))
+      end
+
+      private_class_method def self.normalized_query(opts = {})
+        command = opts[:command]
+        address = (opts[:function] || opts[:addr] || 'main').to_s
+        raise ArgumentError, 'invalid function/address' unless address.match?(/\A[a-zA-Z0-9_.$:]+\z/)
+
+        path = File.realpath(File.expand_path(opts[:path].to_s))
+        if opts[:backend] != 'binutils' && BinaryAnalysis.available?(name: 'r2')
+          raw = BinaryAnalysis.run(argv: ['r2', '-2', '-NN', '-q', '-e', 'scr.color=0', '-c', "aaa;#{command} @ #{address}", path], timeout: opts.fetch(:timeout, 60))
+          return { backend: 'radare2', status: 'ok', risk_level: 'low', data: JSON.parse(raw), path: path }
+        end
+        result = BinaryAnalysis.analyze(opts)
+        data = if command == 'pdfj'
+                 selector = address.match?(/\A(?:0x[0-9a-fA-F]+|[0-9]+)\z/) ? "--start-address=#{address}" : "--disassemble=#{address}"
+                 BinaryAnalysis.run(argv: ['objdump', '-d', selector, path], timeout: opts.fetch(:timeout, 60))
+               else
+                 []
+               end
+        result.delete(:disassembly)
+        result.merge(data: data, requested_function: address)
+      rescue StandardError => e
+        raise if e.is_a?(ArgumentError)
+
+        BinaryAnalysis.analyze(opts).merge(data: [], error: e.message)
       end
 
       public_class_method def self.authors
@@ -244,6 +301,70 @@ module PWN
           )
 
           # Print the AUTHOR(S) string for this module.
+          #{self}.authors
+          # Invoke required_bins with the documented options; normalized path APIs report their backend.
+          #{self}.required_bins
+          # Invoke open with the documented options; normalized path APIs report their backend.
+          #{self}.open(
+            path: 'optional - filesystem path to the local artifact or binary'
+          )
+          # Invoke cmd with the documented options; normalized path APIs report their backend.
+          #{self}.cmd(
+            cmd: 'optional - raw radare2 command for the legacy session interface'
+          )
+          # Invoke cmdj with the documented options; normalized path APIs report their backend.
+          #{self}.cmdj(
+            cmd: 'optional - raw radare2 command for the legacy session interface'
+          )
+          # Invoke close with the documented options; normalized path APIs report their backend.
+          #{self}.close(
+            session: 'optional - session identifier returned by Radare2.open'
+          )
+          # Invoke functions with the documented options; normalized path APIs report their backend.
+          #{self}.functions
+          # Invoke xrefs_to with the documented options; normalized path APIs report their backend.
+          #{self}.xrefs_to(
+            addr: 'optional - hexadecimal address or binary symbol name'
+          )
+          # Invoke xrefs_from with the documented options; normalized path APIs report their backend.
+          #{self}.xrefs_from(
+            addr: 'optional - hexadecimal address or binary symbol name'
+          )
+          # Invoke disasm with the documented options; normalized path APIs report their backend.
+          #{self}.disasm(
+            addr: 'optional - hexadecimal address or binary symbol name',
+            len: 'optional - alternative maximum disassembly instruction count',
+            n: 'optional - maximum disassembly instruction count; defaults to 32'
+          )
+          # Invoke strings with the documented options; normalized path APIs report their backend.
+          #{self}.strings(
+            path: 'optional - filesystem path to the local artifact or binary'
+          )
+          # Invoke imports with the documented options; normalized path APIs report their backend.
+          #{self}.imports(
+            path: 'optional - filesystem path to the local artifact or binary'
+          )
+          # Invoke sections with the documented options; normalized path APIs report their backend.
+          #{self}.sections
+          # Invoke binary_info with the documented options; normalized path APIs report their backend.
+          #{self}.binary_info
+          # Invoke decompile with the documented options; normalized path APIs report their backend.
+          #{self}.decompile(
+            addr: 'optional - hexadecimal address or binary symbol name'
+          )
+          # Invoke analyze_all with the documented options; normalized path APIs report their backend.
+          #{self}.analyze_all(
+            backend: 'optional - analysis backend name; binutils forces lightweight fallback',
+            path: 'optional - filesystem path to the local artifact or binary',
+            timeout: 'optional - positive subprocess or HTTP deadline in seconds'
+          )
+          # Invoke list_functions with the documented options; normalized path APIs report their backend.
+          #{self}.list_functions
+          # Invoke disasm_function with the documented options; normalized path APIs report their backend.
+          #{self}.disasm_function
+          # Invoke xrefs with the documented options; normalized path APIs report their backend.
+          #{self}.xrefs
+          # Invoke authors with the documented options; normalized path APIs report their backend.
           #{self}.authors
         "
         constants.sort

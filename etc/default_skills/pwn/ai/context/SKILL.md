@@ -39,6 +39,8 @@ PWN::AI::Context.attach_file(opts)
 - `attach_http_transcript`
 - `authors`
 - `help`
+- `ingest`
+- `retrieve`
 
 ## Source
 

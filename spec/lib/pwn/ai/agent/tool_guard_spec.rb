@@ -3,6 +3,7 @@
 require 'spec_helper'
 require 'fileutils'
 require 'tmpdir'
+require 'base64'
 
 describe PWN::AI::Agent::ToolGuard do
   it 'should display information for authors' do
@@ -44,6 +45,13 @@ describe PWN::AI::Agent::ToolGuard do
 
     it 'still denies a command that is only a placeholder token' do
       expect(described_class.placeholder?(text: ' ... ')).to be true
+    end
+
+    it 'unwraps a base64 payload so document ellipsis is opaque data' do
+      blob = Base64.strict_encode64("cat <<'EOF'\nThe token ... is fine.\nEOF\n")
+      out = described_class.unwrap_payload(args: { encoding: 'base64', data: blob }, key: :command)
+      expect(out[:command]).to include('The token ... is fine.')
+      expect(described_class.placeholder?(text: out[:command])).to be false
     end
   end
 
