@@ -24,11 +24,8 @@ module PWN
       end
 
       private_class_method def self.invoke(opts = {})
-        runner = File.join(__dir__, 'sandbox', 'driver.py')
-        stdout, stderr, status = Open3.capture3('/usr/bin/python3', '-I', runner, stdin_data: JSON.generate(opts))
-        return { ok: false, error: stderr, backend: opts.fetch(:backend, 'docker') } unless status.success?
-
-        JSON.parse(stdout, symbolize_names: true)
+        require_relative 'sandbox/driver'
+        PWNSandboxDriver.main(opts)
       rescue StandardError => e
         { ok: false, error: e.message, backend: opts.fetch(:backend, 'docker') }
       end

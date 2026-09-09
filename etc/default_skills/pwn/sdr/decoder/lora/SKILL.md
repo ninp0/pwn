@@ -12,7 +12,7 @@ metadata:
 
 # PWN::SDR::Decoder::LoRa
 
-LoRa (Semtech CSS) true-air preamble/sync-word decoder. I/Q resampled so fs = BW (default 125 kHz), one complex sample per chirp step. For each SF ∈ 7..12: dechirp with a reference down-chirp (DSP.cmul + PWN::FFI::FFTW.cfft), find ≥6 consecutive symbols whose FFT-argmax bin is identical (preamble), then read the two sync-word symbols and two SFD down-chirps. Emits {sf:, bw_hz:, sync_word:, preamble_len:, cfo_bins:} — the same metadata gr-lora / rtl-lora surface, no external binary.
+LoRa (Semtech CSS) raw PHY payload decoder and separate detector. .decode supports SF7-12, CR4/5..4/8, explicit/implicit headers, optional payload CRC, LDRO and normal/inverted IQ at sample_rate >= BW. Raw payload bytes only: no LoRaWAN decryption or clock-drift tracking. The following preamble-only description applies to .detect. I/Q resampled so fs = BW (default 125 kHz), one complex sample per chirp step. For each SF ∈ 7..12: dechirp with a reference down-chirp (DSP.cmul + PWN::FFI::FFTW.cfft), find ≥6 consecutive symbols whose FFT-argmax bin is identical (preamble), then read the two sync-word symbols and two SFD down-chirps. Emits {sf:, bw_hz:, sync_word:, preamble_len:, cfo_bins:}. This is preamble/sync metadata only, not LoRa payload decoding.
 
 ## When to use
 
@@ -34,6 +34,7 @@ PWN::SDR::Decoder::LoRa.decode(opts)
 ## Public methods
 
 - `decode`
+- `detect`
 - `parse_line`
 - `authors`
 - `help`

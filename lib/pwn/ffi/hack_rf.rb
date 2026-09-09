@@ -11,9 +11,8 @@ module PWN
     # Intentionally control-plane first: init/open/tune/rate/gains + one-shot
     # sync-style helpers used by Extrospection `probe_rf` and by wideband
     # PWN::SDR::Decoder::* modules that need real I/Q (not GQRX audio).
-    # Streaming callbacks stay opt-in — Ruby GC must not run on the
-    # libusb transfer thread, so call sites that need continuous RX should
-    # buffer into a Queue from a dedicated thread.
+    # Callbacks copy into a bounded nonblocking queue. Ruby callbacks still
+    # acquire the GVL and allocate: this is not a hard-realtime guarantee.
     module HackRF
       extend PubFFI::Library
 
@@ -51,7 +50,7 @@ module PWN
         # int (*hackrf_sample_block_cb_fn)(hackrf_transfer* transfer)
         callback :hackrf_sample_block_cb_fn, [:pointer], :int
         attach_function :hackrf_start_rx, %i[pointer hackrf_sample_block_cb_fn pointer], :int
-        attach_function :hackrf_stop_rx, [:pointer], :int
+        attach_function :hackrf_stop_rx, [:pointer], :int, blocking: true
         attach_function :hackrf_board_id_read, %i[pointer pointer], :int
         attach_function :hackrf_board_id_name, [:uint8], :string
         attach_function :hackrf_version_string_read, %i[pointer pointer uint8], :int
@@ -175,7 +174,9 @@ module PWN
       #   device:    'required - pointer from .open',
       #   max_queue: 'optional - max buffered chunks (default 64)'
       # )
-      # Returns { device:, queue:, callback: } handle for read_sync/stop_rx.
+      # Returns { device:, queue:, callback:, overruns:, dropped_bytes: }.
+      # Counters cover application queue drops only, not unreported USB/RF loss.
+      # An overrun/error latches :error; read_sync raises until RX is restarted.
       # libhackrf runs the callback on its own libusb thread; FFI acquires
       # the GVL for us, so keep the callback body to a bare byte copy.
 
@@ -186,19 +187,33 @@ module PWN
         raise 'ERROR: :device required' if dev.nil? || dev.null?
 
         max_q = (opts[:max_queue] || 64).to_i
-        queue = Queue.new
+        raise ArgumentError, 'max_queue must be positive' unless max_q.positive?
+
+        queue = SizedQueue.new(max_q)
+        h = { device: dev, queue: queue, dropped_bytes: 0, overruns: 0 }
         cb = PubFFI::Function.new(:int, [:pointer]) do |xfer_ptr|
           begin
             xfer = Transfer.new(xfer_ptr)
-            len  = xfer[:valid_length].to_i
-            queue.push(xfer[:buffer].read_bytes(len)) if len.positive? && queue.size < max_q
-          rescue StandardError
-            nil
+            len = xfer[:valid_length].to_i
+            raise 'ERROR: invalid HackRF transfer length' if len.negative? || len > xfer[:buffer_length] || len.odd?
+
+            if len.positive?
+              begin
+                queue.push(xfer[:buffer].read_bytes(len), true)
+              rescue ThreadError
+                h[:dropped_bytes] += len
+                h[:overruns] += 1
+                h[:error] = RuntimeError.new('ERROR: HackRF RX overrun: IQ continuity lost')
+              end
+            end
+          rescue StandardError => e
+            h[:error] = e
           end
           0
         end
+        h[:callback] = cb
         check!(hackrf_start_rx(dev, cb, nil))
-        { device: dev, queue: queue, callback: cb }
+        h
       end
 
       # Supported Method Parameters::
@@ -206,21 +221,29 @@ module PWN
       #   handle:  'required - handle from .start_rx',
       #   timeout: 'optional - seconds to wait for a chunk (default 1.0)'
       # )
-      # Returns String of interleaved cs8 I/Q, or nil on timeout.
+      # Returns String of interleaved cs8 I/Q, or nil on timeout/stopped RX.
+      # Raises on callback errors or queue overrun; never bridges lost IQ.
 
       public_class_method def self.read_sync(opts = {})
         h = opts[:handle]
         raise 'ERROR: :handle required (from start_rx)' unless h.is_a?(Hash) && h[:queue]
 
+        raise h[:error] if h[:error]
+
         q  = h[:queue]
         to = (opts[:timeout] || 1.0).to_f
-        deadline = Time.now + to
-        while q.empty?
-          return nil if Time.now > deadline
+        deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + to
+        loop do
+          raise h[:error] if h[:error]
+          return nil if h[:stopped]
 
+          begin
+            return q.pop(true)
+          rescue ThreadError
+            return nil if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+          end
           sleep 0.005
         end
-        q.pop
       end
 
       # Supported Method Parameters::
@@ -230,11 +253,12 @@ module PWN
         h = opts[:handle]
         return unless h.is_a?(Hash) && h[:device]
 
-        hackrf_stop_rx(h[:device])
+        return if h[:stopped]
+
+        check!(hackrf_stop_rx(h[:device]))
+        h[:stopped] = true
         h[:queue]&.clear
         h[:callback] = nil
-        nil
-      rescue StandardError
         nil
       end
 

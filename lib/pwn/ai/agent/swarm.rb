@@ -192,6 +192,9 @@ module PWN
         public_class_method def self.ask(opts = {})
           name    = opts[:name].to_s
           depth   = Thread.current[:pwn_swarm_depth] || 0
+          empty_tools = false
+          prior_id = Thread.current[:pwn_swarm_id]
+          prior_honesty = Thread.current[:pwn_swarm_honesty]
           sid     = opts[:swarm_id] || create(topic: opts[:request].to_s[0, 60])[:swarm_id]
           persona = personas(swarm_id: sid)[name.to_sym]
           raise ArgumentError, "unknown persona: #{name} (see #{AGENTS_FILE})" unless persona
@@ -231,10 +234,14 @@ module PWN
           bus_append(swarm_id: sid, from: name, to: opts[:to] || :all, content: reply)
           inbox = child_inbox(session_id: session_id, name: name)
           honesty = child_honesty(name: name, toolsets: persona[:toolsets], session_id: session_id, skills: persona[:skills])
-          (Thread.current[:pwn_swarm_honesty] ||= []) << honesty.merge(name: name)
+          (Thread.current[:pwn_swarm_honesty] ||= []) << honesty.merge(name: name) unless empty_tools
           { ok: true, swarm_id: sid, name: name, session_id: session_id, reply: reply, inbox: inbox, honesty: honesty }
         ensure
           Thread.current[:pwn_swarm_depth] = depth
+          if empty_tools
+            Thread.current[:pwn_swarm_id] = prior_id
+            Thread.current[:pwn_swarm_honesty] = prior_honesty
+          end
         end
 
         # Supported Method Parameters::
@@ -547,7 +554,9 @@ module PWN
         end
 
         public_class_method def self.honesty_unmet(opts = {})
-          _sid = opts[:swarm_id]
+          sid = (opts[:swarm_id] || Thread.current[:pwn_swarm_id]).to_s
+          return [] if sid.empty?
+
           Array(Thread.current[:pwn_swarm_honesty]).filter_map do |h|
             next unless h[:gap]
 

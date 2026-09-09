@@ -12,7 +12,7 @@ metadata:
 
 # PWN::SDR::Decoder::ZigBee
 
-IEEE 802.15.4 O-QPSK (2.4 GHz ZigBee/Thread) true-air decoder. 2 Mchip/s half-sine O-QPSK ≡ MSK, so I/Q → PWN::FFI::Liquid gmskdem (BT=0.5) at 2 Msps → chip stream. Each 4-bit symbol maps to a 32-chip PN sequence (Table 73, IEEE 802.15.4-2011); soft- correlate every 32 chips against the 16 sequences → symbols → nibbles → bytes. Hunt SHR (4×0x00 preamble + SFD 0xA7) → PHR len → MHR (FCF/seq/PAN/addr) → FCS (CRC-16-KERMIT). Emits per-frame {pan_id:, src:, dst:, frame_type:, len:, fcs_ok:}.
+IEEE 802.15.4 O-QPSK (2.4 GHz ZigBee/Thread) true-air decoder. 2 Mchip/s half-sine O-QPSK ≡ MSK: continuous Ruby FM/NRZ recovery produces differential frequency signs, not raw chips. Each symbol maps to a 32-chip PN sequence (Table 73, IEEE 802.15.4-2011); soft- correlate every 32 chips against the 16 sequences → symbols → nibbles → bytes. Hunt SHR (4×0x00 preamble + SFD 0xA7) → PHR len → MHR (FCF/seq/PAN/addr) → FCS (CRC-16-KERMIT). Emits per-frame {pan_id:, src:, dst:, frame_type:, len:, fcs_ok:}.
 
 ## When to use
 
@@ -28,15 +28,25 @@ Class methods take `(opts = {})` and read `opts`.
 
 ```ruby
 PWN::SDR::Decoder::ZigBee.help
-PWN::SDR::Decoder::ZigBee.decode(opts)
+PWN::SDR::Decoder::ZigBee.parse_mpdu(opts)
 ```
 
 ## Public methods
 
+- `parse_mpdu`
+- `decrypt_ccm`
+- `parse_security`
+- `parse_nwk`
+- `parse_aps`
 - `decode`
+- `detect`
 - `parse_line`
 - `authors`
 - `help`
+
+## References
+
+- `references/urls.md` — URLs from source
 
 ## Source
 
@@ -44,5 +54,5 @@ PWN::SDR::Decoder::ZigBee.decode(opts)
 
 ## Verification
 
-`PWN::SDR::Decoder::ZigBee.respond_to?(:decode)` after the
+`PWN::SDR::Decoder::ZigBee.respond_to?(:parse_mpdu)` after the
 module is loaded. Read the source for parameter names.

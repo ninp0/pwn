@@ -12,7 +12,7 @@ metadata:
 
 # PWN::SDR::Decoder::DSP
 
-DSP primitives shared by every PWN::SDR::Decoder::* module. Default path is pure Ruby operating on Array<Float> samples normalised to -1.0..1.0 (48 kHz s16le mono from GQRX UDP — no `sox` / `multimon-ng` / `minimodem` dependency). When the matching system library is present the hot paths transparently accelerate via PWN::FFI::{Volk,Liquid,FFTW}: unpack_s16le → PWN::FFI::Volk (SIMD s16→f32 convert) unpack_cs16le → pure / Volk path (interleaved I/Q s16 → f32) unpack_cu8 → pure path (RTL-SDR u8 I/Q → f32) resample → PWN::FFI::Liquid (msresamp multi-stage) dc_block → PWN::FFI::Liquid (firfilt DC blocker) rms_dbfs → PWN::FFI::Volk (accumulate of squares) mag_sq / fm_demod_iq → true-air I/Q paths for Base.run_iq Each accelerated method falls back to the pure-Ruby body when the backend is missing or raises, so decoders never require a native library at install time. Force pure Ruby for testing with PWN::SDR::Decoder::DSP.native = false
+DSP primitives shared by every PWN::SDR::Decoder::* module. Default path is pure Ruby operating on Array<Float> samples normalised to -1.0..1.0 (48 kHz s16le mono from GQRX UDP — no `sox` / `multimon-ng` / `minimodem` dependency). When the matching system library is present the hot paths transparently accelerate via PWN::FFI::{Volk,Liquid,FFTW}: unpack_s16le → PWN::FFI::Volk (SIMD s16→f32 convert) unpack_cs16le → pure / Volk path (interleaved I/Q s16 → f32) unpack_cu8 → pure path (RTL-SDR u8 I/Q → f32) resample → PWN::FFI::Liquid (msresamp multi-stage) dc_block → PWN::FFI::Liquid (firfilt DC blocker) rms_dbfs → PWN::FFI::Volk (accumulate of squares) mag_sq / fm_demod_iq → true-air I/Q paths for Base.run_iq Packed IQ/FM/magnitude and radix-2 FFT use optional DSPNative first. Build explicitly with ruby ext/pwn_dsp/build.rb; no runtime compilation. process_iq exposes :ruby degradation and keeps caller-owned chunk state. Other accelerated methods fall back to pure Ruby when their backend is missing or raises, so decoders never require a native library at install time. Force pure Ruby for testing with PWN::SDR::Decoder::DSP.native = false
 
 ## When to use
 
@@ -68,6 +68,7 @@ PWN::SDR::Decoder::DSP.unpack_s16le(opts)
 - `zadoff_chu`
 - `ca_code`
 - `cmul`
+- `process_iq`
 - `authors`
 - `help`
 - `even_parity_ok?`

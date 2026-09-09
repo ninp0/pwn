@@ -20,8 +20,11 @@ module PWN
       #   rms_dbfs      → PWN::FFI::Volk   (accumulate of squares)
       #   mag_sq / fm_demod_iq → true-air I/Q paths for Base.run_iq
       #
-      # Each accelerated method falls back to the pure-Ruby body when
-      # the backend is missing or raises, so decoders never require a
+      # Packed IQ/FM/magnitude and radix-2 FFT use optional DSPNative first.
+      # Build explicitly with ruby ext/pwn_dsp/build.rb; no runtime compilation.
+      # process_iq exposes :ruby degradation and keeps caller-owned chunk state.
+      # Other accelerated methods fall back to pure Ruby when their backend
+      # is missing or raises, so decoders never require a
       # native library at install time. Force pure Ruby for testing with
       #   PWN::SDR::Decoder::DSP.native = false
       module DSP
@@ -434,6 +437,8 @@ module PWN
 
         public_class_method def self.unpack_cs16le(opts = {})
           data = opts[:data].to_s
+          return process_iq(data: data, format: :cs16le, operation: :unpack)[:samples] if native && (data.bytesize % 4).zero? && PWN::FFI.available?(mod: :DSPNative)
+
           if native && PWN::FFI.available?(mod: :Volk)
             begin
               return PWN::FFI::Volk.unpack_s16le(data: data)
@@ -453,6 +458,8 @@ module PWN
 
         public_class_method def self.unpack_cu8(opts = {})
           data = opts[:data].to_s
+          return process_iq(data: data, format: :cu8, operation: :unpack)[:samples] if native && data.bytesize.even? && PWN::FFI.available?(mod: :DSPNative)
+
           norm = 1.0 / 128.0
           data.unpack('C*').map { |v| (v - 127.5) * norm }
         end
@@ -466,13 +473,8 @@ module PWN
         public_class_method def self.mag_sq(opts = {})
           iq = opts[:iq]
           n  = iq.length / 2
-          if native && n >= 64 && PWN::FFI.available?(mod: :Volk)
-            begin
-              return PWN::FFI::Volk.magnitude_squared(iq: iq)
-            rescue StandardError
-              # fall through
-            end
-          end
+          return process_iq(data: iq.first(n * 2).pack('d*'), format: :f64, operation: :mag)[:samples] if native && n >= 64 && PWN::FFI.available?(mod: :DSPNative)
+
           out = Array.new(n)
           i = 0
           while i < n
@@ -489,23 +491,18 @@ module PWN
         #   iq: 'required - interleaved Array<Float> [I0,Q0,…]',
         #   kf: 'optional - modulation index scale (default 1.0)'
         # )
-        # Polar-discriminant FM demod. Prefers PWN::FFI::Liquid.freq_demod
-        # when available; otherwise atan2 difference of consecutive samples.
+        # Polar-discriminant FM demod: atan2(cross, dot) * kf. Optional
+        # state: {} retains the previous IQ pair across calls; no leading zero.
 
         public_class_method def self.fm_demod_iq(opts = {})
           iq = opts[:iq]
           kf = (opts[:kf] || 1.0).to_f
           n  = iq.length / 2
+          return process_iq(data: iq.first(n * 2).pack('d*'), format: :f64, operation: :fm, kf: kf, state: opts[:state])[:samples] if opts[:state] || (native && PWN::FFI.available?(mod: :DSPNative))
           return [] if n < 2
 
-          if native && PWN::FFI.available?(mod: :Liquid)
-            begin
-              return PWN::FFI::Liquid.freq_demod(iq: iq, kf: kf)
-            rescue StandardError
-              # fall through
-            end
-          end
-
+          # Liquid uses a different scaling convention and emits n rather than
+          # n-1 samples; it cannot substitute for this polar discriminator.
           out = Array.new(n - 1)
           prev_re = iq[0].to_f
           prev_im = iq[1].to_f
@@ -890,6 +887,16 @@ module PWN
           iq = opts[:iq]
           n  = (opts[:n] || (iq.length / 2)).to_i
           sh = opts.fetch(:shift, true)
+          raise ArgumentError, 'n must be positive' unless n.positive?
+
+          if native && n.nobits?(n - 1) && PWN::FFI.available?(mod: :DSPNative)
+            begin
+              mag = PWN::FFI::DSPNative.cfft_mag(iq: iq, n: n)
+              return sh ? mag.rotate(n / 2) : mag
+            rescue StandardError
+              # Continue with existing FFTW / Ruby fallback.
+            end
+          end
           bins =
             if native && PWN::FFI.available?(mod: :FFTW)
               begin
@@ -904,14 +911,51 @@ module PWN
           sh ? mag.rotate(n / 2) : mag
         end
 
-        # Naive O(n²) complex DFT — pure-Ruby fallback for small n.
+        # Ruby radix-2 FFT for power-of-two sizes; exact O(n²) DFT otherwise.
         # Supported Method Parameters::
         # bins = PWN::SDR::Decoder::DSP.dft_naive(iq:, n:)
 
         public_class_method def self.dft_naive(opts = {})
           iq = opts[:iq]
           n  = (opts[:n] || (iq.length / 2)).to_i
-          n  = [n, 512].min
+          raise ArgumentError, 'n must be positive' unless n.positive?
+
+          if n.nobits?(n - 1)
+            bins = Array.new(n) { |i| [iq[2 * i].to_f, iq[(2 * i) + 1].to_f] }
+            j = 0
+            (1...n).each do |i|
+              bit = n >> 1
+              while j.anybits?(bit)
+                j ^= bit
+                bit >>= 1
+              end
+              j ^= bit
+              bins[i], bins[j] = bins[j], bins[i] if i < j
+            end
+            length = 2
+            while length <= n
+              angle = -TWO_PI / length
+              wr = Math.cos(angle)
+              wi = Math.sin(angle)
+              (0...n).step(length) do |start|
+                ur = 1.0
+                ui = 0.0
+                (length / 2).times do |offset|
+                  a = start + offset
+                  b = a + (length / 2)
+                  br, bi = bins[b]
+                  tr = (br * ur) - (bi * ui)
+                  ti = (br * ui) + (bi * ur)
+                  ar, ai = bins[a]
+                  bins[a] = [ar + tr, ai + ti]
+                  bins[b] = [ar - tr, ai - ti]
+                  ur, ui = [(ur * wr) - (ui * wi), (ur * wi) + (ui * wr)]
+                end
+              end
+              length *= 2
+            end
+            return bins
+          end
           Array.new(n) do |k|
             re = 0.0
             im = 0.0
@@ -994,6 +1038,53 @@ module PWN
             i += 1
           end
           out
+        end
+
+        # Contiguous IQ kernel; state is caller-owned, never shared across streams.
+        # Supported Method Parameters::
+        # result = PWN::SDR::Decoder::DSP.process_iq(data:, format: :cu8,
+        #   operation: :fm, state: {}, kf: 1.0, native: true)
+        # Returns { samples:, backend: }; state retains incomplete bytes and last IQ.
+        public_class_method def self.process_iq(opts = {})
+          format = opts.fetch(:format, :cu8).to_sym
+          operation = opts.fetch(:operation, :fm).to_sym
+          width = { cu8: 2, cs16le: 4, f64: 16 }.fetch(format)
+          raise ArgumentError, 'operation must be unpack, mag or fm' unless %i[unpack mag fm].include?(operation)
+
+          state = opts[:state] || {}
+          data = state.fetch(:remainder, ''.b) + opts[:data].to_s.b
+          complete = data.bytesize / width * width
+          payload = data.byteslice(0, complete)
+          kf = opts.fetch(:kf, 1.0).to_f
+          if opts.fetch(:native, native) && PWN::FFI.available?(mod: :DSPNative)
+            begin
+              result = PWN::FFI::DSPNative.process_iq(data: payload, format: format, operation: operation, previous: state[:previous], kf: kf)
+              state[:previous] = result[:previous] if result[:previous]
+              state[:remainder] = data.byteslice(complete, data.bytesize - complete)
+              return { samples: result[:samples], backend: :native }
+            rescue StandardError
+              # Native failures leave caller state untouched; retry in Ruby.
+            end
+          end
+          iq = case format
+               when :cu8 then payload.unpack('C*').map { |v| (v - 127.5) / 128.0 }
+               when :cs16le then payload.unpack('s<*').map { |v| v / 32_768.0 }
+               when :f64 then payload.unpack('d*')
+               end
+          previous = state[:previous]
+          samples = case operation
+                    when :unpack then iq
+                    when :mag then iq.each_slice(2).map { |re, im| (re * re) + (im * im) }
+                    when :fm
+                      iq.each_slice(2).filter_map do |re, im|
+                        value = Math.atan2((im * previous[0]) - (re * previous[1]), (re * previous[0]) + (im * previous[1])) * kf if previous
+                        previous = [re, im]
+                        value
+                      end
+                    end
+          state[:previous] = iq.last(2) unless iq.empty?
+          state[:remainder] = data.byteslice(complete, data.bytesize - complete)
+          { samples: samples, backend: :ruby }
         end
 
         # Author(s):: 0day Inc. <support@0dayinc.com>
@@ -1115,7 +1206,8 @@ module PWN
             # Run fm demod iq and return its result
             #{self}.fm_demod_iq(
               iq: 'required - interleaved Array<Float> [I0,Q0,…]',
-              kf: 'optional - modulation index scale (default 1.0)'
+              kf: 'optional - modulation index scale (default 1.0)',
+              state: 'optional - caller-owned Hash preserving previous IQ pair'
             )
 
             # Run iq rms dbfs and return its result
@@ -1208,7 +1300,7 @@ module PWN
               n: 'optional - count, width, or size'
             )
 
-            # Naive O(n²) complex DFT — pure-Ruby fallback for small n
+            # Ruby radix-2 FFT for power-of-two sizes; O(n²) DFT otherwise
             #{self}.dft_naive(
               iq: 'optional - iq value consumed by #dft_naive',
               n: 'optional - count, width, or size'
@@ -1230,6 +1322,17 @@ module PWN
               a: 'optional - a value consumed by #cmul',
               b: 'optional - b value consumed by #cmul',
               conj_b: 'optional - conj b value consumed by #cmul'
+            )
+
+            # Process packed IQ without allocating an intermediate IQ Array.
+            # Returns samples plus :native or explicitly degraded :ruby backend.
+            #{self}.process_iq(
+              data: 'required - packed IQ bytes',
+              format: 'optional - :cu8, :cs16le, or host-native :f64 (default :cu8)',
+              operation: 'optional - :unpack, :mag, or :fm (default :fm)',
+              state: 'optional - caller-owned Hash retaining byte remainder and previous pair',
+              kf: 'optional - multiply FM phase radians (default 1.0)',
+              native: 'optional - override native toggle (default DSP.native)'
             )
 
             # Print the AUTHOR(S) string for this module.

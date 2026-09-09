@@ -1,0 +1,19 @@
+{
+  "fixture_sha256": "d658e615c10c8e65b8c190d7cf2592237fd430411936b4d82c7b30c008c1ab21",
+  "scope": "offline repeated upstream 5ms capture; not a continuous on-air stream",
+  "iterations": 100,
+  "demod": {
+    "first_seconds": 0.03976687788963318,
+    "total_seconds": 0.40510242618620396,
+    "decoded_mibs": 100,
+    "complex_samples_per_second": 2369771.0454065246,
+    "realtime_ratio": 1.2342557528158982
+  },
+  "shared_runner": {
+    "first_seconds": 0.0358047466725111,
+    "total_seconds": 0.6484070736914873,
+    "decoded_mibs": 100,
+    "complex_samples_per_second": 1480551.3988836724,
+    "realtime_ratio": 0.7711205202519127
+  }
+}

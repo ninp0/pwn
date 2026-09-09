@@ -1,0 +1,24 @@
+[
+  {
+    "backend": "ruby",
+    "samples": 1000000,
+    "seconds": 30.265897622331977,
+    "samples_per_second": 33040.487101302446,
+    "realtime": false,
+    "verified_frames": 20,
+    "chunk_bytes": 16384,
+    "dsp_native": true,
+    "ruby_version": "4.0.6"
+  },
+  {
+    "backend": "native",
+    "samples": 1000000,
+    "seconds": 0.3193483091890812,
+    "samples_per_second": 3131377.155367732,
+    "realtime": true,
+    "verified_frames": 20,
+    "chunk_bytes": 16384,
+    "dsp_native": true,
+    "ruby_version": "4.0.6"
+  }
+]

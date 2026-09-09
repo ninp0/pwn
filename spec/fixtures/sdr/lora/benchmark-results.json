@@ -1,0 +1,142 @@
+[
+  {
+    "file": "mode-0.cf32.gz",
+    "sf": 9,
+    "sample_rate": 125000,
+    "samples": 21120,
+    "seconds": 0.086125,
+    "signal_seconds": 0.16896,
+    "realtime_ratio": 1.962,
+    "decoded_packets": 1
+  },
+  {
+    "file": "mode-1.cf32.gz",
+    "sf": 10,
+    "sample_rate": 125000,
+    "samples": 39680,
+    "seconds": 0.07455,
+    "signal_seconds": 0.31744,
+    "realtime_ratio": 4.258,
+    "decoded_packets": 1
+  },
+  {
+    "file": "mode-2.cf32.gz",
+    "sf": 11,
+    "sample_rate": 125000,
+    "samples": 84992,
+    "seconds": 0.190659,
+    "signal_seconds": 0.679936,
+    "realtime_ratio": 3.566,
+    "decoded_packets": 1
+  },
+  {
+    "file": "mode-3.cf32.gz",
+    "sf": 12,
+    "sample_rate": 125000,
+    "samples": 181760,
+    "seconds": 0.347159,
+    "signal_seconds": 1.45408,
+    "realtime_ratio": 4.189,
+    "decoded_packets": 1
+  },
+  {
+    "file": "mode-4.cf32.gz",
+    "sf": 9,
+    "sample_rate": 125000,
+    "samples": 20096,
+    "seconds": 0.058706,
+    "signal_seconds": 0.160768,
+    "realtime_ratio": 2.739,
+    "decoded_packets": 1
+  },
+  {
+    "file": "mode-5.cf32.gz",
+    "sf": 12,
+    "sample_rate": 125000,
+    "samples": 124416,
+    "seconds": 0.270001,
+    "signal_seconds": 0.995328,
+    "realtime_ratio": 3.686,
+    "decoded_packets": 1
+  },
+  {
+    "file": "mode-6.cf32.gz",
+    "sf": 7,
+    "sample_rate": 125000,
+    "samples": 8224,
+    "seconds": 0.019986,
+    "signal_seconds": 0.065792,
+    "realtime_ratio": 3.292,
+    "decoded_packets": 1
+  },
+  {
+    "file": "mode-7.cf32.gz",
+    "sf": 7,
+    "sample_rate": 125000,
+    "samples": 6176,
+    "seconds": 0.015599,
+    "signal_seconds": 0.049408,
+    "realtime_ratio": 3.167,
+    "decoded_packets": 1
+  },
+  {
+    "file": "mode-8.cf32.gz",
+    "sf": 8,
+    "sample_rate": 125000,
+    "samples": 11072,
+    "seconds": 0.023736,
+    "signal_seconds": 0.088576,
+    "realtime_ratio": 3.732,
+    "decoded_packets": 1
+  },
+  {
+    "file": "mode-9.cf32.gz",
+    "sf": 10,
+    "sample_rate": 125000,
+    "samples": 45824,
+    "seconds": 0.085227,
+    "signal_seconds": 0.366592,
+    "realtime_ratio": 4.301,
+    "decoded_packets": 1
+  },
+  {
+    "file": "mode-10.cf32.gz",
+    "sf": 11,
+    "sample_rate": 125000,
+    "samples": 72704,
+    "seconds": 0.143009,
+    "signal_seconds": 0.581632,
+    "realtime_ratio": 4.067,
+    "decoded_packets": 1
+  },
+  {
+    "file": "mode-11.cf32.gz",
+    "sf": 12,
+    "sample_rate": 125000,
+    "samples": 132608,
+    "seconds": 0.265867,
+    "signal_seconds": 1.060864,
+    "realtime_ratio": 3.99,
+    "decoded_packets": 1
+  },
+  {
+    "file": "mode-12.cf32.gz",
+    "sf": 8,
+    "sample_rate": 500000,
+    "samples": 45824,
+    "seconds": 0.10917,
+    "signal_seconds": 0.091648,
+    "realtime_ratio": 0.839,
+    "decoded_packets": 1
+  },
+  {
+    "file": "mode-13.cf32.gz",
+    "sf": 9,
+    "sample_rate": 300000,
+    "samples": 59597,
+    "seconds": 0.132221,
+    "signal_seconds": 0.198657,
+    "realtime_ratio": 1.502,
+    "decoded_packets": 1
+  }
+]

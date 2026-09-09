@@ -1,0 +1,5 @@
+Session review summary
+The user supplied a plan to summarize the session without tools, along with host telemetry and known fixes.
+The assistant checked session memory and warned that the available session history contained only the review request, not a full earlier conversation.
+The user then requested nonempty artifacts at the listed paths.
+These filenames originate from telemetry values and code identifiers, not original summary deliverables. This file records the session review, not a measured result or executable implementation.

@@ -12,7 +12,7 @@ metadata:
 
 # PWN::SDR::Decoder::LTE
 
-LTE (E-UTRA) true-air PSS/SSS cell search. I/Q resampled to 1.92 Msps (128-FFT grid), time-domain PSS correlation against Zadoff-Chu roots {25,29,34} → N_ID_2 ∈ {0,1,2} + half-frame timing + coarse CFO. SSS m-sequence pair 5 symbols earlier → N_ID_1 ∈ 0..167 → PCI = 3·N_ID_1 + N_ID_2. All FFTs via PWN::FFI::FFTW; falls back to naive DFT for small N.
+LTE PSS observations (.detect) and optional native PBCH MIB (.decode). PBCH: acquired or caller-aligned SF0, 1.92Msps, FDD, normal CP, 2 ports. No SIB/traffic decoding or live-RF validation.
 
 ## When to use
 
@@ -37,6 +37,7 @@ PWN::SDR::Decoder::LTE.sss_indices(opts)
 - `mseq`
 - `cseq`
 - `decode`
+- `detect`
 - `parse_line`
 - `authors`
 - `help`

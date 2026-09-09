@@ -12,7 +12,7 @@ metadata:
 
 # PWN::SDR::Decoder::APT
 
-Pure-Ruby NOAA APT (Automatic Picture Transmission) decoder for the 137 MHz polar-orbiting weather satellites (NOAA-15/18/19). APT is a 2400 Hz AM subcarrier inside a ~34 kHz-wide FM downlink carrying two 909-pixel image channels at 2 lines/second (4160 words/line). This module envelope-demodulates the 2400 Hz carrier from GQRX's 48 kHz UDP audio, resamples to 4160 words/sec, aligns each line on the 7-pulse Sync-A pattern, and appends the resulting 8-bit greyscale rows to a Netpbm PGM (P5) file — all in Ruby. No `sox`, no `noaa-apt`.
+Pure-Ruby NOAA APT (Automatic Picture Transmission) decoder for the 137 MHz polar-orbiting weather satellites (NOAA-15/18/19). APT is a 2400 Hz AM subcarrier inside a ~34 kHz-wide FM downlink carrying two 909-pixel image channels at 2 lines/second (2080 words/line). This module envelope-demodulates the 2400 Hz carrier from audio, resamples to 4160 words/sec with continuous phase, and aligns the initial line on a Sync-A correlation candidate. Fixed-rate rows update a bounded rolling P5 PGM; there is no drift tracking or satellite identification. Line contrast is normalized independently. No `sox`, no `noaa-apt`.
 
 ## When to use
 
@@ -28,11 +28,12 @@ Class methods take `(opts = {})` and read `opts`.
 
 ```ruby
 PWN::SDR::Decoder::APT.help
-PWN::SDR::Decoder::APT.decode(opts)
+PWN::SDR::Decoder::APT.detect(opts)
 ```
 
 ## Public methods
 
+- `detect`
 - `decode`
 - `authors`
 - `help`
@@ -43,5 +44,5 @@ PWN::SDR::Decoder::APT.decode(opts)
 
 ## Verification
 
-`PWN::SDR::Decoder::APT.respond_to?(:decode)` after the
+`PWN::SDR::Decoder::APT.respond_to?(:detect)` after the
 module is loaded. Read the source for parameter names.

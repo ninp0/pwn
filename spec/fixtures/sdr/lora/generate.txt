@@ -1,0 +1,31 @@
+import sys, time, json, pathlib, hashlib
+import gnuradio
+# Fixture generation only; not a PWN runtime dependency.
+gnuradio.__path__.append('/tmp/pwn-lora-install/lib/python3.13/site-packages/gnuradio')
+from gnuradio import gr, blocks, lora_sdr
+import pmt
+out = pathlib.Path('/opt/pwn/spec/fixtures/sdr/lora')
+out.mkdir(parents=True, exist_ok=True)
+vectors=[]
+for sf,cr,text in [(7,4,'Hello LoRa'),(7,1,'123456789'),(8,3,'Independent PHY'),(8,2,'CR4/6 vector')]:
+    tb=gr.top_block()
+    tx=lora_sdr.lora_sdr_lora_tx(sf=sf,cr=cr,bw=125000,samp_rate=125000,has_crc=True,impl_head=False,frame_zero_padd=128)
+    iq=blocks.vector_sink_c()
+    syms=blocks.vector_sink_i()
+    tb.connect(tx,iq)
+    # Access hierarchical transmitter output of Gray demapper for encoded symbols.
+    tb.connect(tx.lora_sdr_gray_demap_0,syms)
+    tb.start()
+    tx.lora_sdr_whitening_0.to_basic_block()._post(pmt.intern('msg'),pmt.intern(text))
+    end=time.monotonic()+5
+    while time.monotonic()<end and not iq.data(): time.sleep(.02)
+    time.sleep(.1)
+    tb.stop(); tb.wait()
+    import numpy as np
+    raw=np.asarray(iq.data(),dtype='<c8').tobytes()
+    assert raw and syms.data()
+    name=f'sf{sf}-cr{cr}.cf32'
+    (out/name).write_bytes(raw)
+    vectors.append(dict(sf=sf,cr=cr,bw=125000,sample_rate=125000,payload_hex=text.encode().hex(),symbols=list(syms.data()),file=name,sha256=hashlib.sha256(raw).hexdigest()))
+(out/'vectors.json').write_text(json.dumps(vectors,indent=2)+'\n')
+print(json.dumps(vectors,indent=2))

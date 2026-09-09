@@ -25,40 +25,90 @@ module PWN
           3 => 'Alphanumeric (D)'
         }.freeze
 
-        # Streaming POCSAG demodulator fed by Base.run_native.
-        class Demod
-          def initialize(rate: 48_000)
-            @rate  = rate
-            @buf   = []
-            @baud  = nil
-            @inv   = false
-            @carry_bits = []
+        # Incremental framing retains partial codewords and messages across
+        # transport chunks and batch sync words. A terminator emits immediately.
+        class BitStream
+          def initialize(baud:)
+            @baud = baud
+            @bits = []
+            @word_index = nil
+            @pending = nil
           end
 
-          def feed(samples, &)
-            @buf.concat(samples)
-            max = (@rate * 3.5).to_i
-            @buf.shift(@buf.length - max) if @buf.length > max
-            return if @buf.length < @rate # need ≥1 s to lock
+          def feed(bits, &emit)
+            @bits.concat(bits)
+            loop do
+              if @word_index.nil? || @word_index == 16
+                idx = DSP.find_sync(bits: @bits, pattern: FSC, width: 32, max_err: 2)
+                unless idx
+                  @bits.shift([@bits.length - 31, 0].max)
+                  break
+                end
+                @bits.shift(idx + 32)
+                @word_index = 0
+              end
+              break if @bits.length < 32
 
-            try_lock unless @baud
-            return unless @baud
+              cw = DSP.bits_to_int(bits: @bits.shift(32))
+              cw = POCSAG.correct_word(word: cw)
+              unless cw
+                @pending = nil
+                @word_index += 1
+                next
+              end
+              if cw == IDLE_CW
+                emit_pending(&emit)
+              elsif cw.nobits?(0x80000000)
+                emit_pending(&emit)
+                @pending = { ric: (((cw >> 13) & 0x3FFFF) << 3) | (@word_index / 2),
+                             func: (cw >> 11) & 3, msg_words: [] }
+              elsif @pending
+                @pending[:msg_words] << ((cw >> 11) & 0xFFFFF)
+              end
+              @word_index += 1
+            end
+          end
 
-            bits = PWN::SDR::Decoder::DSP.nrz_slice(samples: @buf, rate: @rate, baud: @baud, invert: @inv)
-            @buf.clear
-            bits = @carry_bits + bits
-            @carry_bits = POCSAG.decode_bits(bits: bits, baud: @baud, &)
+          def flush(&)
+            @pending = nil unless @bits.empty?
+            return unless @pending
+
+            emit_pending(&)
           end
 
           private
 
-          # Try each baud × polarity until FSC (≤2 bit errors) is found.
-          def try_lock
-            hit = BAUDS.product([false, true]).find do |bd, inv|
-              bits = PWN::SDR::Decoder::DSP.nrz_slice(samples: @buf, rate: @rate, baud: bd, invert: inv)
-              PWN::SDR::Decoder::DSP.find_sync(bits: bits, pattern: FSC, width: 32, max_err: 2)
+          def emit_pending
+            return unless @pending
+
+            yield POCSAG.assemble(pending: @pending, baud: @baud)
+            @pending = nil
+          end
+        end
+
+        # Stateful filters and clocks for each candidate baud; inverted bits
+        # have independent framing history, not concatenated polarity trials.
+        class Demod
+          def initialize(rate: 48_000)
+            @streams = BAUDS.map do |baud|
+              [Bluetooth::SymbolStream.new(rate: rate, baud: baud),
+               BitStream.new(baud: baud), BitStream.new(baud: baud)]
             end
-            @baud, @inv = hit if hit
+          end
+
+          def feed(samples, &emit)
+            @streams.each do |slicer, normal, inverted|
+              bits = slicer.feed(samples)
+              normal.feed(bits, &emit)
+              inverted.feed(bits.map { |b| b ^ 1 }, &emit)
+            end
+          end
+
+          def flush(&emit)
+            @streams.each do |_, normal, inverted|
+              normal.flush(&emit)
+              inverted.flush(&emit)
+            end
           end
         end
 
@@ -66,6 +116,48 @@ module PWN
         # carry = PWN::SDR::Decoder::POCSAG.decode_bits(bits: [...], baud: 1200) { |msg| ... }
         # Returns the trailing (unconsumed) bits so the caller can prepend
         # them to the next chunk for streaming continuity.
+
+        # Extended BCH syndrome includes the overall even parity bit.
+        private_class_method def self.word_syndrome(opts = {})
+          word = opts[:word]
+          remainder = word >> 1
+          30.downto(10) { |i| remainder ^= 0x769 << (i - 10) if remainder[i] == 1 }
+          (remainder << 1) | (word.digits(2).sum & 1)
+        end
+
+        CORRECTION_MASKS = begin
+          masks = { 0 => 0 }
+          32.times do |i|
+            masks[word_syndrome(word: 1 << i)] = 1 << i
+            ((i + 1)...32).each do |j|
+              mask = (1 << i) | (1 << j)
+              masks[word_syndrome(word: mask)] = mask
+            end
+          end
+          masks.freeze
+        end
+
+        # Correct up to two errors across BCH(31,21) and its parity bit.
+        # Beyond the correction radius, rejection is not guaranteed (as with
+        # any bounded-distance decoder); three-bit errors are detectable.
+        public_class_method def self.correct_word(opts = {})
+          word = opts[:word]
+          return nil unless word.is_a?(Integer) && word.between?(0, 0xFFFFFFFF)
+
+          mask = CORRECTION_MASKS[word_syndrome(word: word)]
+          mask ? word ^ mask : nil
+        end
+
+        # Validate BCH(31,21) plus even parity without changing the word.
+        public_class_method def self.valid_word?(opts = {})
+          word = opts[:word]
+          return false unless word.is_a?(Integer) && word.between?(0, 0xFFFFFFFF)
+          return false unless word.digits(2).sum.even?
+
+          remainder = word >> 1
+          30.downto(10) { |i| remainder ^= 0x769 << (i - 10) if remainder[i] == 1 }
+          remainder.zero?
+        end
 
         public_class_method def self.decode_bits(opts = {})
           bits = opts[:bits] || []
@@ -88,7 +180,16 @@ module PWN
 
                 cw = PWN::SDR::Decoder::DSP.bits_to_int(bits: bits[i, 32])
                 i += 32
-                next if [IDLE_CW, FSC].include?(cw)
+                cw = correct_word(word: cw)
+                unless cw
+                  pending = nil
+                  next
+                end
+                if cw == IDLE_CW
+                  flush.call
+                  next
+                end
+                next if cw == FSC
 
                 if cw.nobits?(0x80000000)
                   flush.call
@@ -102,6 +203,7 @@ module PWN
               end
             end
           end
+          pending = nil if i < bits.length
           flush.call
           tail_from = [bits.length - 576, 0].max
           bits[tail_from..] || []
@@ -185,6 +287,20 @@ module PWN
         #   freq_obj: 'required - freq_obj returned from PWN::SDR::GQRX.init_freq'
         # )
 
+        # Realtime options forwarded to Base: on_frame (Hash callback), output
+        # (writable IO), interactive (default true), duration (seconds), stop
+        # (callable), queue_size (bounded chunks), log_file (path or false).
+        # Energy detection only; does not identify or decode POCSAG payloads.
+        # Supported Method Parameters::
+        # POCSAG.detect(freq_obj: Hash, threshold: 8.0, on_frame: Proc)
+        public_class_method def self.detect(opts = {})
+          Base.run_detector(opts.merge(
+                              protocol: 'POCSAG',
+                              note: 'Energy detection only; no protocol payload decoding.',
+                              describe: proc { |_burst| { event: 'detection', capability: 'energy-detection', decoded: false } }
+                            ))
+        end
+
         public_class_method def self.decode(opts = {})
           freq_obj = opts[:freq_obj]
           # Prefer true-air I/Q (FM-demod → existing audio demod) when the
@@ -193,20 +309,23 @@ module PWN
           want_iq = opts[:source] || opts[:file] || freq_obj[:iq_source] || freq_obj[:iq_file]
           if want_iq
             PWN::SDR::Decoder::Base.run_iq(
+              **opts,
+              fallback: :raise,
               freq_obj: freq_obj,
               protocol: 'POCSAG',
-              demod: Demod.new,
+              demod: Demod.new(rate: (opts[:sample_rate] || freq_obj[:iq_rate] || 240_000).to_i),
               sample_rate: (opts[:sample_rate] || freq_obj[:iq_rate] || 240_000).to_i,
               source: opts[:source],
               file: opts[:file],
               fm_demod: true,
-              note: 'POCSAG true-air: FM-demod I/Q then native bit recovery; falls back to detector without SDR hardware.'
+              note: 'POCSAG true-air: FM-demod I/Q then native bit recovery; missing I/Q raises (use .detect for energy only).'
             )
           else
             PWN::SDR::Decoder::Base.run_native(
+              **opts,
               freq_obj: freq_obj,
               protocol: 'POCSAG',
-              demod: Demod.new
+              demod: Demod.new(rate: (opts[:rate] || 48_000).to_i)
             )
           end
         end
@@ -221,6 +340,13 @@ module PWN
 
         public_class_method def self.help
           puts "USAGE:
+            # Correct up to two BCH/parity errors; nil if no codeword is within two flips.
+            #{self}.correct_word(word: 'required - unsigned 32-bit POCSAG codeword including parity')
+            # Detect energy only (not protocol payloads); accepts Base runner controls.
+            #{self}.detect(freq_obj: {}, threshold: 8.0, on_frame: nil)
+            # Verify BCH and parity without correcting errors.
+            #{self}.valid_word?(word: 'required - unsigned 32-bit POCSAG codeword including parity')
+
             # Run decode bits and return its result
             #{self}.decode_bits(
               bits: 'optional - bits value consumed by #decode_bits (defaults to [])',
@@ -246,6 +372,13 @@ module PWN
             # Run decode and return its result
             #{self}.decode(
               freq_obj: 'required - freq_obj returned from PWN::SDR::GQRX.init_freq',
+              on_frame: 'optional - callback receiving each emitted Hash',
+              output: 'optional - writable IO (default stdout)',
+              interactive: 'optional - false disables ENTER input',
+              duration: 'optional - finite seconds to run',
+              stop: 'optional - callable returning true to stop',
+              queue_size: 'optional - bounded pending chunks (default 8)',
+              log_file: 'optional - JSONL path or false to disable logging',
               source: 'optional - source value consumed by #decode',
               file: 'optional - filesystem path',
               sample_rate: 'optional - sample rate value consumed by #decode'

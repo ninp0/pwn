@@ -50,6 +50,14 @@ module PWN
             flush_word(&)
           end
 
+          def flush(&)
+            classify_run(&) if @state == :on
+            @state = :off
+            @run = 0
+            flush_char
+            flush_word(&)
+          end
+
           private
 
           def classify_run(&)
@@ -95,6 +103,20 @@ module PWN
         #   freq_obj: 'required - freq_obj returned from PWN::SDR::GQRX.init_freq'
         # )
 
+        # Realtime options forwarded to Base: on_frame (Hash callback), output
+        # (writable IO), interactive (default true), duration (seconds), stop
+        # (callable), queue_size (bounded chunks), log_file (path or false).
+        # Energy detection only; does not identify or decode Morse payloads.
+        # Supported Method Parameters::
+        # Morse.detect(freq_obj: Hash, threshold: 8.0, on_frame: Proc)
+        public_class_method def self.detect(opts = {})
+          Base.run_detector(opts.merge(
+                              protocol: 'MORSE',
+                              note: 'Energy detection only; no protocol payload decoding.',
+                              describe: proc { |_burst| { event: 'detection', capability: 'energy-detection', decoded: false } }
+                            ))
+        end
+
         public_class_method def self.decode(opts = {})
           freq_obj = opts[:freq_obj]
           # Prefer true-air I/Q (FM-demod → existing audio demod) when the
@@ -103,20 +125,23 @@ module PWN
           want_iq = opts[:source] || opts[:file] || freq_obj[:iq_source] || freq_obj[:iq_file]
           if want_iq
             PWN::SDR::Decoder::Base.run_iq(
+              **opts,
+              fallback: :raise,
               freq_obj: freq_obj,
               protocol: 'MORSE-CW',
-              demod: Demod.new,
+              demod: Demod.new(rate: (opts[:sample_rate] || freq_obj[:iq_rate] || 48_000).to_i),
               sample_rate: (opts[:sample_rate] || freq_obj[:iq_rate] || 48_000).to_i,
               source: opts[:source],
               file: opts[:file],
               fm_demod: true,
-              note: 'MORSE-CW true-air: FM-demod I/Q then native bit recovery; falls back to detector without SDR hardware.'
+              note: 'MORSE-CW true-air: FM-demod I/Q then native bit recovery; missing I/Q raises (use .detect for energy only).'
             )
           else
             PWN::SDR::Decoder::Base.run_native(
+              **opts,
               freq_obj: freq_obj,
               protocol: 'MORSE-CW',
-              demod: Demod.new
+              demod: Demod.new(rate: (opts[:rate] || 48_000).to_i)
             )
           end
         end
@@ -140,9 +165,18 @@ module PWN
 
         public_class_method def self.help
           puts "USAGE:
+            # Detect energy only (not protocol payloads); accepts Base runner controls.
+            #{self}.detect(freq_obj: {}, threshold: 8.0, on_frame: nil)
             # Run decode and return its result
             #{self}.decode(
               freq_obj: 'required - freq_obj returned from PWN::SDR::GQRX.init_freq',
+              on_frame: 'optional - callback receiving each emitted Hash',
+              output: 'optional - writable IO (default stdout)',
+              interactive: 'optional - false disables ENTER input',
+              duration: 'optional - finite seconds to run',
+              stop: 'optional - callable returning true to stop',
+              queue_size: 'optional - bounded pending chunks (default 8)',
+              log_file: 'optional - JSONL path or false to disable logging',
               source: 'optional - source value consumed by #decode',
               file: 'optional - filesystem path',
               sample_rate: 'optional - sample rate value consumed by #decode'

@@ -12,7 +12,7 @@ metadata:
 
 # PWN::SDR::Decoder::RDS
 
-RDS Decoder Module for FM Radio Signals. Two entry points: .sample — non-interactive structured Hash (agents / cron / tools) .decode — interactive TTY spinner (human REPL via GQRX.init_freq) Both share the same GQRX RDS protocol path (U RDS, p RDS_PI / PS_NAME / RADIOTEXT). .sample is the canonical mid-layer API that Extrospection and any other automation should call.
+RDS Decoder Module for FM Radio Signals. Two entry points: .sample — non-interactive structured Hash (agents / cron / tools) .decode — realtime JSONL/callback stream with optional ENTER stop Both share the same GQRX RDS protocol path (U RDS, p RDS_PI / PS_NAME / RADIOTEXT). .sample is the canonical mid-layer API that Extrospection and any other automation should call.
 
 ## When to use
 
@@ -34,6 +34,7 @@ PWN::SDR::Decoder::RDS.sample(opts)
 ## Public methods
 
 - `sample`
+- `detect`
 - `decode`
 - `authors`
 - `help`

@@ -1,0 +1,33 @@
+{
+  "provenance": "CTTC Spain real GPS L1 C/A capture, 2013-04-04; GNSS-SDR 0.0.21 monitor; see README.md",
+  "source_sha256": "57a926c42063dbd143bdb6b5e6ddc4dbe4bceb984a1e1d1fba89a30e7c09a541",
+  "source_prefix_bytes": 625853440,
+  "monitor": {
+    "system": "G",
+    "signal": "1C",
+    "prn": 20,
+    "tow_ms": 368628000,
+    "nav_message": "100010110000101100011000000100011101111111111100101100001000111111111101000000010101011110101000110110100000001110111000000000000000111100100101010011110101011100111010000010111100000111100000110000110100100011110110000100010111001111111110111111111010000011010100011010000110111111100110010010111100"
+  },
+  "expected": {
+    "protocol": "GPS",
+    "event": "lnav-subframe",
+    "capability": "iq-lnav-decode",
+    "decoded": true,
+    "checksum_verified": true,
+    "integrity": {
+      "algorithm": "LNAV-word-parity",
+      "valid": true,
+      "words_verified": 10
+    },
+    "subframe_id": 3,
+    "tow_next_seconds": 368628,
+    "alert": false,
+    "anti_spoof": true,
+    "payload_hex": "8b0b1877ff2cffd015a3680e000f25d5ce821e0c34d845cfffa0d41bf992",
+    "payload_bits": 240,
+    "summary": "GPS LNAV subframe 3 parity verified TOW(next)=368628s",
+    "prn": 20,
+    "backend": "gnss-sdr"
+  }
+}

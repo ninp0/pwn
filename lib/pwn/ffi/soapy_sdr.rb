@@ -241,7 +241,11 @@ module PWN
         raise "ERROR: setupStream failed: #{SoapySDRDevice_lastError()}" if stream.nil? || stream.null?
 
         rc = SoapySDRDevice_activateStream(dev, stream, 0, 0, 0)
-        raise "ERROR: activateStream rc=#{rc}: #{SoapySDRDevice_lastError()}" if rc.nonzero?
+        if rc.nonzero?
+          error = "ERROR: activateStream rc=#{rc}: #{SoapySDRDevice_lastError()}"
+          SoapySDRDevice_closeStream(dev, stream)
+          raise error
+        end
 
         mtu   = SoapySDRDevice_getStreamMTU(dev, stream)
         elems = (opts[:samples] || (mtu.positive? ? mtu : 65_536)).to_i
@@ -263,7 +267,10 @@ module PWN
       #   handle:     'required - from .start_rx',
       #   timeout_us: 'optional - microseconds (default 1_000_000)'
       # )
-      # Returns String of interleaved cs16le I/Q (4 bytes/sample), or nil.
+      # Returns all samples read as cs16le I/Q, or nil on timeout/no samples.
+      # Other native errors raise. Overflow increments handle[:overruns]; the
+      # hardware lost-sample count is unknown. Callers must not bridge the gap.
+      # Serialize read/stop/close for this stream (driver thread safety varies).
 
       public_class_method def self.read_sync(opts = {})
         h = opts[:handle]
@@ -273,7 +280,14 @@ module PWN
         n = SoapySDRDevice_readStream(
           h[:device], h[:stream], h[:buffs], h[:elems], h[:flags_p], h[:time_p], to
         )
-        return nil if n <= 0
+        return nil if n.zero? || n == -1 # SOAPY_SDR_TIMEOUT
+
+        if n == -4 # SOAPY_SDR_OVERFLOW; lost sample count is unknown
+          h[:overruns] = h.fetch(:overruns, 0) + 1
+          raise 'ERROR: SoapySDR RX overrun rc=-4: IQ continuity lost'
+        end
+        raise "ERROR: SoapySDR readStream rc=#{n}" if n.negative?
+        raise "ERROR: SoapySDR invalid read length #{n}" if n > h[:elems]
 
         h[:buf].read_bytes(n * 4)
       end
@@ -285,11 +299,13 @@ module PWN
         h = opts[:handle]
         return unless h.is_a?(Hash) && h[:stream]
 
-        SoapySDRDevice_deactivateStream(h[:device], h[:stream], 0, 0)
-        SoapySDRDevice_closeStream(h[:device], h[:stream])
+        deactivate_rc = SoapySDRDevice_deactivateStream(h[:device], h[:stream], 0, 0)
+        close_rc = SoapySDRDevice_closeStream(h[:device], h[:stream])
+        raise "ERROR: closeStream rc=#{close_rc}" unless close_rc.zero?
+
         h[:stream] = nil
-        nil
-      rescue StandardError
+        raise "ERROR: deactivateStream rc=#{deactivate_rc}" unless deactivate_rc.zero?
+
         nil
       end
 

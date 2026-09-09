@@ -678,6 +678,16 @@ describe PWN::AI::Agent::Loop do # rubocop:disable Metrics/BlockLength
       expect(src).not_to match(/pwn_extinguished\[sig\] = true/)
     end
 
+    it 'does not Dispatch.call an identical payload once the checkpoint fires' do
+      src = File.read(described_class.method(:run).source_location.first)
+      chunk = src[/if Thread\.current\[:pwn_extinguished\].*?tools_called \+= 1/m]
+      expect(chunk).to include('same_n = note_same_payload!')
+      expect(chunk.index('note_same_payload!')).to be < chunk.index('Dispatch.call')
+      expect(chunk).to match(/same_n >= 3/)
+      raw = described_class.send(:checkpoint_result, name: 'shell', args: '{"command":"echo same"}')
+      expect(JSON.parse(raw)).to include('success' => false, 'checkpoint' => true)
+    end
+
     it 'records a timeout increment mistake instead of treating success:true as ok' do
       tmp = Dir.mktmpdir
       stub_const('PWN::AI::Agent::Mistakes::MISTAKES_FILE', File.join(tmp, 'mistakes.json'))
@@ -1800,6 +1810,38 @@ describe PWN::AI::Agent::Loop do # rubocop:disable Metrics/BlockLength
         on_tool: ->(name, args, _res) { seen << [name, args] }
       )
       expect(seen).to eq([['task', 'task 1/3: scan']])
+    end
+  end
+
+  describe 'red-team reviewer vs parent completion' do
+    it 'does not treat a text_only red-team honesty gap as unmet on a session summary' do
+      req = 'summarize the conversation of this session.'
+      recap = 'This session only recapped itself. You asked what we had been discussing, then asked for a summary.'
+      Thread.current[:pwn_loop_active] = true
+      Thread.current[:pwn_loop_deliverables] = {
+        paths: [], min_seconds: 0, skills: [], proofs: [], hosts: [], techniques: [], issue_work: false
+      }
+      Thread.current[:pwn_swarm_honesty] = [{ name: 'pwn_red_team', gap: 'child_filed_nothing' }]
+      Thread.current[:pwn_swarm_id] = nil
+      msgs = [
+        { role: 'user', content: req },
+        { role: 'assistant', content: recap }
+      ]
+      expect(described_class.send(:completion_unmet, request: req, messages: msgs)).not_to include(
+        'child_filed_nothing:pwn_red_team'
+      )
+      expect(described_class.send(:incomplete_final?, text: recap, last_iter: false)).to eq(false)
+      expect(described_class.send(:may_finalize?, request: req, messages: msgs, text: recap)).to eq(true)
+    ensure
+      Thread.current[:pwn_loop_active] = nil
+      Thread.current[:pwn_loop_deliverables] = nil
+      Thread.current[:pwn_swarm_honesty] = nil
+      Thread.current[:pwn_swarm_id] = nil
+    end
+
+    it 'keeps explicit empty enabled_toolsets on nested Loop.run' do
+      src = File.read(described_class.method(:run).source_location.first)
+      expect(src).to match(/key\?\(:enabled_toolsets\) && Array\(opts\[:enabled_toolsets\]\)\.empty\?/)
     end
   end
 end

@@ -12,7 +12,7 @@ metadata:
 
 # PWN::SDR::Decoder::WiFi
 
-True-air + detector-fallback decoder for WiFi. Prefers PWN::FFI I/Q (RTL-SDR / ADALM-Pluto / HackRF / capture file) via Base.run_iq; degrades to Base.run_detector with no hardware.
+Protocol frames via .decode; energy observations only via .detect.
 
 ## When to use
 
@@ -28,15 +28,22 @@ Class methods take `(opts = {})` and read `opts`.
 
 ```ruby
 PWN::SDR::Decoder::WiFi.help
-PWN::SDR::Decoder::WiFi.decode(opts)
+PWN::SDR::Decoder::WiFi.parse_frame(opts)
 ```
 
 ## Public methods
 
+- `parse_frame`
 - `decode`
+- `detect`
+- `plcp_crc`
 - `parse_line`
 - `authors`
 - `help`
+
+## References
+
+- `references/urls.md` — URLs from source
 
 ## Source
 
@@ -44,5 +51,5 @@ PWN::SDR::Decoder::WiFi.decode(opts)
 
 ## Verification
 
-`PWN::SDR::Decoder::WiFi.respond_to?(:decode)` after the
+`PWN::SDR::Decoder::WiFi.respond_to?(:parse_frame)` after the
 module is loaded. Read the source for parameter names.

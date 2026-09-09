@@ -28,18 +28,22 @@ Class methods take `(opts = {})` and read `opts`.
 
 ```ruby
 PWN::SDR::Decoder::POCSAG.help
-PWN::SDR::Decoder::POCSAG.decode_bits(opts)
+PWN::SDR::Decoder::POCSAG.correct_word(opts)
 ```
 
 ## Public methods
 
+- `correct_word`
+- `valid_word`
 - `decode_bits`
 - `assemble`
 - `numeric_decode`
 - `alpha_decode`
+- `detect`
 - `decode`
 - `authors`
 - `help`
+- `valid_word?`
 
 ## Source
 
@@ -47,5 +51,5 @@ PWN::SDR::Decoder::POCSAG.decode_bits(opts)
 
 ## Verification
 
-`PWN::SDR::Decoder::POCSAG.respond_to?(:decode_bits)` after the
+`PWN::SDR::Decoder::POCSAG.respond_to?(:correct_word)` after the
 module is loaded. Read the source for parameter names.

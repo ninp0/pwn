@@ -28,11 +28,12 @@ Class methods take `(opts = {})` and read `opts`.
 
 ```ruby
 PWN::SDR::Decoder::Pager.help
-PWN::SDR::Decoder::Pager.decode(opts)
+PWN::SDR::Decoder::Pager.detect(opts)
 ```
 
 ## Public methods
 
+- `detect`
 - `decode`
 - `authors`
 - `help`
@@ -43,5 +44,5 @@ PWN::SDR::Decoder::Pager.decode(opts)
 
 ## Verification
 
-`PWN::SDR::Decoder::Pager.respond_to?(:decode)` after the
+`PWN::SDR::Decoder::Pager.respond_to?(:detect)` after the
 module is loaded. Read the source for parameter names.

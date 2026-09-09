@@ -253,7 +253,7 @@ module PWNConventions
 
   def purpose_above?(help, name)
     lines = help.to_s.lines
-    idx = lines.find_index { |l| l.match?(/\#\{self\}\.#{Regexp.escape(name)}(?!\w)/) }
+    idx = lines.find_index { |l| l.match?(/\#\{self\}(?:::[A-Z]\w*)*\.#{Regexp.escape(name)}(?!\w)/) }
     return false unless idx
 
     prev = nil

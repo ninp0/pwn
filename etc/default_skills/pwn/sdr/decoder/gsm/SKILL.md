@@ -12,7 +12,7 @@ metadata:
 
 # PWN::SDR::Decoder::GSM
 
-GSM (2G) true-air FCCH/SCH decoder. 270.833 kbit/s GMSK. FCCH burst = 148 all-zero bits → a pure +67.708 kHz tone for ~547 μs. Detect via variance-dip on the FM discriminator (PWN::FFI::Liquid.freq_demod), estimate carrier offset from mean deviation, then correlate the SCH 64-bit extended training sequence 8 timeslots later and recover the 6-bit BSIC (NCC/BCC) + 19-bit reduced frame number (T1/T2/T3'). Emits {event:'fcch'|'sch', freq_offset_hz:, bsic:, ncc:, bcc:, rfn:}.
+GSM SCH IQ/channel-bit decoding (.decode) and FCCH observations (.detect). Channelized GMSK IQ is synchronized and differentially demodulated before convolutional/CRC10 verification and BSIC/frame-number extraction. Multipath equalization, BCCH/CCCH and traffic decoding are unsupported.
 
 ## When to use
 
@@ -34,8 +34,10 @@ PWN::SDR::Decoder::GSM.viterbi_decode(opts)
 ## Public methods
 
 - `viterbi_decode`
+- `decode_sch`
 - `parity`
 - `decode`
+- `detect`
 - `parse_line`
 - `authors`
 - `help`

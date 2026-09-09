@@ -139,6 +139,23 @@ describe PWN::Setup do
     end
   end
 
+  it 'core dependency plans never install a Python runtime or package manager' do
+    { apt: :kali, dnf: :fedora, pacman: :arch, brew: :macos, port: :macos, pkg_add: :openbsd }.each do |manager, distro|
+      allow(PWN::Setup).to receive(:pkg_manager).and_return(key: manager, install: 'install-package')
+      result = PWN::Setup.deps(profile: :core, dry_run: true, io: StringIO.new, distro: distro, version: 'test')
+      commands = Array(result[:ran]).map { |entry| entry[:cmd] }.join("\n")
+      expect(commands).not_to match(/python|\bpip(?:[23x])?\b/i), "#{manager} core plan: #{commands}"
+    end
+  end
+
+  it 'requests pipx only for profiles selecting Python third-party tools' do
+    allow(PWN::Setup).to receive(:pkg_manager).and_return(key: :apt, install: 'apt-get install -y')
+    core = PWN::Setup.deps(profile: :core, dry_run: true, io: StringIO.new, distro: :kali, version: '2026.3')
+    full = PWN::Setup.deps(profile: :full, dry_run: true, io: StringIO.new, distro: :kali, version: '2026.3')
+    expect(Array(core[:ran]).map { |entry| entry[:cmd] }).not_to include('apt-get install -y pipx')
+    expect(Array(full[:ran]).map { |entry| entry[:cmd] }).to include('apt-get install -y pipx', 'pipx install kube-hunter')
+  end
+
   it 'packages_for prefers distro overrides then package-manager family' do
     expect(
       PWN::Setup.packages_for(bin: 'nmap', distro: :ubuntu, version: '24.04', pm_key: :apt)
