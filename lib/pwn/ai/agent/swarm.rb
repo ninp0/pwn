@@ -58,6 +58,7 @@ module PWN
         #     role: 'required - system_role_content overlay for this persona',
         #     toolsets: 'optional - Array of Registry toolset names',
         #     engine: 'optional - :openai / :anthropic / :grok / :gemini / :ollama / :openwebui',
+        #     model: 'optional - exact model identifier (defaults to selected provider model)',
         #     max_iters: 'optional - per-turn iteration cap for this persona'
         #   )
 
@@ -372,34 +373,27 @@ module PWN
           PROMPT
         end
 
-        # Temporarily override PWN::Env[:ai][:active] and
-        # PWN::Env[:ai][:agent][:max_iters] for the duration of a sub-agent
-        # turn, restoring both afterwards even on raise.
+        # Scope provider selection to this turn, preserving enclosing overrides.
+        # An omitted engine inherits the parent; an omitted model uses the
+        # selected provider's default rather than the parent persona's model.
         private_class_method def self.with_persona_env(opts = {})
           persona = opts[:persona]
-          ai = env_ai
-          return yield unless ai
+          prev_engine = Thread.current[:pwn_swarm_engine]
+          prev_model = Thread.current[:pwn_swarm_model]
 
-          agent_h = (ai[:agent] ||= {})
-          prev_active = ai[:active]
-          prev_iters  = agent_h[:max_iters]
-
-          ai[:active] = persona[:engine].to_s if persona[:engine]
           Thread.current[:pwn_swarm_engine] = persona[:engine].to_s if persona[:engine]
-          agent_h[:max_iters] = persona[:max_iters] if persona[:max_iters]
+          Thread.current[:pwn_swarm_model] = persona[:model]
           yield
         ensure
-          Thread.current[:pwn_swarm_engine] = nil
-          if ai
-            ai[:active]         = prev_active
-            agent_h[:max_iters] = prev_iters
-          end
+          Thread.current[:pwn_swarm_engine] = prev_engine
+          Thread.current[:pwn_swarm_model] = prev_model
         end
 
         private_class_method def self.normalize_persona(opts = {})
           p = opts[:persona] || {}
           {
             role: p[:role].to_s,
+            model: (p[:model] if p[:model].is_a?(String) && !p[:model].strip.empty?),
             engine: (p[:engine].to_s.empty? ? nil : p[:engine].to_s.downcase.to_sym),
             toolsets: begin
               raw_ts = p[:toolsets]
@@ -415,15 +409,6 @@ module PWN
           v.to_i.positive? ? v.to_i : DEFAULT_DEPTH
         rescue StandardError
           DEFAULT_DEPTH
-        end
-
-        private_class_method def self.env_ai
-          return nil unless defined?(PWN::Env) && PWN::Env.is_a?(Hash)
-
-          ai = PWN::Env[:ai]
-          ai.is_a?(Hash) && !ai.frozen? ? ai : nil
-        rescue StandardError
-          nil
         end
 
         private_class_method def self.caller_label
@@ -640,6 +625,7 @@ module PWN
               role: 'required - system_role_content overlay for this persona',
               toolsets: 'optional - Array of Registry toolset names',
               engine: 'optional - :openai / :anthropic / :grok / :gemini / :ollama / :openwebui',
+              model: 'optional - exact model identifier (defaults to selected provider model)',
               max_iters: 'optional - per-turn iteration cap for this persona',
               skills: 'optional - Array of SOP skill names (capped at 3)',
               swarm_id: 'optional - write ephemeral persona under this swarm',

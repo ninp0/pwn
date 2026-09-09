@@ -130,7 +130,7 @@ module PWN
           }
           entry[:score] = score if decision || opts.key?(:score)
           if decision
-            %i[verdict confidence training_score decision_version verification verifier_verdict grounded critic_pass judge_score].each do |key|
+            %i[verdict confidence training_score decision_version verification verifier_verdict grounded critic_pass judge_score quality_score rationale].each do |key|
               entry[key] = decision[key] if decision.key?(key)
             end
             entry[:status] = 'unverified' if decision[:training_score].nil?

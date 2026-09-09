@@ -113,8 +113,9 @@ puts resp[:content]
 
 ## Model diversity in Swarm
 
-Because each persona in [`agents.yml`](Swarm.md) can override `engine:`, an
-`agent_debate` can pit several *different providers* against each other - real
+Because each persona in [`agents.yml`](Swarm.md) can override `engine:` and
+`model:`, an `agent_debate` can compare different models on the same provider
+or several *different providers* against each other - real
 antagonism, not one model role-playing three voices. The same mechanism backs
 `ai.agent.escalation_persona`: when a local model is stuck, `Loop.run` asks a
 frontier persona for a 3-line corrective hint and injects it as a synthetic

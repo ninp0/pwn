@@ -7,11 +7,21 @@ PWN::AI::Agent::Registry.register(
   toolset: 'pwn',
   schema: {
     name: 'finding_record',
-    description: 'Append a finding row (title, severity, host, evidence, poc path) to ~/.pwn/findings.jsonl.',
+    description: 'Record a validated finding with CVSS 3.x, evidence file paths and a required command/code PoC. File existence is not execution proof. Also supports query, chain and export.',
     parameters: {
       type: 'object',
       properties: {
         title: { type: 'string' },
+        cwe: { type: 'string', pattern: '^CWE-[1-9][0-9]*$' },
+        cvss_vector: { type: 'string' },
+        cvss_score: { type: 'number', minimum: 0, maximum: 10 },
+        affected_asset: { type: 'string' },
+        evidence_paths: { type: 'array', minItems: 1, items: { type: 'string' } },
+        attack_chain_refs: { type: 'array', items: { type: 'string' } },
+        remediation: { type: 'string' },
+        confidence: { type: 'number', minimum: 0, maximum: 1 },
+        dir_path: { type: 'string' },
+        report_name: { type: 'string' },
         severity: { type: 'string' },
         host: { type: 'string' },
         evidence: { type: 'string' },
@@ -22,36 +32,30 @@ PWN::AI::Agent::Registry.register(
         parent_id: { type: 'string' },
         engagement_id: { type: 'string' }
       },
-      required: %w[]
+      required: %w[],
+      anyOf: [
+        { properties: { op: { enum: %w[query export] } }, required: %w[op] },
+        { required: %w[title cwe cvss_vector cvss_score affected_asset evidence_paths poc attack_chain_refs remediation confidence] }
+      ]
     }
   },
   handler: lambda { |args|
-    op = (args[:op] || args['op'] || 'record').to_s
+    args = args.transform_keys(&:to_sym)
+    op = (args[:op] || 'record').to_s
     case op
     when 'query'
-      PWN::Plugins::Findings.query(host: args[:host] || args['host'])
+      PWN::Plugins::Findings.query(args)
     when 'chain'
-      PWN::Plugins::Findings.chain(
-        parent_id: args[:parent_id] || args['parent_id'],
-        title: args[:title] || args['title'],
-        severity: args[:severity] || args['severity'],
-        poc_artifacts: args[:poc_artifacts] || args['poc_artifacts'],
-        poc: args[:poc] || args['poc'],
-        session_id: args[:session_id] || args['session_id']
-      )
+      parent = args[:parent_id].to_s
+      raise ArgumentError, 'parent_id is required' if parent.empty?
+
+      PWN::Plugins::Findings.record_structured(args.merge(attack_chain_refs: (Array(args[:attack_chain_refs]) + [parent]).uniq))
     when 'export'
-      PWN::Plugins::Findings.render(report_name: 'findings')
+      PWN::Plugins::Findings.render(args)
+    when 'record'
+      PWN::Plugins::Findings.record_structured(args)
     else
-      PWN::Plugins::Findings.record(
-        title: args[:title] || args['title'],
-        severity: args[:severity] || args['severity'],
-        host: args[:host] || args['host'],
-        evidence: args[:evidence] || args['evidence'],
-        poc: args[:poc] || args['poc'],
-        poc_artifacts: args[:poc_artifacts] || args['poc_artifacts'],
-        session_id: args[:session_id] || args['session_id'],
-        engagement_id: args[:engagement_id] || args['engagement_id']
-      )
+      raise ArgumentError, "unknown finding operation: #{op}"
     end
   }
 )

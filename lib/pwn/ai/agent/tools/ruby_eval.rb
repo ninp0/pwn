@@ -33,6 +33,8 @@ PWN::AI::Agent::Registry.register(
       type: 'object',
       properties: {
         code: { type: 'string', description: 'Ruby source to evaluate.' },
+        encoding: { type: 'string', description: 'Set to base64 when data holds the Ruby source.' },
+        data: { type: 'string', description: 'Base64 Ruby source when encoding is base64.' },
         timeout: {
           type: 'integer',
           description: 'Conservative seconds this eval should take given HOST LOAD. Omit for a host-derived default. Explicit values honored 1..10800 (3 hours). On timeout keep the same payload and timeout += 180; rewrite only after the 3-hour budget (max 10 mutations/task).'
@@ -43,6 +45,7 @@ PWN::AI::Agent::Registry.register(
   },
   max_chars: 32_000,
   handler: lambda { |args|
+    args = PWN::AI::Agent::ToolGuard.unwrap_payload(args: args, key: :code)
     args = PWN::AI::Agent::ToolGuard.coerce_args(args: args, required: %w[code])
     if args[:__schema_error]
       return {
@@ -53,14 +56,7 @@ PWN::AI::Agent::Registry.register(
     end
 
     code = args[:code].to_s
-    if code.strip.empty? || PWN::AI::Agent::ToolGuard.placeholder?(text: code)
-      return PWN::AI::Agent::ToolGuard.invalid_payload(
-        hint: 'code is required (string). Do not send ..., {...}, {…}, or empty. Example: pwn_eval(code="1 + 1"). Triple-dot inside quoted/heredoc bodies is allowed.',
-        offending_token: '...',
-        text: code,
-        suggestion: 'replace ellipsis or placeholders with concrete Ruby'
-      )
-    end
+    return PWN::AI::Agent::ToolGuard.invalid_payload(hint: 'code must be a nonempty string') unless args[:code].is_a?(String) && !code.empty?
 
     old_stdout = $stdout
     buf = StringIO.new

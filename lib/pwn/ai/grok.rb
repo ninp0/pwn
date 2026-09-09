@@ -578,6 +578,8 @@ module PWN
         }
         http_body[:tools]       = opts[:tools]       if opts[:tools] && !opts[:tools].empty?
         http_body[:tool_choice] = opts[:tool_choice] if opts[:tool_choice]
+        effort = opts[:reasoning_effort].to_s
+        http_body[:reasoning_effort] = effort unless effort.empty? || effort == 'none'
 
         response = grok_rest_call(
           http_method: :post,
@@ -592,6 +594,14 @@ module PWN
 
         json_resp = JSON.parse(response, symbolize_names: true)
         json_resp[:assistant_message] = json_resp.dig(:choices, 0, :message)
+        msg = json_resp[:assistant_message]
+        if msg.is_a?(Hash)
+          thinking = msg[:thinking].to_s
+          thinking = msg[:reasoning_content].to_s if thinking.empty?
+          msg = msg.merge(thinking: thinking) unless thinking.strip.empty?
+          json_resp[:assistant_message] = msg
+          json_resp[:choices][0][:message] = msg if json_resp.dig(:choices, 0).is_a?(Hash)
+        end
         json_resp
       rescue StandardError => e
         raise e
@@ -738,7 +748,8 @@ module PWN
             temp: 'optional - temperature (defaults to PWN::Env[:ai][:grok][:temp] || 1)',
             timeout: 'optional - seconds (default 180)',
             spinner: 'optional - display spinner (default false)',
-            quiet: 'optional - quiet value consumed by #chat_with_tools'
+            quiet: 'optional - quiet value consumed by #chat_with_tools',
+            reasoning_effort: 'optional - Grok reasoning effort (default medium; none disables thinking)'
           )
 
           # Run chat and return its result

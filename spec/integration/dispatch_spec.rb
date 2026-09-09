@@ -71,10 +71,10 @@ RSpec.describe 'PWN::AI::Agent::Dispatch — tolerant dispatch', :aggregate_fail
   end
 
   describe '.call — argument parsing' do
-    it 'accepts valid JSON, a raw Hash, and empty args' do
+    it 'accepts valid JSON and raw Hash arguments but enforces required fields' do
       expect(call('spec_echo', '{"payload":"a"}')).to include('success' => true, 'result' => { 'echoed' => 'a' })
       expect(call('spec_echo', { 'payload' => 'b' })).to include('success' => true, 'result' => { 'echoed' => 'b' })
-      expect(call('spec_echo', nil)).to include('success' => true)
+      expect(call('spec_echo', nil)).to include('success' => false, 'error' => 'invalid_payload')
     end
 
     it 'tolerantly parses trailing-comma / single-quoted JSON' do

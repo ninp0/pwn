@@ -10,6 +10,74 @@ module PWN
   module Plugins
     # Used to encrypt/decrypt configuration files leveraging AES256
     module Vault
+      CREDENTIAL_KDF_ITERATIONS = 600_000
+
+      # Returns an authenticated envelope; the caller persists only this value.
+      # keyring is an injected OS-keyring reader responding to call(key_id).
+      public_class_method def self.seal_credentials(opts = {})
+        envelope = { 'version' => 1, 'cipher' => 'aes-256-gcm',
+                     'kdf' => opts[:keyring] ? 'keyring' : 'pbkdf2-sha256',
+                     'key_id' => opts[:key_id] || 'pwn-ai-credentials',
+                     'iterations' => CREDENTIAL_KDF_ITERATIONS,
+                     'salt' => Base64.strict_encode64(OpenSSL::Random.random_bytes(16)) }
+        cipher = OpenSSL::Cipher.new('aes-256-gcm')
+        cipher.encrypt
+        cipher.key = credential_key(opts.merge(envelope: envelope))
+        envelope['iv'] = Base64.strict_encode64(cipher.random_iv)
+        cipher.auth_data = credential_aad(envelope: envelope)
+        plaintext = JSON.generate(opts.fetch(:credentials))
+        envelope['ct'] = Base64.strict_encode64(cipher.update(plaintext) + cipher.final)
+        envelope['tag'] = Base64.strict_encode64(cipher.auth_tag)
+        envelope
+      end
+
+      # Decrypts in memory only. Does not modify or open any credential file.
+      public_class_method def self.open_credentials(opts = {})
+        envelope = opts.fetch(:envelope).transform_keys(&:to_s)
+        raise ArgumentError, 'Unsupported credential envelope' unless envelope['version'] == 1 && envelope['cipher'] == 'aes-256-gcm'
+
+        cipher = OpenSSL::Cipher.new('aes-256-gcm')
+        cipher.decrypt
+        cipher.key = credential_key(opts.merge(envelope: envelope))
+        cipher.iv = Base64.strict_decode64(envelope.fetch('iv'))
+        tag = Base64.strict_decode64(envelope.fetch('tag'))
+        raise ArgumentError, 'Invalid credential authentication tag' unless tag.bytesize == 16
+
+        cipher.auth_tag = tag
+        cipher.auth_data = credential_aad(envelope: envelope)
+        JSON.parse(cipher.update(Base64.strict_decode64(envelope.fetch('ct'))) + cipher.final)
+      rescue OpenSSL::Cipher::CipherError, JSON::ParserError
+        raise ArgumentError, 'Credential authentication failed'
+      end
+
+      private_class_method def self.credential_key(opts = {})
+        envelope = opts.fetch(:envelope)
+        if envelope['kdf'] == 'keyring'
+          reader = opts[:keyring]
+          raise ArgumentError, 'OS keyring reader required' unless reader.respond_to?(:call)
+
+          key = reader.call(envelope.fetch('key_id'))
+          raise ArgumentError, 'OS keyring must return a 32-byte key' unless key.is_a?(String) && key.bytesize == 32
+
+          return key
+        end
+        raise ArgumentError, 'Unsupported credential KDF' unless envelope['kdf'] == 'pbkdf2-sha256'
+
+        passphrase = opts[:passphrase].to_s
+        raise ArgumentError, 'Credential passphrase required' if passphrase.empty?
+        raise ArgumentError, 'Invalid credential KDF iterations' unless envelope['iterations'] == CREDENTIAL_KDF_ITERATIONS
+
+        salt = Base64.strict_decode64(envelope.fetch('salt'))
+        raise ArgumentError, 'Invalid credential salt' unless salt.bytesize == 16
+
+        OpenSSL::PKCS5.pbkdf2_hmac(passphrase, salt, CREDENTIAL_KDF_ITERATIONS, 32, 'sha256')
+      end
+
+      private_class_method def self.credential_aad(opts = {})
+        envelope = opts.fetch(:envelope)
+        JSON.generate(envelope.except('ct', 'tag').sort.to_h)
+      end
+
       # Supported Method Parameters::
       # PWN::Plugins::Vault.refresh_encryption_secrets(
       #   file: 'required - file to encrypt with new key and iv',
@@ -125,27 +193,13 @@ module PWN
           prompt: 'IV'
         )
 
-        yaml = opts[:yaml] ||= true
-
-        decrypt(
-          file: file,
-          key: key,
-          iv: iv
-        )
-
-        if yaml
-          file_dump = YAML.load_file(file, symbolize_names: true)
-        else
-          file_dump = File.read(file)
-        end
-
-        encrypt(
-          file: file,
-          key: key,
-          iv: iv
-        )
-
-        file_dump
+        cipher = OpenSSL::Cipher.new('aes-256-cbc')
+        cipher.decrypt
+        cipher.key = Base64.strict_decode64(key)
+        cipher.iv = Base64.strict_decode64(iv)
+        bytes = Base64.strict_decode64(File.read(file).chomp)
+        plaintext = cipher.update(bytes) + cipher.final
+        opts[:yaml] == false ? plaintext : YAML.safe_load(plaintext, permitted_classes: [Symbol], aliases: true, symbolize_names: true)
       rescue ArgumentError
         raise 'ERROR: Incorrect Key or IV.'
       rescue StandardError => e
@@ -351,6 +405,19 @@ module PWN
 
       public_class_method def self.help
         puts "USAGE:
+          # Seal credentials in an authenticated AES256GCM envelope, without filesystem access.
+          #{self}.seal_credentials(
+            credentials: 'required - JSON-compatible credentials hash',
+            passphrase: 'optional - required unless keyring is supplied',
+            keyring: 'optional - callable OS keyring reader returning a raw 32-byte key',
+            key_id: 'optional - keyring identifier, default pwn-ai-credentials'
+          )
+          # Open an authenticated envelope in memory; never writes plaintext.
+          #{self}.open_credentials(
+            envelope: 'required - sealed credentials hash',
+            passphrase: 'optional - required for passphrase envelopes',
+            keyring: 'optional - callable OS keyring reader for keyring envelopes'
+          )
           # Run refresh encryption secrets and return its result
           #{self}.refresh_encryption_secrets(
             file: 'required - file to encrypt with new key and iv',

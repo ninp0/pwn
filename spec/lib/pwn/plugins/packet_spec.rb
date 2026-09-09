@@ -3,6 +3,14 @@
 require 'spec_helper'
 
 describe PWN::Plugins::Packet do
+  it 'does not invent capture success when the broker is absent' do
+    require 'pwn/plugins/capability_broker'
+    allow(PWN::Plugins::CapabilityBroker).to receive(:request).and_return(ok: false, error: 'absent')
+    result = described_class.capture(path: '/nonexistent/capture.pcap')
+    expect(result[:ok]).to eq(false)
+    expect(result[:degraded]).to eq(true)
+    expect(result).not_to have_key(:path)
+  end
   it 'should display information for authors' do
     authors_response = PWN::Plugins::Packet
     expect(authors_response).to respond_to :authors

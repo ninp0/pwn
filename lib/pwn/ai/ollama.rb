@@ -533,6 +533,7 @@ module PWN
           http_body[:format] = fmt unless fmt.nil? || fmt.to_s.empty?
         end
         http_body[:tool_choice] = opts[:tool_choice] if opts[:tool_choice]
+        http_body[:think] = true unless opts[:think] == false
 
         response = ollama_rest_call(
           http_method: :post,
@@ -686,7 +687,8 @@ module PWN
             model: 'optional - overrides PWN::Env[:ai][:ollama][:model]',
             temp: 'optional - temperature (defaults to PWN::Env[:ai][:ollama][:temp] || 1)',
             timeout: 'optional - seconds (default 900)',
-            spinner: 'optional - display spinner (default false)'
+            spinner: 'optional - display spinner (default false)',
+            think: 'optional - true enables Ollama think (default true; false disables)'
           )
 
           # Run chat and return its result

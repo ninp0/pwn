@@ -18,6 +18,8 @@ Dir[File.join(__dir__, 'support', '**', '*.rb')].each { |f| require f }
 #    - `it '...', :stdout do ... end`               → per-example opt-out
 # ─────────────────────────────────────────────────────────────────────────────
 RSpec.configure do |config|
+  config.filter_run_excluding :local_embeddings unless ENV['PWN_TEST_EMBED_ENDPOINT'] && ENV['PWN_SQLITE_VEC_EXTENSION']
+
   next if ENV['PWN_SPEC_VERBOSE']
 
   original_stdout = $stdout

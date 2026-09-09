@@ -1,0 +1,10 @@
+# Only methods named here are registered by the YAML loader.
+- name: host_os_type
+  description: Detect the local host operating system family (read only).
+  plugin: PWN::Plugins::DetectOS
+  method: type
+  risk_level: info
+  params:
+    type: object
+    properties: {}
+    additionalProperties: false

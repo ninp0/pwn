@@ -27,11 +27,11 @@ describe 'PWN::AI::Agent::Tools shell' do
     expect(r[:stdout].to_s).to include('hello')
   end
 
-  it 'joins mid-command backslash-newline continuations into a space' do
+  it 'leaves backslash-newline interpretation to the shell without inserting bytes' do
     r = handler.call(command: "echo hello\\\nworld")
     expect(r[:error]).to be_nil
     expect(r[:exit]).to eq(0)
-    expect(r[:stdout].to_s.gsub(/\s+/, ' ').strip).to eq('hello world')
+    expect(r[:stdout].to_s.gsub(/\s+/, ' ').strip).to eq('helloworld')
   end
 
   it 'still runs printf with embedded escapes in single quotes' do

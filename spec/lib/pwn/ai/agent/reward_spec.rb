@@ -4,6 +4,55 @@ require 'spec_helper'
 require 'tmpdir'
 
 describe PWN::AI::Agent::Reward do
+  describe 'labeled transcript calibration' do
+    include_context 'pwn tmp sandbox'
+
+    it 'does not promote a lone successful check without full-request coverage' do
+      result = described_class.resolve_outcome(outcome: {
+                                                 score: 0.36, source: :heuristic, rationale: 'missing service validation',
+                                                 verification: { checks: [{ criterion: 'file exists', passed: true, evidence: '/tmp/answer.json' }] }
+                                               })
+      expect(result[:success]).not_to be true
+      expect(result[:score]).to eq(0.36)
+      expect(result[:training_score]).to be_nil
+    end
+
+    it 'does not floor heuristic scores from a prose PASS label' do
+      allow(described_class).to receive(:llm_judge).and_return(nil)
+      allow(described_class).to receive(:verify_as_reward).and_return(nil)
+      allow(described_class).to receive(:evidence_prior).and_return(score: 0.2, confidence: 0.6)
+      result = described_class.judge(request: 'Write report and validate every section', final: 'PASS',
+                                     trace: ['{"success":true,"result":{"exit":0}}'], commit: false)
+      expect(result[:score]).to be < 0.6
+      expect(result[:training_score]).to be_nil
+    end
+
+    it 'preserves quality and rationale while an executed full request PASS determines success' do
+      request = 'Write the answer and validate its JSON'
+      sid = PWN::Sessions.create(title: request)[:id]
+      PWN::Sessions.append(session_id: sid, role: 'user', content: request)
+      File.write(File.join(@tmp, 'answer.json'), '{"answer":42}')
+      contract = {
+        root: @tmp, requirements: ['Write the answer', 'validate its JSON'],
+        checks: [
+          { requirement: 'Write the answer', kind: :file, path: 'answer.json', expected: '{"answer":42}' },
+          { requirement: 'validate its JSON', kind: :json, path: 'answer.json', expected: { answer: 42 } }
+        ]
+      }
+      allow(described_class).to receive(:llm_judge).and_return(score: 0.36, source: :heuristic, rationale: 'terse answer; weak lexical overlap')
+      allow(described_class).to receive(:verify_as_reward).and_return(nil)
+      PWN::Env[:ai][:reward] = { verifier_precedence: false }
+      result = described_class.judge(request: request, session_id: sid, final: 'Written.', trace: ['{"success":true}'],
+                                     verification_contract: contract, persist_components: true, critic_pass: false)
+      expect(result).to include(success: true, quality_score: 0.36, judge_score: 0.36, rationale: 'terse answer; weak lexical overlap')
+      expect(result[:score]).to be >= 0.6
+      row = PWN::AI::Agent::Learning.outcomes.first
+      expect(row).to include(success: true, quality_score: 0.36, rationale: 'terse answer; weak lexical overlap')
+    end
+  end
+end
+
+describe PWN::AI::Agent::Reward do
   describe 'executed request verification' do
     include_context 'pwn tmp sandbox'
 
@@ -623,7 +672,7 @@ describe 'PWN::AI::Agent::Reward vs TUI plan' do
     expect(v[:judge_score]).to be < 0.6
   end
 
-  it 'tags tool-backed heuristics so they are not haircut' do
+  it 'tags tool-backed heuristics without treating PASS prose as verification' do
     allow(PWN::AI::Agent::Reward).to receive(:llm_judge).and_return(nil)
     v = PWN::AI::Agent::Reward.judge(
       request: 'write /tmp/x and verify',
@@ -632,6 +681,24 @@ describe 'PWN::AI::Agent::Reward vs TUI plan' do
       commit: false
     )
     expect(v[:heuristic_class].to_s).to eq('toolbacked')
-    expect(v[:score]).to be >= 0.6
+    expect(v[:score]).to be < 0.6
+    expect(v[:training_score]).to be_nil
+  end
+
+  it 'floors success when a verification block has PASS plus evidence, without using unbound verifier_verdict' do
+    allow(PWN::AI::Agent::Reward).to receive(:llm_judge).and_return(
+      { score: 0.4, source: 'heuristic', verdict: :partial, rationale: 'overlap=0.2', confidence: 0.4 }
+    )
+    v = PWN::AI::Agent::Reward.judge(
+      request: 'write /tmp/x and verify',
+      final: 'wrote /tmp/x',
+      trace: ['{"success":true,"result":{"exit":0}}'],
+      commit: false,
+      verification: { verdict: :pass, evidence: 'stat /tmp/x size=120 sha256=aaaaaaaaaaaaaaaaaaaaaaaa' }
+    )
+    expect(v[:score_quality].to_f).to be < 0.6
+    expect(v[:score].to_f).to be >= 0.6
+    expect(v[:success]).to eq(true)
+    expect(v[:rationale].to_s).to include('verification_floor')
   end
 end

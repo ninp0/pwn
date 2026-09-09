@@ -25,7 +25,7 @@ module PWN
         # Token-level junk the model keeps emitting instead of a real command.
         PLACEHOLDER_RX = /
           \A\s*(?:\.{3}|…|\{\s*\.{3}\s*\}|\{\s*…\s*\}|<\.{3}>)\s*\z
-          |(?:^|[\s;|&])(?:\.{3}|…|\{\s*\.{3}\s*\}|\{\s*…\s*\})(?:$|[\s;|&])
+          |\{\s*(?:\.{3}|…)\s*\}
         /x
 
         # Conservative bash-only constructs. POSIX `$(())` is allowed.
@@ -37,6 +37,21 @@ module PWN
           |<\([^)]
           |&>
         /x
+
+        public_class_method def self.unwrap_payload(opts = {})
+          args = opts[:args]
+          return args unless args.is_a?(Hash)
+
+          enc = (args[:encoding] || args['encoding']).to_s
+          data = args[:data] || args['data']
+          return args unless enc == 'base64' && !data.to_s.empty?
+
+          raw = Base64.strict_decode64(data.to_s)
+          key = (opts[:key] || :command).to_sym
+          args.merge(key => raw)
+        rescue ArgumentError
+          opts[:args]
+        end
 
         public_class_method def self.present?(opts = {})
           value = opts.is_a?(Hash) ? opts[:value] : opts
@@ -55,7 +70,11 @@ module PWN
         end
 
         public_class_method def self.bashism?(opts = {})
-          BASHISM_RX.match?(shell_syntax_surface(text: opts[:text]))
+          surface = shell_syntax_surface(text: opts[:text])
+          return false if surface.to_s.empty?
+
+          surface = surface.gsub(/\$\{?RANDOM\}?\b/, '') if surface.match?(/\bRANDOM=/)
+          BASHISM_RX.match?(surface)
         rescue StandardError
           false
         end
@@ -592,6 +611,12 @@ module PWN
 
         public_class_method def self.help
           puts "USAGE:
+            # Decode {encoding:base64,data:} onto command or code.
+            #{self}.unwrap_payload(
+              args: 'required - Hash that may contain encoding and data',
+              key: 'optional - destination key (defaults to command)'
+            )
+
             # Run present and return its result
             #{self}.present?(
               value: 'required - integer or string to pack/encode'

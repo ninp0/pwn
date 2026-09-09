@@ -196,6 +196,41 @@ RSpec.describe PWN::AI::OpenAI do
     described_class.chat(request: 'Hi')
   end
 
+  it 'lists Codex models with the required client_version query parameter' do
+    expect(RestClient::Request).to receive(:execute) do |request|
+      expect(request[:method]).to eq(:get)
+      expect(request[:url]).to eq('https://chatgpt.com/backend-api/codex/models')
+      expect(request[:headers][:params]).to include(client_version: '1.0.0')
+      expect(request[:headers][:authorization]).to eq('Bearer fake-oauth-token')
+      { data: [{ id: 'gpt-5.5' }] }.to_json
+    end
+    models = described_class.get_models
+    expect(models[:data].first[:id]).to eq('gpt-5.5')
+  end
+
+  it 'maps a Codex slug catalog onto data[].id for /model list llms' do
+    expect(RestClient::Request).to receive(:execute) do |request|
+      expect(request[:method]).to eq(:get)
+      expect(request[:url]).to eq('https://chatgpt.com/backend-api/codex/models')
+      { models: [{ slug: 'gpt-6-astra', display_name: 'GPT-6-Astra' }] }.to_json
+    end
+    models = described_class.get_models
+    expect(models[:data].first[:id]).to eq('gpt-6-astra')
+  end
+
+  it 'lists Platform models without a Codex client_version query' do
+    engine[:oauth] = {}
+    expect(RestClient::Request).to receive(:execute) do |request|
+      expect(request[:method]).to eq(:get)
+      expect(request[:url]).to eq('https://api.openai.com/v1/models')
+      params = request.dig(:headers, :params)
+      expect(params).to be_nil.or(satisfy { |row| row.nil? || row[:client_version].to_s.empty? })
+      { data: [{ id: 'gpt-4o' }] }.to_json
+    end
+    models = described_class.get_models
+    expect(models[:data].first[:id]).to eq('gpt-4o')
+  end
+
   it 'leaves API-key text chat on Chat Completions with its original parameters' do
     engine[:oauth] = {}
     expect(RestClient::Request).to receive(:execute) do |request|

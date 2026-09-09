@@ -5,6 +5,13 @@ require 'open3'
 require 'net/http'
 require 'uri'
 require 'timeout'
+require 'socket'
+require 'openssl'
+require 'digest'
+require 'fileutils'
+require 'securerandom'
+require 'time'
+require 'rexml/document'
 
 module PWN
   module Plugins
@@ -14,6 +21,159 @@ module PWN
 
       public_class_method def self.required_bins
         %w[subfinder httpx masscan amass]
+      end
+
+      # Persisted asset IDs are the join key for Context ingestion and Findings.
+      public_class_method def self.run(opts = {})
+        target = opts[:target].to_s
+        raise ArgumentError, 'target must be a single hostname or IP' unless target.match?(/\A[a-zA-Z0-9][a-zA-Z0-9.:-]*\z/)
+
+        engagement = opts.fetch(:engagement_id, 'default').to_s
+        raise ArgumentError, 'engagement_id must be a simple identifier' unless engagement.match?(/\A[a-zA-Z0-9_-]+\z/)
+
+        modules = opts.fetch(:modules, %w[nmap banner]).map(&:to_s)
+        raise ArgumentError, 'modules must contain nmap, banner, tls, subfinder or nuclei' if modules.empty? || (modules - %w[nmap banner tls subfinder nuclei]).any?
+
+        ports = Array(opts.fetch(:ports, [80, 443]))
+        raise ArgumentError, 'ports must be integers in 1..65535' unless !ports.empty? && ports.all? { |port| port.is_a?(Integer) && port.between?(1, 65_535) }
+
+        timeout = Float(opts.fetch(:timeout, 15))
+        raise ArgumentError, 'timeout must be in 0..300 seconds' unless timeout.positive? && timeout <= 300
+
+        dir = File.join(File.expand_path(opts[:root] || '~/.pwn/engagements'), engagement, 'recon')
+        FileUtils.mkdir_p(dir)
+        assets = []
+        results = modules.uniq.map do |name|
+          probe_errors = []
+          evidence = File.join(dir, "#{SecureRandom.hex(8)}-#{name}.#{name == 'nmap' ? 'xml' : 'json'}")
+          observations = if name == 'nmap'
+                           xml = pipeline_command(argv: ['nmap', '-n', '-Pn', '-sT', '-p', ports.uniq.join(','), '-oX', '-', target], timeout: timeout)
+                           File.write(evidence, xml)
+                           doc = REXML::Document.new(xml)
+                           REXML::XPath.match(doc, '//host').flat_map do |host|
+                             address = host.elements['address']&.attributes&.[]('addr') || target
+                             REXML::XPath.match(host, 'ports/port').filter_map do |port|
+                               next unless port.elements['state']&.attributes&.[]('state') == 'open'
+
+                               { address: address, port: port.attributes['portid'].to_i, protocol: port.attributes['protocol'],
+                                 source: name, state: 'open', service: port.elements['service']&.attributes&.[]('name') }
+                             end
+                           end
+                         elsif %w[subfinder nuclei].include?(name)
+                           argv = name == 'subfinder' ? ['subfinder', '-silent', '-d', target] : ['nuclei', '-silent', '-jsonl', '-duc', '-u', target]
+                           output = pipeline_command(argv: argv, timeout: timeout)
+                           rows = output.lines.reject { |line| line.strip.empty? }.map do |line|
+                             if name == 'subfinder'
+                               { address: line.strip.downcase, protocol: 'host', port: nil, source: name }
+                             else
+                               row = JSON.parse(line)
+                               host = URI(row['host'].to_s)
+                               { address: host.host || target, protocol: 'tcp', port: host.port,
+                                 source: name, template_id: row['template-id'], matched_at: row['matched-at'],
+                                 scanner_severity: row.dig('info', 'severity'), classification: 'scanner_observation' }
+                             end
+                           end.uniq
+                           File.write(evidence, JSON.pretty_generate(rows))
+                           rows
+                         else
+                           rows = ports.filter_map do |port|
+                             Socket.tcp(target, port, connect_timeout: timeout) do |socket|
+                               data = if name == 'tls'
+                                        context = OpenSSL::SSL::SSLContext.new
+                                        context.verify_mode = OpenSSL::SSL::VERIFY_NONE
+                                        ssl = OpenSSL::SSL::SSLSocket.new(socket, context)
+                                        ssl.hostname = target
+                                        begin
+                                          Timeout.timeout(timeout) { ssl.connect }
+                                          cert = ssl.peer_cert
+                                          { subject: cert.subject.to_s, issuer: cert.issuer.to_s,
+                                            not_before: cert.not_before.utc.iso8601, not_after: cert.not_after.utc.iso8601,
+                                            certificate_sha256: Digest::SHA256.hexdigest(cert.to_der),
+                                            san: cert.extensions.find { |ext| ext.oid == 'subjectAltName' }&.value,
+                                            tls_version: ssl.ssl_version, trust_verified: false }
+                                        ensure
+                                          ssl.close
+                                        end
+                                      else
+                                        banner = Timeout.timeout(timeout) { socket.readpartial(4096) }
+                                        { banner: banner.encode('UTF-8', invalid: :replace, undef: :replace) }
+                                      end
+                               { address: socket.remote_address.ip_address, port: port, protocol: 'tcp', source: name }.merge(data)
+                             end
+                           rescue StandardError => e
+                             probe_errors << { port: port, error: "#{e.class}: #{e.message}" }
+                             nil
+                           end
+                           File.write(evidence, JSON.pretty_generate(rows))
+                           rows
+                         end
+          observations.each do |row|
+            id = "asset-#{Digest::SHA256.hexdigest([row[:address].downcase, row[:protocol], row[:port]].join('|'))[0, 24]}"
+            assets << { id: id, address: row[:address], protocol: row[:protocol], port: row[:port],
+                        observations: [row], evidence_paths: [evidence] }
+          end
+          status = if probe_errors.empty?
+                     'ok'
+                   else
+                     (observations.empty? ? 'error' : 'partial')
+                   end
+          { name: name, status: status, evidence_path: evidence, errors: probe_errors }
+        rescue Errno::ENOENT => e
+          { name: name, status: 'unavailable', error: e.message }
+        rescue StandardError => e
+          { name: name, status: 'error', error: "#{e.class}: #{e.message}" }
+        end
+        path = File.join(dir, 'assets.json')
+        File.open("#{path}.lock", 'a') do |lock|
+          lock.flock(File::LOCK_EX)
+          previous = File.file?(path) ? JSON.parse(File.read(path), symbolize_names: true).fetch(:assets) : []
+          merged = (previous + assets).group_by { |row| row[:id] }.map do |_id, rows|
+            rows.last.merge(observations: rows.flat_map { |row| row[:observations] }.uniq,
+                            evidence_paths: rows.flat_map { |row| row[:evidence_paths] }.uniq)
+          end
+          merged.sort_by! { |row| row[:id] }
+          payload = { schema_version: 1, engagement_id: engagement, assets: merged, modules: results }
+          temp = "#{path}.#{SecureRandom.hex(8)}.tmp"
+          File.write(temp, JSON.pretty_generate(payload))
+          File.rename(temp, path)
+        end
+        result = JSON.parse(File.read(path), symbolize_names: true).merge(path: path)
+        if opts[:ingest]
+          begin
+            ingestor = opts[:ingestor] || PWN::AI::Context.method(:ingest)
+            result[:ingestion] = ingestor.call(path, session_id: engagement, **opts[:ingest_options] || {})
+          rescue StandardError => e
+            result[:ingestion] = { status: 'error', error: "#{e.class}: #{e.message}" }
+          end
+        end
+        result
+      end
+
+      private_class_method def self.pipeline_command(opts = {})
+        Open3.popen3(*opts[:argv], pgroup: true) do |stdin, stdout, stderr, wait|
+          stdin.close
+          output = Thread.new { stdout.read }
+          errors = Thread.new { stderr.read }
+          begin
+            Timeout.timeout(opts[:timeout]) do
+              status = wait.value
+              raise "command failed (#{status.exitstatus}): #{errors.value}" unless status.success?
+
+              output.value
+            end
+          rescue Timeout::Error
+            begin
+              Process.kill('KILL', -wait.pid)
+            rescue StandardError
+              nil
+            end
+            wait.value
+            raise
+          ensure
+            output.join
+            errors.join
+          end
+        end
       end
 
       public_class_method def self.subdomains(opts = {})
@@ -107,6 +267,19 @@ module PWN
         puts "USAGE:
           # List host binaries this module expects to be installed.
           #{self}.required_bins
+
+          # Normalize explicit scan modules and persist stable evidence-backed asset IDs.
+          #{self}.run(
+            target: 'required - single hostname or IP',
+            modules: 'optional - Array nmap/banner/tls/subfinder/nuclei; defaults nmap/banner',
+            ports: 'optional - Array of integer ports; defaults 80 and 443',
+            engagement_id: 'optional - simple identifier; defaults default',
+            root: 'optional - engagements directory; defaults ~/.pwn/engagements',
+            timeout: 'optional - per-operation timeout seconds; defaults 15, maximum 300',
+            ingest: 'optional - invoke Context.ingest after persistence; defaults false',
+            ingestor: 'optional - callable(path, **options) replacing Context.ingest',
+            ingest_options: 'optional - Hash passed to the ingestor'
+          )
 
           # Run subdomains and return its result
           #{self}.subdomains(

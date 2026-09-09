@@ -47,6 +47,10 @@ PWN::Plugins::Radare2.required_bins(opts)
 - `sections`
 - `binary_info`
 - `decompile`
+- `analyze_all`
+- `list_functions`
+- `disasm_function`
+- `xrefs`
 - `authors`
 - `help`
 

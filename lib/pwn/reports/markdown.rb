@@ -24,6 +24,12 @@ module PWN
             lines << ''
           end
         end
+        unless payload[:attack_chains].empty?
+          lines += ['## Attack chains', '']
+          payload[:attack_chains].each do |chain|
+            lines << "- #{chain[:finding_ids].join(' -> ')}: **#{chain[:combined_severity]}**. #{chain[:rationale]}"
+          end
+        end
         File.write(out, "#{lines.join("\n").rstrip}\n")
         out
       end

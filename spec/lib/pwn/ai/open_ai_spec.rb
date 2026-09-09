@@ -180,6 +180,18 @@ describe PWN::AI::OpenAI do
     expect(msg[:_native_content]).to eq(raw[:output])
   end
 
+  it 'attaches Responses reasoning summaries as thinking for the task TUI' do
+    raw = {
+      output_text: 'done',
+      output: [
+        { type: 'reasoning', summary: [{ type: 'summary_text', text: 'Check the service banner first.' }] },
+        { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'done' }] }
+      ]
+    }
+    out = described_class.send(:parse_responses, raw: raw)
+    expect(out[:assistant_message][:thinking]).to include('Check the service banner first.')
+  end
+
   describe 'completed OAuth response normalization' do
     def response_event(type, fields = {})
       "data: #{fields.merge(type: type).to_json}\n\n"

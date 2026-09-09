@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require 'logger'
+require_relative '../redaction'
 
 module PWN
   module Plugins
@@ -33,7 +34,7 @@ module PWN
 
         logger.formatter = proc do |severity, _datetime, _progname, msg|
           # TODO: Include datetime & progname vars
-          "[#{severity}] #{msg}\n"
+          "[#{severity}] #{PWN::Redaction.redact(value: PWN::Redaction.redact(value: msg).to_s)}\n"
         end
 
         logger

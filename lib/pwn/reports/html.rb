@@ -10,6 +10,13 @@ module PWN
         rows = payload[:findings].map do |row|
           "<tr><td>#{h(text: row['id'])}</td><td>#{h(text: row['title'])}</td><td>#{h(text: row['severity'])}</td><td>#{h(text: row['cvss'])}</td><td>#{h(text: row['description'])}</td><td>#{h(text: row['poc'])}</td><td>#{h(text: row['recommendation'])}</td></tr>"
         end
+        details = payload[:findings].map do |row|
+          fields = row.map { |key, value| "<dt>#{h(text: key)}</dt><dd>#{h(text: value)}</dd>" }.join
+          "<section><h2>#{h(text: row['title'])}</h2><dl>#{fields}</dl></section>"
+        end.join
+        chains = payload[:attack_chains].map do |chain|
+          "<li>#{h(text: chain[:finding_ids].join(' -> '))}: #{h(text: chain[:combined_severity])}. #{h(text: chain[:rationale])}</li>"
+        end.join
         body = <<~HTML
           <!DOCTYPE html>
           <html lang="en">
@@ -28,6 +35,8 @@ module PWN
                 #{rows.join("\n")}
               </tbody>
             </table>
+            #{details}
+            <h2>Attack chains</h2><ul>#{chains}</ul>
           </body>
           </html>
         HTML

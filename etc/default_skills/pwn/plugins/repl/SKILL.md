@@ -45,6 +45,10 @@ PWN::Plugins::REPL.ready_tty(opts)
 - `pwn_ai_complete_ruby`
 - `install_pwn_ai_completer`
 - `restore_pwn_ai_completer`
+- `leave_special_mode`
+- `pwn_ai_activation_session`
+- `pwn_ai_profile_command`
+- `pwn_ai_memory_command`
 - `pwn_ai_dispatch_slash`
 - `pwn_ai_engines`
 - `pwn_ai_provider_class`
@@ -63,6 +67,7 @@ PWN::Plugins::REPL.ready_tty(opts)
 - `authors`
 - `help`
 - `install_pwn_ai_completer!`
+- `leave_special_mode!`
 - `pwn_ai_dispatch_slash!`
 - `ready_tty!`
 - `restore_pwn_ai_completer!`

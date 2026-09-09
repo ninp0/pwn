@@ -245,6 +245,10 @@ module PWN
         apt: %w[radare2], dnf: %w[radare2], pacman: %w[radare2], brew: %w[radare2], port: %w[radare2],
         plugins: %w[PWN::Plugins::Radare2]
       },
+      'objdump' => {
+        apt: %w[binutils], dnf: %w[binutils], pacman: %w[binutils], brew: %w[binutils], port: %w[binutils],
+        plugins: %w[PWN::Plugins::ROP PWN::Plugins::BinaryAnalysis]
+      },
       'checksec' => {
         apt: %w[], dnf: %w[], pacman: %w[checksec], brew: %w[], port: %w[],
         pip: 'checksec.py',

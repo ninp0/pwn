@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require 'json'
+require 'digest'
 
 module PWN
   module AI
@@ -177,24 +178,86 @@ module PWN
           MUTEX.synchronize { THREADS.count(&:alive?) }
         end
 
+        # Literal destinations only; source paths are never delivery obligations.
+        public_class_method def self.output_paths(opts = {})
+          request = opts[:request].to_s
+          paths = []
+          intent = nil
+          previous_end = 0
+          request.to_enum(:scan, %r{["'`]((?:~/|/|\./|\.\./)[^"'`\n]+|[^"'`\n]+\.[A-Za-z0-9]+)["'`]|(?<![\w:/])((?:~/|/|\./|\.\./)[\w.+/-]+|[\w+-]+\.[A-Za-z0-9]+)}).each do
+            match = Regexp.last_match
+            literal = match[1] || match[2].sub(/[.,;:]+\z/, '')
+            prefix = request[previous_end...match.begin(0)]
+            previous_end = match.end(0)
+            intent = prefix.scan(/\b(write|save|store|output|export|create|update|modify|edit|generate|put|produce|deliver|read|inspect|review|analy[sz]e|summari[sz]e|from|using)\b/i).flatten.last&.downcase || intent
+            next unless %w[write save store output export create update modify edit generate put produce deliver].include?(intent)
+
+            paths << File.expand_path(literal, opts[:cwd] || Dir.pwd)
+          end
+          paths.uniq
+        end
+
+        # Host-only snapshot; never parse an artifact claim from tool stdout.
+        public_class_method def self.artifact_snapshot(opts = {})
+          Array(opts[:paths]).to_h do |literal|
+            path = File.expand_path(literal.to_s)
+            [path, artifact_readback(path: path)]
+          end
+        end
+
+        # Invoke immediately after a successful tool dispatch. The host reads
+        # stat plus bounded head/tail itself, before exposing the result.
+        public_class_method def self.observe_artifacts(opts = {})
+          return {} unless opts[:success] == true && opts[:effect].to_s == 'write'
+
+          before = opts[:before] || {}
+          artifact_snapshot(paths: opts[:paths]).select do |path, row|
+            row && before.key?(path) && before[path] != row
+          end
+        end
+
+        private_class_method def self.artifact_readback(opts = {})
+          File.open(opts[:path], File::RDONLY | File::NONBLOCK) do |file|
+            stat = file.stat
+            return nil unless stat.file? && stat.size.positive?
+
+            head = file.read(4096).to_s
+            file.seek([stat.size - 4096, 0].max)
+            tail = file.read(4096).to_s
+            file.rewind
+            digest = Digest::SHA256.new
+            while (chunk = file.read(65_536))
+              digest.update(chunk)
+            end
+            current = file.stat
+            return nil unless [current.ino, current.size, current.mtime, current.ctime] == [stat.ino, stat.size, stat.mtime, stat.ctime]
+
+            { stat: { size: stat.size, ino: stat.ino, dev: stat.dev, mtime: stat.mtime.to_r.to_s, ctime: stat.ctime.to_r.to_s },
+              head: head, tail: tail, sha256: digest.hexdigest }
+          end
+        rescue StandardError
+          nil
+        end
+
         public_class_method def self.arbitrate(opts = {})
           request = opts[:request].to_s
           messages = Array(opts[:messages])
           t0 = opts[:session_t0] || Thread.current[:pwn_loop_t0]
-          paths = Array(opts[:paths]).map(&:to_s).select { |p| p.start_with?('/') }
-          paths += request.scan(%r{(/[A-Za-z0-9._/+-]+\.\w+)}).flatten
+          paths = Array(opts[:paths]).map { |path| File.expand_path(path.to_s) }
+          paths += output_paths(request: request)
           paths.uniq!
           ledger = evidence_ledger(messages: messages)
           unmet = []
           paths.each do |path|
             row = ledger[path]
-            if row.nil? || !File.file?(path)
+            unless File.file?(path)
               unmet << { criterion: 'artifact_missing', detail: path }
               next
             end
             unmet << { criterion: 'empty_artifact', detail: path } if File.size(path) <= 0
-            unmet << { criterion: 'readback_missing', detail: path } unless row[:read]
-            unmet << { criterion: 'artifact_mtime_before_session', detail: path } if t0 && File.mtime(path) < t0 && !row[:write]
+            unmet << { criterion: 'write_missing', detail: path } unless row && row[:write]
+            unmet << { criterion: 'readback_missing', detail: path } unless row && row[:read]
+            unmet << { criterion: 'artifact_mtime_before_session', detail: path } if t0 && File.mtime(path) < t0 && !(row && row[:write])
           end
           {
             complete: unmet.empty? && (!paths.empty? || ledger.any?),
@@ -208,20 +271,13 @@ module PWN
           Array(opts[:messages]).each do |msg|
             next unless msg.is_a?(Hash) && msg[:role].to_s == 'tool'
 
-            raw = msg[:content].to_s
-            fx = nil
-            begin
-              parsed = JSON.parse(raw, symbolize_names: true)
-              fx = parsed[:effect].to_s.to_sym if parsed.is_a?(Hash)
-            rescue StandardError
-              fx = nil
-            end
-            raw.scan(%r{(/[A-Za-z0-9._/+-]+)}).flatten.each do |path|
-              next unless path.start_with?('/')
+            next unless msg[:artifact_observations].is_a?(Hash)
 
-              ledger[path] ||= { write: false, read: false }
-              ledger[path][:write] = true if fx == :write
-              ledger[path][:read] = true if fx == :read
+            msg[:artifact_observations].each do |path, observed|
+              current = artifact_readback(path: path)
+              next unless current && current == observed
+
+              ledger[path] = { write: true, read: true, evidence: observed }
             end
           end
           ledger
@@ -279,6 +335,19 @@ module PWN
             # Run pending and return its result
             #{self}.pending
 
+            # Extract explicit output literals, excluding source/read paths.
+            #{self}.output_paths(request: 'required - original user request', cwd: 'optional - relative path base')
+
+            # Snapshot named destinations immediately before a tool runs.
+            #{self}.artifact_snapshot(paths: 'required - destination paths')
+
+            # Host-only post-dispatch write delta and stat/head-tail readback.
+            # Keep this result in internal tool-message artifact_observations.
+            #{self}.observe_artifacts(
+              paths: 'required - destination paths', before: 'required - artifact_snapshot result',
+              effect: 'required - actual Dispatch effect', success: 'required - semantic tool success boolean'
+            )
+
             # Arbitrate a completion claim against the turn evidence ledger.
             #{self}.arbitrate(
               request: 'optional - original operator request',
@@ -287,7 +356,7 @@ module PWN
               session_t0: 'optional - session start Time (mtime-before-session is named, not silent)'
             )
 
-            # Build path → {write,read} ledger from tool messages.
+            # Build path → {write,read} from host-owned artifact_observations only.
             #{self}.evidence_ledger(
               messages: 'optional - Array of role/content hashes'
             )

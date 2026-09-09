@@ -4,6 +4,7 @@ require 'fileutils'
 require 'json'
 require 'logger'
 require 'securerandom'
+require_relative '../redaction'
 
 module PWN
   module Plugins
@@ -114,7 +115,7 @@ module PWN
               exit_gracefully = true unless driver_name == 'pwn'
             end
           else
-            log_event += " => #{msg}"
+            log_event += " => #{PWN::Redaction.redact(value: msg)}"
             if msg.respond_to?('backtrace') && !msg.instance_of?(Errno::ECONNRESET)
               log_event += " => \n\t#{msg.backtrace.join("\n\t")}"
               log_event += "\n\n\n"
@@ -122,7 +123,8 @@ module PWN
           end
         end
 
-        logger.add(logger.level, log_event, which_self)
+        logger.add(logger.level, PWN::Redaction.redact(value: log_event), PWN::Redaction.redact(value: which_self))
+        logger.close
       rescue Interrupt
         note_interrupt!(where: 'CTRL+C', which_self: self) if debug_enabled?
         puts "\n#{self}.#{__method__} => Goodbye."
@@ -329,6 +331,8 @@ module PWN
         return unless debug_enabled?
         return if Thread.current[:pwn_log_stderr]
 
+        return if @stderr_redaction_overflow
+
         text = opts[:text].to_s
         return if text.empty?
         return if spinner_frame?(text: text)
@@ -338,7 +342,19 @@ module PWN
           io = @debug_file
           return if io.nil? || (io.respond_to?(:closed?) && io.closed?)
 
-          clean = sanitize_debug_text(text: text.gsub(/\e\[[0-9;]*m/, ''))
+          @stderr_redaction_buffer = @stderr_redaction_buffer.to_s + text.gsub(/\e\[[0-9;]*m/, '')
+          buffer = @stderr_redaction_buffer
+          if buffer.bytesize > 65_536
+            clean = PWN::Redaction.token(kind: 'stream', value: buffer)
+            @stderr_redaction_overflow = true
+          else
+            # A write may split a JWT/header; PEM bodies may span many writes.
+            return unless buffer.end_with?("\n")
+            return if buffer.match?(/-----BEGIN [A-Z ]*PRIVATE KEY-----/) && !buffer.match?(/-----END [A-Z ]*PRIVATE KEY-----/)
+
+            clean = sanitize_debug_text(text: buffer)
+          end
+          @stderr_redaction_buffer = ''
           return if clean.strip.empty?
           return if spinner_frame?(text: clean)
 
@@ -405,11 +421,16 @@ module PWN
         return if opts[:skip]
 
         begin
-          @debug_file&.close unless @debug_file.nil? || @debug_file.closed?
+          unless @debug_file.nil? || @debug_file.closed?
+            @debug_file.puts(PWN::Redaction.token(kind: 'stream', value: @stderr_redaction_buffer)) unless @stderr_redaction_buffer.to_s.empty?
+            @debug_file.close
+          end
         rescue StandardError
           nil
         end
         @debug_file = nil
+        @stderr_redaction_buffer = ''
+        @stderr_redaction_overflow = false
       end
 
       private_class_method def self.open_debug_file!(opts = {})
@@ -493,7 +514,7 @@ module PWN
           begin
             who = which.is_a?(Module) ? (which.name || which.to_s) : which.to_s
             line = "[DEBUG #{local_ts}] #{who} #{msg}".strip
-            @debug_file&.puts(line)
+            @debug_file&.puts(sanitize_debug_text(text: line))
             @debug_file&.flush
             ok = true
           rescue StandardError
@@ -601,18 +622,16 @@ module PWN
       end
 
       private_class_method def self.sanitize_debug_text(opts = {})
-        text = opts[:text].to_s
-        text = text.gsub(SECRET_VALUE_RX, '[REDACTED]')
-        text.gsub(/-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----/m, '[REDACTED]')
+        PWN::Redaction.redact(value: opts[:text].to_s)
       end
 
       private_class_method def self.inspect_debug(opts = {})
         val = opts[:value]
         key = opts[:key]
-        return '[REDACTED]' if secret_key?(key: key)
-        return '[REDACTED]' if opaque_secret?(key: key, value: val)
+        return PWN::Redaction.token(kind: 'credential', value: val.to_s) if secret_key?(key: key)
+        return PWN::Redaction.token(kind: 'opaque', value: val) if opaque_secret?(key: key, value: val)
         return format_debug_hash(hash: val) if val.is_a?(Hash)
-        return '[REDACTED]' if val.is_a?(String) && val.match?(SECRET_VALUE_RX)
+        return sanitize_debug_text(text: val) if val.is_a?(String) && val.match?(SECRET_VALUE_RX)
 
         raw = sanitize_debug_text(text: val.inspect)
         raw = "#{raw[0, DEBUG_VALUE_MAX]}…" if raw.length > DEBUG_VALUE_MAX

@@ -22,4 +22,23 @@ describe PWN::AI::Gemini do
     expect(src).to include('PromptCache.gemini_system_instruction')
     expect(src).to include('enabled?(engine: :gemini)')
   end
+
+  it 'separates Gemini thought parts from visible content' do
+    out = described_class.send(
+      :gemini_resp_to_oa,
+      response: {
+        candidates: [{
+          content: {
+            parts: [
+              { thought: true, text: 'I should call shell.' },
+              { text: 'Calling tools.' },
+              { functionCall: { name: 'shell', args: { command: 'id' } } }
+            ]
+          }
+        }]
+      }
+    )
+    expect(out[:assistant_message][:thinking]).to eq('I should call shell.')
+    expect(out[:assistant_message][:content]).to eq('Calling tools.')
+  end
 end

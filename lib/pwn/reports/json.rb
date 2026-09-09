@@ -14,7 +14,8 @@ module PWN
           ::JSON.pretty_generate(
             'title' => payload[:title],
             'executive_summary' => payload[:executive_summary],
-            'findings' => payload[:findings]
+            'findings' => payload[:findings],
+            'attack_chains' => payload[:attack_chains]
           )
         )
         out

@@ -68,6 +68,34 @@ describe PWN::Migrate do
       end
     end
 
+    it 'upgrades schema 2 personas with an unset model without changing explicit selections' do
+      path = File.join(@tmp, 'agents.yml')
+      original = {
+        'custom' => { 'role' => 'keep', 'engine' => 'grok', 'extra' => { 'untouched' => true } },
+        'pinned' => { 'role' => 'review', 'engine' => 'openai', 'model' => 'Exact/Model:Tag' },
+        'default' => { 'role' => 'default', 'model' => nil },
+        'blank' => { 'role' => 'blank', 'model' => '' }
+      }
+      File.write(path, YAML.dump(original))
+      File.write(File.join(@tmp, '.schema'), JSON.generate(schema: 2))
+      expect(described_class.needed?).to be(true)
+      result = described_class.run(fix: false, backup: false, io: io)
+      expect(result[:applied_migrations]).to eq([3])
+      expected = Marshal.load(Marshal.dump(original))
+      expected['custom']['model'] = nil
+      expect(YAML.safe_load_file(path)).to eq(expected)
+      expect(described_class.installed_schema).to eq(3)
+      bytes = File.binread(path)
+      described_class::MIGRATIONS.fetch(3).call(@tmp, io)
+      expect(File.binread(path)).to eq(bytes)
+      expect(described_class.run(fix: false, backup: false, io: io)[:applied_migrations]).to eq([])
+    end
+
+    it 'does not create a persona file when applying the model migration without one' do
+      described_class::MIGRATIONS.fetch(3).call(@tmp, io)
+      expect(File).not_to exist(File.join(@tmp, 'agents.yml'))
+    end
+
     it 'schema 2 patches stock escalator/scribe toolsets and leaves engines alone' do
       File.write(File.join(@tmp, 'agents.yml'), <<~YML)
         ---

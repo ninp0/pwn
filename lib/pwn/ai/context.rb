@@ -3,6 +3,7 @@
 require 'digest'
 require 'fileutils'
 require 'json'
+require 'pwn/ai/context_ingestion'
 
 module PWN
   module AI
@@ -73,6 +74,12 @@ module PWN
 
       public_class_method def self.help
         puts "USAGE:
+          # Ingest evidence into the local embedding database; positional path alone uses defaults.
+          #{self}.ingest(path: '/path/to/evidence', session_id: 'default')
+
+          # Retrieve auditable source citations for a prompt.
+          #{self}.retrieve(query: 'service of interest', session_id: 'default')
+
           # Attach a file (optionally a byte range) and chunk it for the model.
           #{self}.attach_file(
             path: 'required - filesystem path to attach',

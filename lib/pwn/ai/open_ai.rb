@@ -15,6 +15,9 @@ module PWN
     # This is based on the following OpenAI API Specification:
     # https://api.openai.com/v1
     module OpenAI
+      # Codex GET /models requires this query field; missing it is HTTP 400.
+      CODEX_CLIENT_VERSION = '1.0.0'
+
       # Internal helper: true when +opts[:value]+ is a *real* configured value
       # coming from PWN::Config / pwn-vault (not a placeholder string).
       private_class_method def self.real_config_value?(opts = {})
@@ -446,10 +449,16 @@ module PWN
         base_uri = transport_base_uri(base_uri: engine[:base_uri], oauth_selected: oauth_selected)
         rest_call = opts[:rest_call].to_s.scrub
         params = opts[:params]
+        if oauth_selected && rest_call == 'models'
+          version = oauth[:client_version]
+          version = CODEX_CLIENT_VERSION unless real_config_value?(value: version)
+          params = (params.is_a?(Hash) ? params.dup : {}).merge(client_version: version.to_s)
+        end
         headers = {
-          content_type: 'application/json; charset=UTF-8',
           authorization: "Bearer #{token}"
         }
+        headers[:content_type] = 'application/json; charset=UTF-8' unless %i[get delete].include?(http_method)
+        headers[:accept] = 'application/json' if %i[get delete].include?(http_method)
         # ChatGPT subscription tokens often need the account id header (codex).
         headers['ChatGPT-Account-Id'] = oauth[:account_id] if oauth_selected && real_config_value?(value: oauth[:account_id])
 
@@ -579,11 +588,28 @@ module PWN
       # models = PWN::AI::OpenAI.get_models
 
       public_class_method def self.get_models
-        models = open_ai_rest_call(rest_call: 'models')
-
-        JSON.parse(models, symbolize_names: true)
+        catalog_models(raw: open_ai_rest_call(rest_call: 'models'))
       rescue StandardError => e
         raise e
+      end
+
+      private_class_method def self.catalog_models(opts = {})
+        raw = opts[:raw]
+        raw = JSON.parse(raw, symbolize_names: true) if raw.is_a?(String) || raw.respond_to?(:to_str)
+        return { object: 'list', data: raw } if raw.is_a?(Array)
+
+        raise ArgumentError, 'OpenAI models catalog was empty' if raw.nil?
+
+        rows = raw[:data] || raw[:models] || raw['data'] || raw['models'] || []
+        {
+          object: raw[:object] || raw['object'] || 'list',
+          data: Array(rows).map do |row|
+            next row unless row.is_a?(Hash)
+
+            id = row[:id] || row['id'] || row[:slug] || row['slug'] || row[:name] || row['name'] || row[:model] || row['model']
+            row.merge(id: id)
+          end
+        }
       end
 
       # Supported Method Parameters::
@@ -765,7 +791,7 @@ module PWN
           body[:tool_choice] = tc
         end
         effort = opts[:reasoning_effort].to_s
-        body[:reasoning] = { effort: effort } if !effort.empty? && effort != 'none'
+        body[:reasoning] = { effort: effort, summary: 'auto' } if !effort.empty? && effort != 'none'
         body
       end
 
@@ -853,6 +879,7 @@ module PWN
         text = (raw[:output_text] || raw['output_text']).to_s
         text = '' if text.strip.empty?
         text_parts = []
+        thinking_parts = []
         tool_calls = []
         output.each do |item|
           next unless item.is_a?(Hash)
@@ -867,6 +894,13 @@ module PWN
                 arguments: (item[:arguments] || item['arguments']).to_s
               }
             }
+          elsif type == 'reasoning'
+            Array(item[:summary] || item['summary']).each do |part|
+              next unless part.is_a?(Hash)
+
+              t = part[:text] || part['text']
+              thinking_parts << t.to_s unless t.to_s.strip.empty?
+            end
           elsif type == 'message' && text.empty?
             Array(item[:content] || item['content']).each do |part|
               next unless part.is_a?(Hash)
@@ -892,6 +926,7 @@ module PWN
           tool_calls: tool_calls,
           _native_content: output
         }
+        msg[:thinking] = thinking_parts.join("\n") unless thinking_parts.empty?
         raw.merge(
           assistant_message: msg,
           choices: [{ message: msg }]

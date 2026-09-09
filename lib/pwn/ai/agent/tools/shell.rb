@@ -31,6 +31,8 @@ PWN::AI::Agent::Registry.register(
       type: 'object',
       properties: {
         command: { type: 'string', description: 'The exact shell command to run.' },
+        encoding: { type: 'string', description: 'Set to base64 when data holds the command bytes.' },
+        data: { type: 'string', description: 'Base64 command blob when encoding is base64.' },
         timeout: {
           type: 'integer',
           description: 'Conservative seconds this command should take given HOST LOAD. Omit for a host-derived default. Explicit values honored 1..10800 (3 hours). On timeout keep the same payload and timeout += 180; rewrite only after the 3-hour budget (max 10 mutations/task).'
@@ -41,20 +43,25 @@ PWN::AI::Agent::Registry.register(
   },
   max_chars: 24_000,
   handler: lambda { |args|
-    # Sanitize model/tool JSON junk that becomes syntax error: \ in sh:
-    # 1) UTF-8 replace invalid bytes
-    # 2) join line-continuation backslash+newline (mid-cmd) into space
-    # 3) strip a bare trailing backslash (+ following ws)
-    # Prefer pwn_eval / cat <<'EOF' over nested ruby -e with JSON \ layers.
-    # Fix for mistakes 30e55df3a6d6 / 853b3ca24b9e (REGRESSED shell syntax \).
+    # Payload bytes are opaque; only the shell interprets command syntax.
+    args = PWN::AI::Agent::ToolGuard.unwrap_payload(args: args, key: :command)
     args = PWN::AI::Agent::ToolGuard.coerce_args(args: args, required: %w[command])
     return PWN::AI::Agent::ToolGuard.invalid_payload(hint: args[:__schema_hint]) if args[:__schema_error]
 
     cmd = args[:command].to_s
-                        .encode('UTF-8', invalid: :replace, undef: :replace, replace: '')
-                        .gsub(/\\\r?\n/, ' ')
-                        .gsub(/\\+\s*\z/, '')
-                        .strip
+    if PWN::AI::Agent::ToolGuard.placeholder?(text: cmd)
+      return PWN::AI::Agent::ToolGuard.invalid_payload(
+        hint: 'command is required (string). Do not send ..., {...}, {…}.',
+        text: cmd,
+        offending_token: '...'
+      )
+    end
+    if PWN::AI::Agent::ToolGuard.bashism?(text: cmd) && !PWN::AI::Agent::ToolGuard.shell_bash?
+      return PWN::AI::Agent::ToolGuard.invalid_payload(
+        hint: 'bash-only construct (PIPESTATUS/RANDOM/[[) is not POSIX. Rewrite for /bin/sh or set ai.agent.shell_bash.',
+        text: cmd
+      )
+    end
     timeout = PWN::AI::Agent::ToolGuard.deadline_s(timeout: args[:timeout], kind: :shell, payload: cmd)
     if cmd.bytesize > PWN::AI::Agent::ToolGuard::MAX_PAYLOAD_BYTES
       return PWN::AI::Agent::ToolGuard.invalid_payload(
@@ -64,24 +71,7 @@ PWN::AI::Agent::Registry.register(
         code: 'PAYLOAD_TOO_LARGE'
       )
     end
-    if cmd.empty? || PWN::AI::Agent::ToolGuard.placeholder?(text: cmd)
-      return PWN::AI::Agent::ToolGuard.invalid_payload(
-        hint: 'command is required (string). Do not send ..., {...}, {…}, or empty. ' \
-              'Example: shell(command="uname -r"). Triple-dot inside quoted/heredoc bodies is allowed.',
-        offending_token: '...',
-        text: cmd,
-        code: 'SYNTAX_DENY',
-        suggestion: 'replace ellipsis or placeholders with a concrete command'
-      )
-    end
-
-    if PWN::AI::Agent::ToolGuard.bashism?(text: cmd) && !PWN::AI::Agent::ToolGuard.shell_bash?
-      return PWN::AI::Agent::ToolGuard.invalid_payload(
-        hint: 'Command uses bash-only syntax (PIPESTATUS, $RANDOM, [[ ]], process substitution, ' \
-              'source, &>). This handler runs /bin/sh (dash) unless ' \
-              'PWN::Env[:ai][:agent][:shell_bash]=true. Rewrite as POSIX or opt in to bash.'
-      )
-    end
+    return PWN::AI::Agent::ToolGuard.invalid_payload(hint: 'command must be a nonempty string') unless args[:command].is_a?(String) && !cmd.empty?
 
     scoped = PWN::AI::Agent::ToolGuard.scope_refusal(command: cmd)
     return scoped if scoped

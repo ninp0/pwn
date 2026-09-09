@@ -301,7 +301,7 @@ describe PWN::Plugins::Log do
       expect(body).to include('hello-browser')
       expect(body).to include('https://example.test/open')
       expect(body).not_to include('s3cret-token')
-      expect(body).to match(/\[REDACTED\]/)
+      expect(body).to match(/\[REDACTED:[^:]+:[0-9a-f]{8}\]/)
     end
 
     it 'redacts secret-shaped values even when the key is not a password name' do
@@ -330,7 +330,7 @@ describe PWN::Plugins::Log do
       expect(body).not_to include('BEGIN PRIVATE KEY')
       expect(body).not_to include('xai-abcdefghijklmnopqrstuvwxyz0123456789ABCD')
       expect(body).not_to include('sk-live-SUPERSECRET999')
-      expect(body).to match(/\[REDACTED\]/)
+      expect(body).to match(/\[REDACTED:[^:]+:[0-9a-f]{8}\]/)
     end
   end
 end
@@ -387,7 +387,7 @@ describe 'PWN::Plugins::Log toggle-trace step' do
     PWN::AI::Agent::Dispatch::CfgProbe.real_config_value?(value: token)
     body = File.read(path)
     expect(body).not_to include(token)
-    expect(body).to match(/\[REDACTED\]/)
+    expect(body).to match(/\[REDACTED:[^:]+:[0-9a-f]{8}\]/)
   end
 
   it 'does not wait for ENTER when trace is off or nested' do

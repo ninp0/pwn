@@ -49,7 +49,7 @@ module PWN
     # Bump this whenever the shape of any file under ~/.pwn changes in a
     # way that requires a one-time transform.  Add the transform as an
     # entry in MIGRATIONS keyed by the NEW schema number.
-    SCHEMA_VERSION = 2
+    SCHEMA_VERSION = 3
 
     OK   = "\e[32mok\e[0m"
     BAD  = "\e[31mFAIL\e[0m"
@@ -221,6 +221,26 @@ module PWN
               { changed: false }
             end
         io.puts "    · agents.yml #{Array(r[:patched]).join(', ')}" if r[:changed]
+      },
+      3 => lambda { |root, io|
+        path = File.join(root, 'agents.yml')
+        next unless File.file?(path)
+
+        raw = YAML.safe_load_file(path, permitted_classes: [Symbol], aliases: true)
+        next unless raw.is_a?(Hash)
+
+        patched = 0
+        raw.each_value do |persona|
+          next unless persona.is_a?(Hash)
+          next if persona.key?('model') || persona.key?(:model)
+
+          persona['model'] = nil
+          patched += 1
+        end
+        next if patched.zero?
+
+        File.write(path, YAML.dump(raw))
+        io.puts "    · agents.yml added default model to #{patched} personas"
       }
     }.freeze
 

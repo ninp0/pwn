@@ -1,0 +1,5 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Packaging-compatible driver; privileged deployments execute daemon.py directly.
+exec('/usr/bin/python3', '-I', File.expand_path('../lib/pwn/plugins/capability_broker/daemon.py', __dir__), *ARGV)

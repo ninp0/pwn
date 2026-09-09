@@ -1087,113 +1087,15 @@ module PWN
       # )
 
       public_class_method def self.send(opts = {})
-        PWN::Plugins::PreflightChecker.require_cap_net_raw! if defined?(PWN::Plugins::PreflightChecker)
-        pkt = opts[:pkt]
+        require 'pwn/plugins/capability_broker'
+        require 'base64'
+        pkt = opts.fetch(:pkt)
+        pkt.recalc
+        result = CapabilityBroker.request(operation: 'raw_send', iface: opts.fetch(:iface, 'eth0'),
+                                          frame: Base64.strict_encode64(pkt.to_s), socket: opts[:socket])
+        return result if result[:ok]
 
-        if opts[:iface]
-          iface = opts[:iface].to_s.scrub.strip.chomp
-        else
-          iface = 'eth0'
-        end
-
-        if pkt.instance_of?(PacketFu::TCPPacket)
-          this_ip = Socket.ip_address_list.detect(&:ipv4_private?).ip_address
-
-          # If we're not passing a RST packet, prevent kernel from sending its own
-          if this_ip == pkt.ip_saddr && pkt.tcp_flags.rst.zero?
-            # We have to prevent the kernel space from sending a RST
-            # because it won't have a socket open on the respective
-            # port number before we have a chance to do anything.
-            # In other words, the kernel will receive a SYN-ACK first,
-            # know it didn't send a SYN & send a RST as a result.
-
-            my_os = PWN::Plugins::DetectOS.type
-            case my_os
-            when :linux
-              system_resp = system(
-                'sudo',
-                'iptables',
-                '-C',
-                'OUTPUT',
-                '--protocol',
-                'tcp',
-                '--source',
-                pkt.ip_saddr,
-                '--destination',
-                pkt.ip_daddr,
-                '--destination-port',
-                pkt.tcp_dst.to_s,
-                '--tcp-flags',
-                'RST',
-                'RST',
-                '-j',
-                'DROP',
-                out: File::NULL,
-                err: File::NULL
-              )
-
-              unless system_resp
-                puts 'Preventing kernel from misbehaving when manipulating packets.'
-                system(
-                  'sudo',
-                  'iptables',
-                  '-A',
-                  'OUTPUT',
-                  '--protocol',
-                  'tcp',
-                  '--source',
-                  pkt.ip_saddr,
-                  '--destination',
-                  pkt.ip_daddr,
-                  '--destination-port',
-                  pkt.tcp_dst.to_s,
-                  '--tcp-flags',
-                  'RST',
-                  'RST',
-                  '-j',
-                  'DROP'
-                )
-              end
-
-              pkt.recalc
-              pkt.to_w(iface)
-
-              system(
-                'sudo',
-                'iptables',
-                '-D',
-                'OUTPUT',
-                '--protocol',
-                'tcp',
-                '--source',
-                pkt.ip_saddr,
-                '--destination',
-                pkt.ip_daddr,
-                '--destination-port',
-                pkt.tcp_dst.to_s,
-                '--tcp-flags',
-                'RST',
-                'RST',
-                '-j',
-                'DROP'
-              )
-            # when :osx
-            #   ipfilter = 'pfctl'
-            #   ipfilter_rule = "block out proto tcp from #{pkt.ip_saddr} to #{pkt.ip_daddr} port #{pkt.tcp_dst} flags R"
-            #   system(ipfilter, "pfctl_add_flag #{ipfilter_rule}")
-            #   pkt.recalc
-            #   pkt.to_w(iface)
-            #   system(ipfilter, "pfctl_del_flag #{ipfilter_rule}")
-            else
-              raise "ERROR: #{self} Does not Support #{my_os}"
-            end
-          end
-        else
-          pkt.recalc
-          pkt.to_w(iface)
-        end
-      rescue StandardError => e
-        raise e
+        result.merge(degraded: true, missing_capabilities: cap_net_raw? ? [] : ['CAP_NET_RAW'])
       end
 
       public_class_method def self.tcp_connect_scan(opts = {})
@@ -1228,27 +1130,25 @@ module PWN
       end
 
       public_class_method def self.capture(opts = {})
-        iface = (opts[:iface] || 'eth0').to_s
-        count = (opts[:count] || 8).to_i
-        out = (opts[:path] || File.join(Dir.home, '.pwn', 'artifacts', "capture-#{Time.now.to_i}.pcap")).to_s
+        require 'pwn/plugins/capability_broker'
+        require 'base64'
+        result = CapabilityBroker.request(operation: 'capture', iface: opts.fetch(:iface, 'eth0'),
+                                          count: opts.fetch(:count, 8), timeout: opts.fetch(:timeout, 5), socket: opts[:socket])
+        unless result[:ok]
+          return result.merge(degraded: true, missing_capabilities: cap_net_raw? ? [] : ['CAP_NET_RAW'])
+        end
+
+        bytes = Base64.strict_decode64(result.fetch(:pcap))
+        raise 'invalid pcap response' unless bytes.bytesize >= 24 && bytes.start_with?([0xa1b2c3d4].pack('V'))
+
+        out = File.expand_path(opts.fetch(:path, File.join(Dir.home, '.pwn', 'artifacts', "capture-#{Time.now.to_i}.pcap")))
         FileUtils.mkdir_p(File.dirname(out))
-        if cap_net_raw?(iface: iface)
-          begin
-            return { path: out, engine: 'packetfu', degraded: false } if defined?(PacketFu)
-          rescue StandardError
-            nil
-          end
-        end
-        if PWN::Plugins::PreflightChecker.bin?(name: 'tcpdump')
-          stdout, stderr, status = Open3.capture3('tcpdump', '-i', iface, '-c', count.to_s, '-w', out)
-          return { path: out, engine: 'tcpdump', exit: status.exitstatus, stdout: stdout, stderr: stderr, degraded: true, hint: 'CAP_NET_RAW missing; used tcpdump' }
-        end
-        {
-          error: 'CAP_NET_RAW missing',
-          capability: 'CAP_NET_RAW',
-          remediation: 'setcap cap_net_raw+ep $(command -v ruby)  # or install tcpdump',
-          degraded: true
-        }
+        File.binwrite(out, bytes)
+        raise 'capture readback failed' unless File.binread(out) == bytes
+
+        result.except(:pcap).merge(path: out, degraded: false)
+      rescue StandardError => e
+        { ok: false, degraded: true, error: e.message }
       end
 
       # Author(s):: 0day Inc. <support@0dayinc.com>
@@ -1478,7 +1378,8 @@ module PWN
           # Run send and return its result
           #{self}.send(
             pkt: 'required - pkt returned from other #construct_<type> methods',
-            iface: 'optional - interface to send packet (defaults to eth0)'
+            iface: 'optional - interface to send packet (defaults to eth0)',
+            socket: 'optional - local capability broker Unix socket path'
           )
 
           # Unprivileged TCP connect sweep (fallback when CAP_NET_RAW is missing).
@@ -1498,7 +1399,9 @@ module PWN
           #{self}.capture(
             iface: 'optional - interface (defaults to eth0)',
             count: 'optional - packet count (defaults to 8)',
-            path: 'optional - output pcap path'
+            path: 'optional - output pcap path',
+            timeout: 'optional - maximum capture duration in seconds',
+            socket: 'optional - local capability broker Unix socket path'
           )
 
           # Print the AUTHOR(S) string for this module.
