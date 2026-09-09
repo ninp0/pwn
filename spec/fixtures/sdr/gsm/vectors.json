@@ -1,0 +1,16 @@
+{
+  "generator": "GNU Radio 3.10.12.0",
+  "sample_rate": 1083333.3333333333,
+  "freq_offset_hz": 6000,
+  "payload_hex": "03030100",
+  "files": {
+    "sch.cs16": {
+      "sha256": "0722a98009d57f3d9a9b051ac5089cad7be43491bc69dd24a269a4d0c08e9ffa",
+      "samples": 929
+    },
+    "bad-crc.cs16": {
+      "sha256": "99e3bc91459a26da341efb51637d8f380a1c3df0e6e4f7654d3e847f60ca9df3",
+      "samples": 929
+    }
+  }
+}

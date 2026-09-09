@@ -1,19 +1,17 @@
 # frozen_string_literal: true
 
+require 'ffi'
+require 'rbconfig'
+
 module PWN
   module SDR
     module Decoder
-      # GSM (2G) true-air FCCH/SCH decoder.
-      #
-      # 270.833 kbit/s GMSK. FCCH burst = 148 all-zero bits → a pure
-      # +67.708 kHz tone for ~547 μs. Detect via variance-dip on the FM
-      # discriminator (PWN::FFI::Liquid.freq_demod), estimate carrier
-      # offset from mean deviation, then correlate the SCH 64-bit extended
-      # training sequence 8 timeslots later and recover the 6-bit BSIC
-      # (NCC/BCC) + 19-bit reduced frame number (T1/T2/T3'). Emits
-      # {event:'fcch'|'sch', freq_offset_hz:, bsic:, ncc:, bcc:, rfn:}.
+      # GSM SCH IQ/channel-bit decoding (.decode) and FCCH observations (.detect).
+      # Channelized GMSK IQ is synchronized and differentially demodulated before
+      # convolutional/CRC10 verification and BSIC/frame-number extraction.
+      # Multipath equalization, BCCH/CCCH and traffic decoding are unsupported.
       module GSM
-        SYMBOL_RATE = 270_833.0
+        SYMBOL_RATE = 3_250_000.0 / 12
         FCCH_TONE   = SYMBOL_RATE / 4.0 # 67.708 kHz above carrier
         FCCH_BITS   = 148
         # SCH extended training sequence (64 bits, TS 45.002 Table 5.2.5)
@@ -24,24 +22,28 @@ module PWN
           0, 1, 1, 1, 0, 1, 1, 0, 0, 0, 0, 1, 1, 0, 1, 1
         ].freeze
 
-        # Streaming GMSK demod for Base.run_iq — I/Q → FCCH lock + SCH BSIC.
+        # Streaming FCCH detector for Base.run_iq (not a channel decoder).
         class DemodIQ
           def initialize(rate:)
             @rate  = rate.to_f
             @spb   = @rate / SYMBOL_RATE
             @audio = []
+            @audio_offset = 0
             @fcch_n = 0
-            @sch_n  = 0
           end
 
           def feed_iq(samples, rate: nil, &)
             @rate = rate.to_f if rate
             @spb  = @rate / SYMBOL_RATE
-            fm = PWN::SDR::Decoder::DSP.fm_demod_iq(iq: samples)
+            @fm_state ||= {}
+            fm = PWN::SDR::Decoder::DSP.fm_demod_iq(iq: samples, state: @fm_state)
             @audio.concat(fm)
             scan(&) if block_given?
             max = (@rate * 0.25).to_i
-            @audio.shift(@audio.length - max) if @audio.length > max
+            return unless @audio.length > max
+
+            @audio_offset += @audio.length - max
+            @audio.shift(@audio.length - max)
           end
 
           private
@@ -68,53 +70,119 @@ module PWN
             g_var  = @audio.sum { |v| (v - g_mean)**2 } / @audio.length
             return unless g_var.positive? && (best[:var] / g_var) < 0.15 && best[:mean].positive?
 
+            position = @audio_offset + best[:i]
+            return if @last_fcch_at == position
+
+            @last_fcch_at = position
             @fcch_n += 1
             # discriminator output ≈ 2π·Δf/fs → Δf = mean · fs / (2π)
             f_est = best[:mean] * @rate / (2 * Math::PI)
             f_off = (f_est - FCCH_TONE).round
             yield(
               protocol: 'GSM', event: 'fcch', modulation: 'GMSK',
+              capability: 'synchronization-only', decoded: false,
               symbol_rate: SYMBOL_RATE.to_i, fcch_no: @fcch_n,
               tone_hz: f_est.round, freq_offset_hz: f_off,
               variance_ratio: (best[:var] / g_var).round(4),
               summary: "GSM FCCH lock ##{@fcch_n} tone=#{f_est.round}Hz Δf=#{f_off}Hz"
             )
 
-            # SCH lives 8 timeslots after FCCH: 8 × 156.25 = 1250 symbols.
-            sch_off = best[:i] + (1250 * @spb).round
-            return unless sch_off + (148 * @spb).round < @audio.length
+            # FCCH is only a timing/frequency observation. SCH decoding is
+            # exposed separately for demodulated, burst-framed symbols.
+          end
+        end
 
-            seg  = @audio[sch_off, (156 * @spb).round]
-            bits = PWN::SDR::Decoder::DSP.nrz_slice(
-              samples: seg, rate: @rate, baud: SYMBOL_RATE
-            )
-            # GMSK data are differentially encoded (1 = no phase change).
-            db = PWN::SDR::Decoder::DSP.diff_decode(bits: bits).map { |b| b ^ 1 }
-            idx = PWN::SDR::Decoder::DSP.find_sync(
-              bits: db, pattern: SCH_ETSC, max_err: 8
-            )
-            return unless idx && idx >= 42 && idx + 64 + 39 <= db.length
+        # Noncoherent SCH receiver for channelized GMSK, BT=0.3. Searches
+        # sample timing against differentially precoded ETSC and estimates CFO
+        # from its two discriminator levels. No multipath equalizer or BCCH/TCH.
+        class SCHDemodIQ
+          attr_reader :backend
 
-            # SCH burst: 3 tail + 39 enc + 64 TS + 39 enc + 3 tail + 8.25 guard
-            enc1 = db[idx - 39, 39]
-            enc2 = db[idx + 64, 39]
-            enc  = enc1 + enc2 # 78 coded bits (rate-1/2 conv, K=5)
-            info = GSM.viterbi_decode(bits: enc, k: 5, g0: 0o23, g1: 0o33)
-            # 25 info bits + 10 parity + 4 tail = 39 → we get first 39.
-            bsic = PWN::SDR::Decoder::DSP.bits_to_int(bits: info[0, 6])
-            t1   = PWN::SDR::Decoder::DSP.bits_to_int(bits: info[6, 11])
-            t2   = PWN::SDR::Decoder::DSP.bits_to_int(bits: info[17, 5])
-            t3p  = PWN::SDR::Decoder::DSP.bits_to_int(bits: info[22, 3])
-            @sch_n += 1
-            yield(
-              protocol: 'GSM', event: 'sch', modulation: 'GMSK',
-              bsic: bsic, ncc: (bsic >> 3) & 7, bcc: bsic & 7,
-              t1: t1, t2: t2, t3p: t3p, sch_no: @sch_n,
-              raw_info_hex: info[0, 25].each_slice(4).map { |n| PWN::SDR::Decoder::DSP.bits_to_int(bits: n).to_s(16) }.join,
-              summary: "GSM SCH BSIC=#{bsic} (NCC=#{(bsic >> 3) & 7} BCC=#{bsic & 7}) T1=#{t1} T2=#{t2} T3'=#{t3p}"
-            )
-            # consume up to & incl. SCH so we don't re-emit on next feed
-            @audio.shift(sch_off + (156 * @spb).round)
+          def initialize(rate:, native: true)
+            @rate = Float(rate)
+            raise ArgumentError, 'SCH IQ needs at least four samples per symbol' unless @rate.finite? && @rate >= 1_083_333
+
+            @spb = @rate / SYMBOL_RATE
+            @audio = []
+            @state = {}
+            @cursor = 0
+            @offset = 0
+            @training = SCH_ETSC.each_cons(2).map { |a, b| a == b ? 1 : -1 }
+            @backend = :ruby
+            load_native if native
+          end
+
+          def feed_iq(samples, rate: nil)
+            raise ArgumentError, 'SCH sample rate cannot change during a stream' if rate && (rate.to_f - @rate).abs > 0.5
+
+            @audio.concat(DSP.fm_demod_iq(iq: samples, state: @state))
+            span = (148 * @spb).ceil
+            packed = @audio.pack('d*') if @scanner && @audio.length > span
+            while @cursor + span < @audio.length
+              if packed
+                @cursor = @scanner.pwn_gsm_search(packed, @audio.length, @cursor, @spb, @training_packed)
+                break unless @cursor + span < @audio.length
+              end
+              frame = candidate(@cursor)
+              if frame
+                yield frame if block_given?
+                @cursor += span
+              else
+                @cursor += 1
+              end
+            end
+            @audio.shift(@cursor)
+            @offset += @cursor
+            @cursor = 0
+          end
+
+          private
+
+          def load_native
+            # An optional search accelerator, never a runtime compiler/download.
+            path = File.expand_path("../../../../ext/pwn_gsm/libpwn_gsm.#{RbConfig::CONFIG.fetch('DLEXT')}", __dir__)
+            @scanner = Module.new do
+              extend ::FFI::Library
+
+              ffi_lib path
+              attach_function :pwn_gsm_search, %i[pointer size_t size_t double pointer], :size_t
+            end
+            @training_packed = @training.pack('l*')
+            @backend = :native
+          rescue LoadError
+            @scanner = nil
+          end
+
+          def candidate(start)
+            # Training starts at bit 42; bit 43 is the first known difference.
+            values = Array.new(63) { |n| @audio[(start + ((43 + n) * @spb)).round] }
+            positive = []
+            negative = []
+            values.each_with_index { |v, n| (@training[n].positive? ? positive : negative) << v }
+            high = positive.sum / positive.length
+            low = negative.sum / negative.length
+            amplitude = (high - low) / 2.0
+            nominal = Math::PI / (2 * @spb)
+            return unless amplitude.between?(nominal * 0.35, nominal * 1.5)
+
+            bias = (high + low) / 2.0
+            errors = values.each_with_index.count { |v, n| (v > bias ? 1 : -1) != @training[n] }
+            return if errors > 2
+
+            differences = Array.new(148) { |n| @audio[(start + (n * @spb)).round] > bias ? 0 : 1 }
+            bits = Array.new(148)
+            bits[42] = SCH_ETSC.first
+            42.downto(1) { |n| bits[n - 1] = bits[n] ^ differences[n] }
+            # Reset differential state at the other known training boundary;
+            # a training error must not invert the second coded half-burst.
+            bits[105] = SCH_ETSC.last
+            106.upto(147) { |n| bits[n] = bits[n - 1] ^ differences[n] }
+            return unless bits.first(3) == [0, 0, 0] && bits.last(3) == [0, 0, 0]
+
+            frame = GSM.decode_sch(bits: bits[3, 39] + bits[106, 39])
+            frame&.merge(input: 'iq', modulation: 'GMSK', sample_index: @offset + start,
+                         freq_offset_hz: (bias * @rate / (2 * Math::PI)).round,
+                         training_errors: errors)
           end
         end
 
@@ -142,8 +210,8 @@ module PWN
             nstates.times do |s|
               [0, 1].each do |u|
                 reg = (u << (k - 1)) | s
-                o0 = parity(reg & g0)
-                o1 = parity(reg & g1)
+                o0 = parity(parity: reg & g0)
+                o1 = parity(parity: reg & g1)
                 m  = pm[s] + (o0 == r0 ? 0 : 1) + (o1 == r1 ? 0 : 1)
                 ns = reg >> 1
                 if m < npm[ns]
@@ -155,7 +223,7 @@ module PWN
             pm = npm
           end
           # traceback from best final state
-          s = pm.each_with_index.min_by(&:first).last
+          s = opts[:terminated] ? 0 : pm.each_with_index.min_by(&:first).last
           out = Array.new(npairs)
           (npairs - 1).downto(0) do |t|
             v = bp[t][s]
@@ -163,6 +231,45 @@ module PWN
             s = v >> 1
           end
           out
+        end
+
+        # TS 45.003 SCH: 25 information + 10 inverted CRC + 4 tail bits,
+        # convolutionally encoded to 78 bits. No IQ demodulation is implied.
+        # Reference: libosmocore src/coding/gsm0503_parity.c (poly 0x175).
+        public_class_method def self.decode_sch(opts = {})
+          bits = opts[:bits]
+          raise ArgumentError, 'SCH requires exactly 78 binary coded bits' unless bits.is_a?(Array) && bits.length == 78 && bits.all? { |b| b.is_a?(Integer) && [0, 1].include?(b) }
+
+          info = viterbi_decode(bits: bits, terminated: true)
+          return nil unless info[35, 4] == [0, 0, 0, 0]
+
+          crc = 0
+          info.first(25).each do |bit|
+            feedback = ((crc >> 9) & 1) ^ bit
+            crc = (crc << 1) & 0x3ff
+            crc ^= 0x175 if feedback == 1
+          end
+          received = info[25, 10].reduce(0) { |a, b| (a << 1) | b }
+          return nil unless received == (crc ^ 0x3ff)
+
+          field = ->(positions) { positions.reduce(0) { |a, i| (a << 1) | info[i] } }
+          ncc = field.call([7, 6, 5])
+          bcc = field.call([4, 3, 2])
+          t1 = field.call([1, 0, 15, 14, 13, 12, 11, 10, 9, 8, 23])
+          t2 = field.call([22, 21, 20, 19, 18])
+          t3p = field.call([17, 16, 24])
+          return nil unless t2 < 26 && t3p < 5
+
+          t3 = (10 * t3p) + 1
+          payload = info.first(25).each_slice(8).map { |byte| byte.each_with_index.sum { |b, i| b << i } }.pack('C*')
+          {
+            protocol: 'GSM', event: 'sch', capability: 'sch-channel-decode', decoded: true,
+            checksum_verified: true, integrity: { algorithm: 'SCH-CRC10', valid: true },
+            payload_hex: payload.unpack1('H*'), payload_bits: 25,
+            bsic: (ncc << 3) | bcc, ncc: ncc, bcc: bcc, t1: t1, t2: t2, t3p: t3p,
+            frame_number: (1326 * t1) + (51 * ((t3 - t2) % 26)) + t3,
+            summary: "GSM SCH CRC verified NCC=#{ncc} BCC=#{bcc}"
+          }
         end
 
         public_class_method def self.parity(opts = {})
@@ -180,17 +287,60 @@ module PWN
         #   freq_obj: 'required - freq_obj returned from PWN::SDR::GQRX.init_freq'
         # )
 
+        # Realtime options forwarded to Base: on_frame (Hash callback), output
+        # (writable IO), interactive (default true), duration (seconds), stop
+        # (callable), queue_size (bounded chunks), log_file (path or false).
         public_class_method def self.decode(opts = {})
-          freq_obj = opts[:freq_obj]
+          mode = opts[:mode] || :iq
+          raise NotImplementedError, "Unsupported GSM mode #{mode}; SCH IQ and :sch_bits only, not traffic/BCCH/CCCH" unless %i[iq sch_iq sch_bits].include?(mode)
+
+          unless mode == :sch_bits
+            freq_obj = opts[:freq_obj] || {}
+            source = opts[:source] || freq_obj[:iq_source]
+            file = opts[:file] || freq_obj[:iq_file]
+            source ||= :file if file
+            raise ArgumentError, 'SCH requires an explicit IQ source; no automatic hardware acquisition' if source.nil? || source.to_s == 'auto'
+
+            rate = (opts[:sample_rate] || freq_obj[:iq_rate] || 1_083_333).to_i
+            return Base.run_iq(opts.merge(freq_obj: freq_obj, source: source, file: file,
+                                          sample_rate: rate, protocol: 'GSM', fallback: :raise,
+                                          demod: SCHDemodIQ.new(rate: rate, native: opts.fetch(:native, true))))
+          end
+
+          chunks = opts[:bit_chunks]
+          raise ArgumentError, ':sch_bits requires enumerable bit_chunks (already demodulated binary SCH bursts)' unless chunks.respond_to?(:each)
+
+          buffer = []
+          frames = []
+          chunks.each do |chunk|
+            raise ArgumentError, 'bit_chunks must contain arrays of binary bits' unless chunk.is_a?(Array) && chunk.all? { |b| b.is_a?(Integer) && [0, 1].include?(b) }
+
+            buffer.concat(chunk)
+            while buffer.length >= 148
+              frame = nil
+              frame = decode_sch(bits: buffer[3, 39] + buffer[106, 39]) if buffer[0, 3] == [0, 0, 0] && buffer[42, 64] == SCH_ETSC && buffer[145, 3] == [0, 0, 0]
+              buffer.shift(frame ? 148 : 1)
+              next unless frame
+
+              frames << frame
+              opts[:on_frame]&.call(frame)
+            end
+          end
+          frames
+        end
+
+        public_class_method def self.detect(opts = {})
+          freq_obj = opts[:freq_obj] || {}
           rate = (opts[:sample_rate] || freq_obj[:iq_rate] || 1_083_333).to_i
           PWN::SDR::Decoder::Base.run_iq(
+            **opts,
             freq_obj: freq_obj,
             protocol: 'GSM',
             sample_rate: rate,
             source: opts[:source],
             file: opts[:file],
             demod: DemodIQ.new(rate: rate),
-            note: '270.833 kbit/s GMSK — I/Q→freqdem→FCCH tone lock→SCH TS correlate→Viterbi→BSIC/RFN.',
+            note: '270.833 kbit/s GMSK — FCCH tone/frequency observations only; no SCH or traffic decoding.',
             describe: proc { |b| { modulation: 'GMSK', tdma_frames: (b[:duration_ms] / 4.615).round } }
           )
         end
@@ -235,7 +385,8 @@ module PWN
               bits: 'required - Array<0|1> soft/hard coded bits (rate-1/2)',
               k: 'optional - 5, g0: 0o23, g1: 0o33',
               g0: 'optional - g0 value consumed by #viterbi_decode',
-              g1: 'optional - g1 value consumed by #viterbi_decode'
+              g1: 'optional - g1 value consumed by #viterbi_decode',
+              terminated: 'optional - force final trellis state zero (default false)'
             )
 
             # Run parity and return its result
@@ -243,9 +394,33 @@ module PWN
               parity: 'optional - parity value consumed by #parity'
             )
 
-            # Run decode and return its result
+            # Observe FCCH tones without decoding payloads:
+            #{self}.detect(freq_obj: {}, source: :file, file: 'capture.cu8')
+            # Decode SCH from channelized IQ or demodulated bits; verifies CRC10.
+            # IQ needs >=1083333 samples/sec; no equalizer, BCCH/CCCH or traffic.
             #{self}.decode(
+              mode: 'optional - :iq (default), :sch_iq, or :sch_bits',
+              freq_obj: 'optional - capture settings Hash',
+              source: 'required for IQ - explicit source IO/device/:file; never :auto',
+              file: 'optional - IQ capture path',
+              sample_rate: 'optional - IQ Hz, default 1083333',
+              native: 'optional - use prebuilt SCH scanner when available (default true); false forces Ruby search',
+              bit_chunks: 'optional - required in :sch_bits mode; Enumerable of binary Array chunks',
+              on_frame: 'optional - synchronous callback before source EOF'
+            )
+            # Decode 78 convolutionally coded SCH bits and verify CRC10.
+            #{self}.decode_sch(bits: 'required - exactly 78 binary bits; nil on integrity failure')
+
+            # Capture observations only, never decoded payloads.
+            #{self}.detect(
               freq_obj: 'required - freq_obj returned from PWN::SDR::GQRX.init_freq',
+              on_frame: 'optional - callback receiving each emitted Hash',
+              output: 'optional - writable IO (default stdout)',
+              interactive: 'optional - false disables ENTER input',
+              duration: 'optional - finite seconds to run',
+              stop: 'optional - callable returning true to stop',
+              queue_size: 'optional - bounded pending chunks (default 8)',
+              log_file: 'optional - JSONL path or false to disable logging',
               sample_rate: 'optional - sample rate value consumed by #decode',
               source: 'optional - source value consumed by #decode',
               file: 'optional - filesystem path'

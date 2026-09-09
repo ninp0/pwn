@@ -21,6 +21,7 @@ module PWN
   # `.available?` returns false so callers can fall back to pure Ruby.
   module FFI
     autoload :AdalmPluto, 'pwn/ffi/adalm_pluto'
+    autoload :DSPNative, 'pwn/ffi/dsp_native'
     autoload :FFTW,     'pwn/ffi/fftw'
     autoload :HackRF,   'pwn/ffi/hack_rf'
     autoload :Liquid,   'pwn/ffi/liquid'

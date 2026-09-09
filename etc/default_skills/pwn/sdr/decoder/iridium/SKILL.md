@@ -12,7 +12,7 @@ metadata:
 
 # PWN::SDR::Decoder::Iridium
 
-True-air + detector-fallback decoder for Iridium. Prefers PWN::FFI I/Q (RTL-SDR / ADALM-Pluto / HackRF / capture file) via Base.run_iq; degrades to Base.run_detector with no hardware.
+IRA protocol decoding from pre-synchronized symbol IQ, plus separate wideband energy observations (.detect). General raw-IQ acquisition and non-IRA message families are not implemented. See the independent RF vectors and BSD protocol-source notice in spec/fixtures/sdr/iridium/.
 
 ## When to use
 
@@ -28,12 +28,14 @@ Class methods take `(opts = {})` and read `opts`.
 
 ```ruby
 PWN::SDR::Decoder::Iridium.help
-PWN::SDR::Decoder::Iridium.decode(opts)
+PWN::SDR::Decoder::Iridium.decode_ring_alert(opts)
 ```
 
 ## Public methods
 
+- `decode_ring_alert`
 - `decode`
+- `detect`
 - `parse_line`
 - `authors`
 - `help`
@@ -44,5 +46,5 @@ PWN::SDR::Decoder::Iridium.decode(opts)
 
 ## Verification
 
-`PWN::SDR::Decoder::Iridium.respond_to?(:decode)` after the
+`PWN::SDR::Decoder::Iridium.respond_to?(:decode_ring_alert)` after the
 module is loaded. Read the source for parameter names.

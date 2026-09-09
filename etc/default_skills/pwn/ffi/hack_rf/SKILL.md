@@ -12,7 +12,7 @@ metadata:
 
 # PWN::FFI::HackRF
 
-Thin libhackrf binding for inventory / RX of raw I/Q. Intentionally control-plane first: init/open/tune/rate/gains + one-shot sync-style helpers used by Extrospection `probe_rf` and by wideband PWN::SDR::Decoder::* modules that need real I/Q (not GQRX audio). Streaming callbacks stay opt-in — Ruby GC must not run on the libusb transfer thread, so call sites that need continuous RX should buffer into a Queue from a dedicated thread.
+Thin libhackrf binding for inventory / RX of raw I/Q. Intentionally control-plane first: init/open/tune/rate/gains + one-shot sync-style helpers used by Extrospection `probe_rf` and by wideband PWN::SDR::Decoder::* modules that need real I/Q (not GQRX audio). Callbacks copy into a bounded nonblocking queue. Ruby callbacks still acquire the GVL and allocate: this is not a hard-realtime guarantee.
 
 ## When to use
 

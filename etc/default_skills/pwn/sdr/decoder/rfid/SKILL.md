@@ -12,7 +12,7 @@ metadata:
 
 # PWN::SDR::Decoder::RFID
 
-True-air + detector-fallback decoder for RFID. Prefers PWN::FFI I/Q (RTL-SDR / ADALM-Pluto / HackRF / capture file) via Base.run_iq; degrades to Base.run_detector with no hardware.
+Protocol frames via .decode; energy observations only via .detect.
 
 ## When to use
 
@@ -28,15 +28,21 @@ Class methods take `(opts = {})` and read `opts`.
 
 ```ruby
 PWN::SDR::Decoder::RFID.help
-PWN::SDR::Decoder::RFID.decode(opts)
+PWN::SDR::Decoder::RFID.parse_frame(opts)
 ```
 
 ## Public methods
 
+- `parse_frame`
 - `decode`
+- `detect`
 - `parse_line`
 - `authors`
 - `help`
+
+## References
+
+- `references/urls.md` — URLs from source
 
 ## Source
 
@@ -44,5 +50,5 @@ PWN::SDR::Decoder::RFID.decode(opts)
 
 ## Verification
 
-`PWN::SDR::Decoder::RFID.respond_to?(:decode)` after the
+`PWN::SDR::Decoder::RFID.respond_to?(:parse_frame)` after the
 module is loaded. Read the source for parameter names.

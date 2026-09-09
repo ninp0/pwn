@@ -122,7 +122,7 @@ module PWN
 
         # ── buffer ─────────────────────────────────────────────────────
         attach_function :iio_buffer_destroy, [:pointer], :void
-        attach_function :iio_buffer_refill, [:pointer], :ssize_t
+        attach_function :iio_buffer_refill, [:pointer], :ssize_t, blocking: true
         attach_function :iio_buffer_start, [:pointer], :pointer
         attach_function :iio_buffer_end, [:pointer], :pointer
         attach_function :iio_buffer_step, [:pointer], :ptrdiff_t
@@ -364,15 +364,19 @@ module PWN
         h = opts[:handle]
         raise 'ERROR: :handle required' unless h.is_a?(Hash)
 
-        buf = h[:buffer]
-        raise 'ERROR: handle missing :buffer' if buf.nil? || buf.null?
+        (h[:read_mutex] ||= Mutex.new).synchronize do
+          buf = h[:buffer]
+          raise 'ERROR: handle missing :buffer' if buf.nil? || buf.null?
+          raise 'ERROR: RX buffer stopping' if h[:stopping]
 
-        nbytes = iio_buffer_refill(buf)
-        raise "ERROR: iio_buffer_refill rc=#{nbytes}" if nbytes.negative?
+          nbytes = iio_buffer_refill(buf)
+          raise "ERROR: iio_buffer_refill rc=#{nbytes}" if nbytes.negative?
+          raise "ERROR: iio_buffer_refill invalid IQ length #{nbytes}" unless (nbytes % 4).zero?
 
-        start = iio_buffer_start(buf)
-        # Pluto packs I then Q as sequential int16 scan elements; step covers both.
-        start.read_string(nbytes)
+          start = iio_buffer_start(buf)
+          # Stock Pluto packs I then Q as sequential int16 scan elements.
+          start.read_string(nbytes)
+        end
       end
 
       # Supported Method Parameters::
@@ -382,14 +386,16 @@ module PWN
         h = opts[:handle]
         return unless h.is_a?(Hash)
 
-        buf = h[:buffer]
-        if buf && !buf.null?
-          begin
+        (h[:stop_mutex] ||= Mutex.new).synchronize do
+          buf = h[:buffer]
+          if buf && !buf.null?
+            h[:stopping] = true
             iio_buffer_cancel(buf)
-          rescue StandardError
-            nil
+            (h[:read_mutex] ||= Mutex.new).synchronize do
+              iio_buffer_destroy(buf)
+              h[:buffer] = nil
+            end
           end
-          iio_buffer_destroy(buf)
         end
         nil
       end

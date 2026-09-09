@@ -28,11 +28,12 @@ Class methods take `(opts = {})` and read `opts`.
 
 ```ruby
 PWN::SDR::Decoder::Morse.help
-PWN::SDR::Decoder::Morse.decode(opts)
+PWN::SDR::Decoder::Morse.detect(opts)
 ```
 
 ## Public methods
 
+- `detect`
 - `decode`
 - `decode_string`
 - `authors`
@@ -44,5 +45,5 @@ PWN::SDR::Decoder::Morse.decode(opts)
 
 ## Verification
 
-`PWN::SDR::Decoder::Morse.respond_to?(:decode)` after the
+`PWN::SDR::Decoder::Morse.respond_to?(:detect)` after the
 module is loaded. Read the source for parameter names.

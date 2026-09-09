@@ -1,5 +1,14 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
-# Packaging-compatible driver; privileged deployments execute daemon.py directly.
-exec('/usr/bin/python3', '-I', File.expand_path('../lib/pwn/plugins/capability_broker/daemon.py', __dir__), *ARGV)
+# Deploy the reviewed Ruby library tree with this executable, never setcap Ruby.
+$LOAD_PATH.unshift(File.expand_path('../lib', __dir__))
+require 'pwn'
+require 'pwn/plugins/capability_broker/daemon'
+
+begin
+  PWN::Plugins::CapabilityBroker::Daemon.main(argv: ARGV)
+rescue StandardError => e
+  warn "pwn-capd: #{e.message}"
+  exit 1
+end

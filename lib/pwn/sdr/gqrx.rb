@@ -1073,7 +1073,8 @@ module PWN
       #   bandwidth: 'optional - Bandwidth (defaults to "200.000")',
       #   squelch: 'optional - Squelch level to set (Defaults to current value)',
       #   decoder: 'optional - Decoder key (e.g., :gsm / :rds) to start live decoding (starts recording if provided)',
-      #   interactive: 'optional - Boolean; when false AND decoder responds to .sample, call sample (non-interactive Hash) instead of decode (TTY). Defaults to true.',
+      #   interactive: 'optional - Boolean (default true); false uses .sample only without explicit decoder context; otherwise .decode.',
+      #   mode: 'optional - Protocol-specific mode; decoder options (backend, iq_format, source, keys, callbacks, etc.) pass unchanged to .decode for validation.',
       #   settle_secs: 'optional - Seconds for decoder.sample (e.g. RDS; default 8)',
       #   udp_ip: 'optional - UDP IP address for decoder module (defaults to 127.0.0.1)',
       #   udp_port: 'optional - UDP port for decoder module (defaults to 7355)',
@@ -1200,7 +1201,16 @@ module PWN
             freq_obj[:udp_ip] = udp_ip
             freq_obj[:udp_port] = udp_port
             freq_obj[:decoder_module] = decoder_module
-            if !interactive && decoder_module.respond_to?(:sample)
+            # Protocols own validation of their options. Strip GQRX controls,
+            # not decoder context; never let supplied objects replace the
+            # frequency/socket/module we resolved, or log secret context.
+            decoder_opts = opts.except(:gqrx_sock, :freq, :precision, :demodulator_mode,
+                                       :bandwidth, :squelch, :decoder, :interactive, :settle_secs,
+                                       :udp_ip, :udp_port, :suppress_details, :keep_alive,
+                                       :freq_obj, :decoder_module)
+            # Any explicit decoder context (even nil/false) must reach decode
+            # for validation, not silently select the legacy RDS sampler.
+            if !interactive && decoder_opts.empty? && decoder_module.respond_to?(:sample)
               sample_opts = {
                 freq_obj: freq_obj,
                 gqrx_sock: gqrx_sock
@@ -1208,7 +1218,7 @@ module PWN
               sample_opts[:settle_secs] = settle_secs unless settle_secs.nil?
               freq_obj[:sample] = decoder_module.sample(sample_opts)
             else
-              decoder_module.decode(freq_obj: freq_obj)
+              decoder_module.decode(decoder_opts.merge(freq_obj: freq_obj, interactive: interactive))
             end
           end
         end

@@ -1,0 +1,47 @@
+# External fixture generator only; GNU Radio and scipy are not runtime dependencies.
+import sys, time, json, pathlib, hashlib, gzip
+import gnuradio
+gnuradio.__path__.append('/tmp/pwn-lora-install/lib/python3.13/site-packages/gnuradio')
+from gnuradio import gr, blocks, lora_sdr
+import pmt
+import numpy as np
+from scipy.signal import resample_poly
+out = pathlib.Path('/opt/pwn/spec/fixtures/sdr/lora')
+vectors = []
+# sf, cr, implicit, crc, ldro, inversion, input rate
+modes = [(9,1,False,True,False,False,125000), (10,2,False,False,False,False,125000),
+         (11,3,False,True,True,False,125000), (12,4,False,True,True,False,125000),
+         (9,2,True,True,False,False,125000), (12,1,True,False,True,True,125000),
+         (7,4,False,True,False,True,125000),
+         (7,4,True,False,False,False,125000), (8,3,True,True,False,False,125000),
+         (10,4,True,False,True,False,125000), (11,1,False,True,False,False,125000),
+         (12,2,False,False,False,False,125000), (8,2,False,True,False,False,500000),
+         (9,3,False,True,False,False,300000)]
+for index, (sf,cr,implicit,crc,ldro,invert,rate) in enumerate(modes):
+    text = 'Mode vector %d' % index
+    tb = gr.top_block()
+    # Oversample independently at 4x for the non-integer rate vector.
+    txrate = 500000 if rate != 125000 else rate
+    tx = lora_sdr.lora_sdr_lora_tx(sf=sf, cr=cr, bw=125000, samp_rate=txrate,
+        has_crc=crc, impl_head=implicit, ldro_mode=int(ldro), frame_zero_padd=512)
+    iq, syms = blocks.vector_sink_c(), blocks.vector_sink_i()
+    tb.connect(tx, iq)
+    tb.connect(tx.lora_sdr_gray_demap_0, syms)
+    tb.start()
+    tx.lora_sdr_whitening_0.to_basic_block()._post(pmt.intern('msg'), pmt.intern(text))
+    end = time.monotonic()+10
+    while time.monotonic()<end and not iq.data(): time.sleep(.02)
+    time.sleep(.2)
+    tb.stop(); tb.wait()
+    signal = np.asarray(iq.data(), dtype='<c8')
+    assert len(signal) and syms.data()
+    if rate != txrate: signal = resample_poly(signal,3,5)
+    if invert: signal = np.conj(signal)
+    raw = np.asarray(signal,dtype='<c8').tobytes()
+    name = f'mode-{index}.cf32.gz'
+    (out/name).write_bytes(gzip.compress(raw,mtime=0))
+    vectors.append(dict(sf=sf,cr=cr,bw=125000,sample_rate=rate,implicit_header=implicit,crc=crc,
+        ldro=ldro,invert_iq=invert,payload_length=len(text),payload_hex=text.encode().hex(),
+        symbols=list(syms.data()),file=name,sha256=hashlib.sha256((out/name).read_bytes()).hexdigest()))
+(out/'modes.json').write_text(json.dumps(vectors,indent=2)+'\n')
+print('Generated',len(vectors),'external mode vectors')

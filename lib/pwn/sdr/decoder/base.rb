@@ -1,9 +1,7 @@
 # frozen_string_literal: true
 
 require 'json'
-require 'tty-spinner'
-require 'tty-screen'
-require 'io/wait'
+require 'socket'
 
 module PWN
   module SDR
@@ -17,9 +15,8 @@ module PWN
       #                 the samples with PWN::SDR::Decoder::DSP, hand each
       #                 chunk to a caller-supplied `demod:` object that
       #                 responds to `#feed(samples, &emit)`. Every Hash the
-      #                 demodulator emits is merged with freq_obj, JSON-
-      #                 pretty-printed, JSONL-logged, and shown on the
-      #                 spinner. [ENTER] stops cleanly.
+      #                 demodulator emits is merged with freq_obj and written
+      #                 as flushed JSONL, then delivered to on_frame.
       #
       #   run_iq      — True-air path. Opens a real SDR front-end via
       #                 PWN::FFI::{RTLSdr,HackRF,AdalmPluto,SoapySDR} (or
@@ -39,6 +36,22 @@ module PWN
       #                 whenever the signal crosses an adaptive threshold, so
       #                 the operator still gets structured, logged intel
       #                 without ANY external decoding binary.
+      #
+      # All runners accept on_frame (callable), output (IO, default $stdout),
+      # interactive (default true), duration (monotonic seconds), stop (callable),
+      # queue_size (positive Integer, default 8), and log_file (nil: default
+      # /tmp/<protocol>_decoder_<date>.log; false: disabled; String: append path).
+      # EOF drains the bounded queue and returns without waiting for ENTER.
+      # Native/IQ demods may implement #flush(&emit), called once at clean EOF
+      # after sample validation, never as cancellation/error cleanup.
+      # Audio :rate (IQ audio :sample_rate) declares the demod's configured
+      # timing. Source descriptors with differing :rate_hz are rejected;
+      # no implicit resampling or demodulator reconfiguration is performed.
+      # Stop/deadline/ENTER cancel pending work; errors propagate after cleanup.
+      # Return: reason, bytes_processed, chunks_processed, frames, queue_size,
+      # queue_high_water (observed), backpressure_waits. These describe this
+      # handoff, not RF/UDP packet loss or guaranteed hardware realtime speed.
+      # Caller-supplied input IOs are closed; output IO is flushed, not closed.
       module Base
         # Supported Method Parameters::
         # PWN::SDR::Decoder::Base.run_native(
@@ -49,70 +62,17 @@ module PWN
         # )
 
         public_class_method def self.run_native(opts = {})
-          freq_obj = opts[:freq_obj]
-          protocol = opts[:protocol] || 'SIGNAL'
-          demod    = opts[:demod]
-          rate     = (opts[:rate] || 48_000).to_i
-
-          raise 'ERROR: :freq_obj is required' unless freq_obj.is_a?(Hash)
+          demod = opts[:demod]
+          raise 'ERROR: :freq_obj is required' unless opts[:freq_obj].is_a?(Hash)
           raise 'ERROR: :demod must respond to #feed' unless demod.respond_to?(:feed)
 
-          udp_ip   = freq_obj[:udp_ip]   || '127.0.0.1'
-          udp_port = freq_obj[:udp_port] || 7355
-          log_obj  = strip_freq_obj(freq_obj: freq_obj)
-
-          puts JSON.pretty_generate(log_obj)
-          puts "\n*** #{protocol} Decoder (ruby-native) ***"
-          puts 'Press [ENTER] to continue to next frequency...'
-
-          spinner, max_len = build_spinner(
-            banner: "INFO: Decoding #{protocol} on udp://#{udp_ip}:#{udp_port} @ #{rate} Hz (native)"
-          )
-          log_file = log_path(protocol: protocol)
-
-          udp_listener = PWN::SDR::GQRX.listen_udp(udp_ip: udp_ip, udp_port: udp_port)
-          audio_q      = Queue.new
-          current_line = 'Waiting for data frames...'
-
-          receiver_thread = Thread.new do
-            loop do
-              data, = udp_listener.recv(4096)
-              audio_q.push(data) if data.to_s.bytesize.positive?
-            end
-          rescue IOError, Errno::ECONNRESET, Errno::EBADF
-            nil
-          end
-
-          decoder_thread = Thread.new do
-            emit = proc do |msg|
-              next unless msg.is_a?(Hash)
-
-              final = log_obj.merge(decoded_at: Time.now.strftime('%Y-%m-%d %H:%M:%S%z')).merge(msg)
-              spinner.stop
-              puts JSON.pretty_generate(final)
-              spinner.auto_spin
-              File.open(log_file, 'a') { |f| f.puts("#{JSON.generate(final)},") }
-              disp = (msg[:summary] || msg[:raw] || msg.values.compact.first).to_s
-              current_line = disp[0...max_len]
-            end
-            loop do
-              raw = audio_q.pop
-              samples = PWN::SDR::Decoder::DSP.unpack_s16le(data: raw)
+          run_audio(opts) do |samples, emit|
+            if samples.nil?
+              demod.flush(&emit) if demod.respond_to?(:flush)
+            else
               demod.feed(samples, &emit)
             end
-          rescue StandardError => e
-            current_line = "demod error: #{e.class}: #{e.message}"
           end
-
-          wait_for_enter(spinner: spinner, title_ref: -> { current_line })
-          spinner.success('Decoding stopped')
-        rescue StandardError => e
-          spinner&.error("Decoding failed: #{e.message}") if defined?(spinner)
-          raise
-        ensure
-          [receiver_thread, decoder_thread].compact.each { |t| t.kill if t&.alive? }
-          PWN::SDR::GQRX.disconnect_udp(udp_listener: udp_listener) if udp_listener
-          spinner&.stop if defined?(spinner)
         end
 
         # Supported Method Parameters::
@@ -125,96 +85,105 @@ module PWN
         # )
 
         public_class_method def self.run_detector(opts = {})
-          freq_obj  = opts[:freq_obj]
-          protocol  = opts[:protocol] || 'SIGNAL'
-          note      = opts[:note]
+          protocol = opts[:protocol] || 'SIGNAL'
           threshold = (opts[:threshold] || 8.0).to_f
-          describe  = opts[:describe]
+          rate = (opts[:rate] || 48_000).to_f
+          raise 'ERROR: :freq_obj is required' unless opts[:freq_obj].is_a?(Hash)
+          raise ArgumentError, ':rate must be positive' unless rate.positive?
 
-          raise 'ERROR: :freq_obj is required' unless freq_obj.is_a?(Hash)
+          floor = nil
+          burst_start = nil
+          peak = -200.0
+          count = 0
+          elapsed = 0.0
+          run_audio(opts.merge(allow_level: true)) do |samples, emit|
+            level = samples.is_a?(Numeric) ? samples : samples && PWN::SDR::Decoder::DSP.rms_dbfs(samples: samples)
+            floor = floor.nil? ? level : (floor * 0.98) + (level * 0.02) if level
+            if level && level - floor >= threshold
+              burst_start ||= elapsed
+              peak = [peak, level].max
+            elsif burst_start
+              count += 1
+              duration_ms = ((elapsed - burst_start) * 1000).round
+              msg = { protocol: protocol, event: 'burst', burst_no: count,
+                      peak_dbfs: peak.round(1), floor_dbfs: floor.round(1),
+                      delta_db: (peak - floor).round(1), duration_ms: duration_ms,
+                      summary: "#{protocol} burst ##{count} peak=#{peak.round(1)} dBFS duration=#{duration_ms} ms" }
+              msg.merge!(opts[:describe].call(msg)) if opts[:describe].respond_to?(:call)
+              emit.call(msg)
+              burst_start = nil
+              peak = -200.0
+            end
+            elapsed += samples.is_a?(Numeric) ? 0.1 : samples.length / rate if samples
+          end
+        end
 
-          gqrx_sock = freq_obj[:gqrx_sock]
-          udp_ip    = freq_obj[:udp_ip]   || '127.0.0.1'
-          udp_port  = freq_obj[:udp_port] || 7355
-          log_obj   = strip_freq_obj(freq_obj: freq_obj)
+        # Sources are owned for the duration of a run and closed on every exit.
+        # Audio fixtures are raw s16le mono; IQ fixtures use resolve_iq_source.
+        private_class_method def self.run_audio(opts = {})
+          freq_obj = opts[:freq_obj]
+          source = opts[:source]
+          bytes = Integer(opts[:chunk_bytes] || 4096)
+          raise ArgumentError, ':chunk_bytes must be positive' unless bytes.positive?
 
-          puts JSON.pretty_generate(log_obj)
-          puts "\n*** #{protocol} Signal Detector (ruby-native) ***"
-          puts "[i] #{note}" if note
-          puts 'Press [ENTER] to continue to next frequency...'
+          io = if opts[:file]
+                 File.open(opts[:file], 'rb')
+               elsif source.is_a?(Hash)
+                 source[:io] || File.open(source.fetch(:path), 'rb')
+               elsif source.respond_to?(:read) || source.respond_to?(:recv)
+                 source
+               else
+                 begin
+                   PWN::SDR::GQRX.listen_udp(udp_ip: freq_obj[:udp_ip] || '127.0.0.1', udp_port: freq_obj[:udp_port] || 7355)
+                 rescue SystemCallError
+                   raise unless opts[:allow_level] && freq_obj[:gqrx_sock]
 
-          spinner, max_len = build_spinner(
-            banner: "INFO: Characterizing #{protocol} activity on #{log_obj[:freq] || "udp://#{udp_ip}:#{udp_port}"} (native)"
-          )
-          log_file = log_path(protocol: protocol)
+                   nil
+                 end
+               end
+          # #feed has no rate argument: callers must configure their demodulator
+          # with :rate, rather than silently changing timing from the descriptor.
+          rate = Float(opts[:rate] || 48_000)
+          actual_rate = source.is_a?(Hash) && !opts[:file] ? Float(source.fetch(:rate_hz, rate)) : rate
+          raise ArgumentError, ':rate must be finite and positive' unless rate.finite? && rate.positive?
+          raise ArgumentError, "Audio source rate #{actual_rate} differs from configured rate #{rate}" unless actual_rate == rate
 
-          udp_listener = begin
-            PWN::SDR::GQRX.listen_udp(udp_ip: udp_ip, udp_port: udp_port)
-          rescue StandardError
+          reader = lambda do
+            if io.nil?
+              sleep 0.1
+              Float(PWN::SDR::GQRX.cmd(gqrx_sock: freq_obj[:gqrx_sock], cmd: 'l STRENGTH'))
+            elsif io.is_a?(UDPSocket)
+              # Read the complete datagram, never truncate it to chunk_bytes.
+              io.recv(65_535)
+            elsif io.respond_to?(:readpartial)
+              io.readpartial(bytes)
+            else
+              data = io.read(bytes)
+              data.to_s.empty? ? nil : data
+            end
+          rescue EOFError
             nil
           end
-
-          current_line = 'Establishing noise floor...'
-          floor    = nil
-          in_burst = false
-          burst_t0 = nil
-          peak     = -200.0
-          burst_n  = 0
-
-          detector_thread = Thread.new do
-            emit = proc do |msg|
-              final = log_obj.merge(decoded_at: Time.now.strftime('%Y-%m-%d %H:%M:%S%z')).merge(msg)
-              spinner.stop
-              puts JSON.pretty_generate(final)
-              spinner.auto_spin
-              File.open(log_file, 'a') { |f| f.puts("#{JSON.generate(final)},") }
-              current_line = (msg[:summary] || '').to_s[0...max_len]
+          carry = ''.b
+          run_stream(opts.merge(log_obj: strip_freq_obj(freq_obj: freq_obj), reader: reader)) do |raw, emit|
+            if raw.is_a?(Numeric)
+              yield raw, emit
+              next
             end
+            if raw.nil?
+              raise IOError, 'Incomplete audio sample at EOF' unless carry.empty?
 
-            loop do
-              lvl = read_level(gqrx_sock: gqrx_sock, udp_listener: udp_listener)
-              if lvl
-                floor = floor.nil? ? lvl : ((floor * 0.98) + (lvl * 0.02))
-                delta = lvl - floor
-                if delta >= threshold
-                  unless in_burst
-                    in_burst = true
-                    burst_t0 = Time.now
-                    peak = lvl
-                  end
-                  peak = lvl if lvl > peak
-                  current_line = format('%<p>s BURST %<l>+.1f dBFS (Δ%<d>+.1f, floor %<f>+.1f)', p: protocol, l: lvl, d: delta, f: floor)[0...max_len]
-                elsif in_burst
-                  in_burst = false
-                  burst_n += 1
-                  dur_ms = ((Time.now - burst_t0) * 1000).round
-                  msg = {
-                    protocol: protocol, event: 'burst', burst_no: burst_n,
-                    peak_dbfs: peak.round(1), floor_dbfs: floor.round(1),
-                    delta_db: (peak - floor).round(1), duration_ms: dur_ms,
-                    summary: format('%<p>s burst #%<n>d peak=%<pk>+.1f dBFS Δ=%<d>.1f dB dur=%<ms>d ms', p: protocol, n: burst_n, pk: peak, d: peak - floor, ms: dur_ms)
-                  }
-                  msg.merge!(describe.call(msg)) if describe.respond_to?(:call)
-                  emit.call(msg)
-                else
-                  current_line = format('%<p>s idle %<l>+.1f dBFS (floor %<f>+.1f, Δ%<d>+.1f)', p: protocol, l: lvl, f: floor, d: delta)[0...max_len]
-                end
-              end
-              sleep(udp_listener ? 0 : 0.1)
+              yield nil, emit
+              next
             end
-          rescue StandardError => e
-            current_line = "detector error: #{e.class}: #{e.message}"
+            carry << raw
+            length = carry.bytesize / 2 * 2
+            next if length.zero?
+
+            yield PWN::SDR::Decoder::DSP.unpack_s16le(data: carry.slice!(0, length)), emit
           end
-
-          wait_for_enter(spinner: spinner, title_ref: -> { current_line })
-          spinner.success('Detector stopped')
-        rescue StandardError => e
-          spinner&.error("Detector failed: #{e.message}") if defined?(spinner)
-          raise
         ensure
-          detector_thread&.kill if defined?(detector_thread) && detector_thread&.alive?
-          PWN::SDR::GQRX.disconnect_udp(udp_listener: udp_listener) if udp_listener
-          spinner&.stop if defined?(spinner)
+          io&.close unless io&.closed?
         end
 
         # Supported Method Parameters::
@@ -246,68 +215,11 @@ module PWN
         end
 
         # Supported Method Parameters::
-        # spinner, max_len = PWN::SDR::Decoder::Base.build_spinner(banner: '...')
-
-        private_class_method def self.build_spinner(opts = {})
-          banner = opts[:banner].to_s
-          spinner = TTY::Spinner.new('[:spinner] :status', format: :arrow_pulse, clear: true, hide_cursor: true)
-          overhead = 12
-          max_len  = [TTY::Screen.width - overhead, 50].max
-          banner   = banner[0...max_len] if banner.length > max_len
-          spinner.update(status: banner)
-          spinner.auto_spin
-          [spinner, max_len]
-        end
-
-        # Supported Method Parameters::
         # path = PWN::SDR::Decoder::Base.log_path(protocol: 'POCSAG')
 
         private_class_method def self.log_path(opts = {})
           protocol = opts[:protocol].to_s
           "/tmp/#{protocol.downcase.gsub(/[^a-z0-9]+/, '_')}_decoder_#{Time.now.strftime('%Y%m%d')}.log"
-        end
-
-        # Supported Method Parameters::
-        # lvl = PWN::SDR::Decoder::Base.read_level(gqrx_sock:, udp_listener:)
-
-        private_class_method def self.read_level(opts = {})
-          gqrx_sock    = opts[:gqrx_sock]
-          udp_listener = opts[:udp_listener]
-          if udp_listener
-            begin
-              data, = udp_listener.recv(4096)
-              return PWN::SDR::Decoder::DSP.rms_dbfs(samples: PWN::SDR::Decoder::DSP.unpack_s16le(data: data)) if data.to_s.bytesize.positive?
-            rescue IOError, Errno::ECONNRESET, Errno::EBADF
-              nil
-            end
-          end
-          return nil unless gqrx_sock
-
-          PWN::SDR::GQRX.cmd(gqrx_sock: gqrx_sock, cmd: 'l STRENGTH').to_f
-        rescue StandardError
-          nil
-        end
-
-        # Supported Method Parameters::
-        # PWN::SDR::Decoder::Base.wait_for_enter(spinner:, title_ref:)
-
-        private_class_method def self.wait_for_enter(opts = {})
-          spinner   = opts[:spinner]
-          title_ref = opts[:title_ref]
-          loop do
-            spinner.update(status: title_ref.call)
-            next unless $stdin.wait_readable(0)
-
-            begin
-              char = $stdin.read_nonblock(1)
-              next unless char == "\n"
-
-              puts "\n[!] ENTER pressed → stopping..."
-              break
-            rescue IO::WaitReadable, EOFError
-              nil
-            end
-          end
         end
 
         # Supported Method Parameters::
@@ -321,16 +233,29 @@ module PWN
 
         public_class_method def self.resolve_iq_source(opts = {})
           freq_obj = opts[:freq_obj] || {}
-          want     = (opts[:source] || freq_obj[:iq_source] || :auto).to_s.downcase.to_sym
+          supplied = opts[:source]
+          return supplied if supplied.is_a?(Hash)
+          if supplied.respond_to?(:readpartial) || supplied.respond_to?(:read)
+            return { kind: :io, io: supplied, format: opts[:iq_format] || :cu8,
+                     rate_hz: opts[:sample_rate] || 2_048_000 }
+          end
+          want     = (supplied || freq_obj[:iq_source] || :auto).to_s.downcase.to_sym
           rate     = (opts[:sample_rate] || freq_obj[:iq_rate] || 2_048_000).to_i
           file     = opts[:file] || freq_obj[:iq_file]
-          freq_hz  = begin
+          if want == :file || file
+            raise ArgumentError, ':file is required for a file source' if file.to_s.empty?
+            raise Errno::ENOENT, file.to_s unless File.file?(file.to_s)
+
+            want = :file if want == :auto
+          end
+          freq_hz = begin
             PWN::SDR.hz_to_i(freq: freq_obj[:freq])
           rescue StandardError
             freq_obj[:freq].to_i
           end
 
           try = lambda do |kind|
+            owned = nil
             case kind
             when :file
               return nil if file.to_s.empty? || !File.file?(file.to_s)
@@ -343,6 +268,7 @@ module PWN
               return nil if PWN::FFI::RTLSdr.list_devices.empty?
 
               dev = PWN::FFI::RTLSdr.open(index: (opts[:index] || 0).to_i)
+              owned = { kind: kind, device: dev }
               PWN::FFI::RTLSdr.configure(
                 device: dev, freq_hz: freq_hz, rate_hz: rate,
                 gain_db: opts[:gain_db] || freq_obj[:gain_db],
@@ -353,6 +279,7 @@ module PWN
               return nil unless PWN::FFI.available?(mod: :HackRF)
 
               dev = PWN::FFI::HackRF.open(serial: opts[:serial])
+              owned = { kind: kind, device: dev }
               PWN::FFI::HackRF.configure(
                 device: dev, freq_hz: freq_hz, rate_hz: rate,
                 lna_gain: opts[:lna_gain] || 16,
@@ -365,6 +292,7 @@ module PWN
               return nil unless PWN::FFI.available?(mod: :AdalmPluto)
 
               ctx = PWN::FFI::AdalmPluto.open(uri: opts[:uri] || freq_obj[:pluto_uri])
+              owned = { kind: :adalm_pluto, context: ctx }
               PWN::FFI::AdalmPluto.configure(
                 context: ctx, freq_hz: freq_hz, rate_hz: rate,
                 gain_db: opts[:gain_db] || freq_obj[:gain_db]
@@ -382,6 +310,7 @@ module PWN
                 args: opts[:soapy_args] || freq_obj[:soapy_args],
                 channel: opts[:channel] || 0
               )
+              owned = { kind: kind, handle: h }
               PWN::FFI::SoapySDR.configure(
                 handle: h, freq_hz: freq_hz, rate_hz: rate,
                 gain_db: opts[:gain_db] || freq_obj[:gain_db]
@@ -393,6 +322,9 @@ module PWN
               { kind: :soapy, handle: h, rate_hz: rate, freq_hz: freq_hz, format: :cs16, streaming: true }
             end
           rescue StandardError
+            close_iq_source(source: owned) if owned
+            raise unless want == :auto
+
             nil
           end
 
@@ -419,21 +351,36 @@ module PWN
           bytes = (opts[:bytes] || 262_144).to_i
           raise 'ERROR: :source required' unless src.is_a?(Hash)
 
-          case src[:kind]
-          when :file
-            src[:io] ||= File.open(src[:path], 'rb')
-            data = src[:io].read(bytes)
-            data.to_s.empty? ? nil : data
-          when :rtlsdr
-            PWN::FFI::RTLSdr.read_sync(device: src[:device], bytes: bytes)
-          when :adalm_pluto
-            PWN::FFI::AdalmPluto.read_sync(handle: src[:handle])
-          when :hackrf
-            PWN::FFI::HackRF.read_sync(handle: src[:handle])
-          when :soapy
-            PWN::FFI::SoapySDR.read_sync(handle: src[:handle])
+          raise IOError, 'I/Q continuity lost: source reports dropped samples' if iq_stream_status(source: src)[:discontinuity]
+
+          data = case src[:kind]
+                 when :file, :io
+                   src[:io] ||= File.open(src[:path], 'rb')
+                   data = src[:io].respond_to?(:readpartial) ? src[:io].readpartial(bytes) : src[:io].read(bytes)
+                   data.to_s.empty? ? nil : data
+                 when :rtlsdr
+                   (src[:read_mutex] ||= Mutex.new).synchronize do
+                     PWN::FFI::RTLSdr.read_sync(device: src[:device], bytes: bytes)
+                   end
+                 when :adalm_pluto
+                   PWN::FFI::AdalmPluto.read_sync(handle: src[:handle])
+                 when :hackrf
+                   PWN::FFI::HackRF.read_sync(handle: src[:handle])
+                 when :soapy
+                   (src[:read_mutex] ||= Mutex.new).synchronize do
+                     PWN::FFI::SoapySDR.read_sync(handle: src[:handle], timeout_us: 100_000)
+                   end
+                 else
+                   raise ArgumentError, "Unknown I/Q source: #{src[:kind]}"
+                 end
+          raise IOError, 'I/Q continuity lost: source reports dropped samples' if iq_stream_status(source: src)[:discontinuity]
+
+          if data.nil? && %i[rtlsdr hackrf adalm_pluto soapy].include?(src[:kind]) && !src.dig(:handle, :stopped)
+            sleep 0.005
+            return ''.b # A hardware timeout is not capture EOF.
           end
-        rescue StandardError
+          data
+        rescue EOFError
           nil
         end
 
@@ -449,8 +396,10 @@ module PWN
           when :cs8
             # HackRF signed 8-bit interleaved I/Q
             data.unpack('c*').map { |v| v / 128.0 }
-          else # :cu8 / unknown
+          when :cu8
             PWN::SDR::Decoder::DSP.unpack_cu8(data: data)
+          else
+            raise ArgumentError, "Unsupported IQ format: #{src[:format]}"
           end
         end
 
@@ -462,10 +411,12 @@ module PWN
           return unless src.is_a?(Hash)
 
           case src[:kind]
-          when :file
-            src[:io]&.close
+          when :file, :io
+            src[:io]&.close unless src[:io]&.closed?
           when :rtlsdr
-            PWN::FFI::RTLSdr.close(device: src[:device]) if src[:device]
+            (src[:read_mutex] ||= Mutex.new).synchronize do
+              PWN::FFI::RTLSdr.close(device: src[:device]) if src[:device]
+            end
           when :adalm_pluto
             PWN::FFI::AdalmPluto.stop_rx(handle: src[:handle]) if src[:handle]
             PWN::FFI::AdalmPluto.close(context: src[:context]) if src[:context]
@@ -473,7 +424,9 @@ module PWN
             PWN::FFI::HackRF.stop_rx(handle: src[:handle]) if src[:handle]
             PWN::FFI::HackRF.close(device: src[:device]) if src[:device]
           when :soapy
-            PWN::FFI::SoapySDR.close(handle: src[:handle]) if src[:handle]
+            (src[:read_mutex] ||= Mutex.new).synchronize do
+              PWN::FFI::SoapySDR.close(handle: src[:handle]) if src[:handle]
+            end
           end
         rescue StandardError
           nil
@@ -491,7 +444,7 @@ module PWN
         #   source:      'optional - :auto|:rtlsdr|:hackrf|:adalm_pluto|:soapy|:file',
         #   file:        'optional - path to capture',
         #   fm_demod:    'optional - FM-demod I/Q→audio then #feed (default false)',
-        #   chunk_bytes: 'optional - bytes per read (default 262144)',
+        #   chunk_bytes: 'optional - bytes per read (default 16384)',
         #   fallback:    'optional - :detector|:raise|:silent (default :detector)',
         #   note:        'optional - shown once when falling back',
         #   describe:    'optional - Proc for detector fallback'
@@ -503,22 +456,13 @@ module PWN
           demod    = opts[:demod]
           rate     = (opts[:sample_rate] || 2_048_000).to_i
           fm_demod = opts[:fm_demod] ? true : false
-          chunk_b  = (opts[:chunk_bytes] || 262_144).to_i
+          chunk_b  = (opts[:chunk_bytes] || 16_384).to_i
           fallback = (opts[:fallback] || :detector).to_sym
 
           raise 'ERROR: :freq_obj is required' unless freq_obj.is_a?(Hash)
           raise 'ERROR: :demod required' if demod.nil?
 
-          src = resolve_iq_source(
-            freq_obj: freq_obj,
-            source: opts[:source],
-            sample_rate: rate,
-            file: opts[:file],
-            gain_db: opts[:gain_db],
-            uri: opts[:uri],
-            index: opts[:index],
-            chunk_samples: chunk_b / 4
-          )
+          src = resolve_iq_source(opts.merge(sample_rate: rate, chunk_samples: opts[:chunk_samples] || (chunk_b / 4)))
 
           unless src && src[:streaming] != false
             case fallback
@@ -527,94 +471,189 @@ module PWN
             when :silent
               return nil
             else
-              return run_detector(
-                freq_obj: freq_obj,
-                protocol: protocol,
-                note: opts[:note] || "No I/Q source — falling back to energy detector. Plug in RTL-SDR/HackRF/Pluto/Soapy or pass iq_file: for true-air decode of #{protocol}.",
-                threshold: opts[:threshold],
-                describe: opts[:describe]
-              )
+              return run_detector(opts.merge(source: nil, file: nil,
+                                             note: opts[:note] || "No I/Q source — energy detector only for #{protocol}."))
             end
           end
 
-          rate = src[:rate_hz] if src[:rate_hz]
+          # Audio demods have fixed timing and cannot consume feed_iq's rate
+          # keyword. No implicit resampling or private demod state mutation.
+          actual_rate = src[:rate_hz] || rate
+          # Rates are configuration values, not computed DSP measurements.
+          raise ArgumentError, "Audio source rate #{actual_rate} differs from configured sample_rate #{rate}" if (fm_demod || !demod.respond_to?(:feed_iq)) && Float(actual_rate) != rate # rubocop:disable Lint/FloatComparison
+
+          rate = actual_rate
           log_obj = strip_freq_obj(freq_obj: freq_obj).merge(
             iq_source: src[:kind], iq_rate: rate, iq_format: src[:format]
           )
 
-          puts JSON.pretty_generate(log_obj)
-          puts "\n*** #{protocol} Decoder (true-air I/Q via #{src[:kind]}) ***"
-          puts 'Press [ENTER] to continue to next frequency...'
+          raise ArgumentError, ':chunk_bytes must be positive' unless chunk_b.positive?
+          raise ArgumentError, 'demod must respond to #feed_iq or #feed' unless demod.respond_to?(:feed_iq) || demod.respond_to?(:feed)
 
-          spinner, max_len = build_spinner(
-            banner: "INFO: Air-decoding #{protocol} @ #{rate} Hz from #{src[:kind]}"
-          )
-          log_file = log_path(protocol: protocol)
-          current_line = "Streaming I/Q from #{src[:kind]}..."
-          iq_q = Queue.new
-          stop = false
+          carry = ''.b
+          previous = nil
+          width = src[:format].to_s == 'cs16' ? 4 : 2
+          cancel_read = -> { PWN::FFI::AdalmPluto.stop_rx(handle: src[:handle]) } if src[:kind] == :adalm_pluto
+          result = run_stream(opts.merge(log_obj: log_obj, cancel_read: cancel_read,
+                                         reader: -> { read_iq_chunk(source: src, bytes: chunk_b) })) do |raw, emit|
+            raise IOError, 'I/Q continuity lost: source reports dropped samples' if iq_stream_status(source: src)[:discontinuity]
 
-          reader_thread = Thread.new do
-            loop do
-              break if stop
+            if raw.nil?
+              raise IOError, "Incomplete I/Q sample at EOF (#{carry.bytesize} bytes)" unless carry.empty?
 
-              raw = read_iq_chunk(source: src, bytes: chunk_b)
-              break if raw.nil?
-
-              iq_q.push(raw) if raw.bytesize.positive?
+              demod.flush(&emit) if demod.respond_to?(:flush)
+              next
             end
-          rescue StandardError => e
-            current_line = "iq-reader: #{e.class}: #{e.message}"
-          ensure
-            iq_q.push(:eof)
+            carry << raw
+            length = carry.bytesize / width * width
+            next if length.zero?
+
+            iq = unpack_iq(source: src, data: carry.slice!(0, length))
+            if fm_demod && demod.respond_to?(:feed)
+              continuous = previous ? previous + iq : iq
+              previous = iq.last(2)
+              demod.feed(PWN::SDR::Decoder::DSP.fm_demod_iq(iq: continuous), &emit)
+            elsif demod.respond_to?(:feed_iq)
+              demod.feed_iq(iq, rate: rate, &emit)
+            else
+              demod.feed(PWN::SDR::Decoder::DSP.mag_sq(iq: iq).map { |v| Math.sqrt(v) }, &emit)
+            end
           end
+          status = iq_stream_status(source: src)
+          raise IOError, 'I/Q continuity lost: source reports dropped samples' if status[:discontinuity]
 
-          decoder_thread = Thread.new do
-            emit = proc do |msg|
-              next unless msg.is_a?(Hash)
-
-              final = log_obj.merge(decoded_at: Time.now.strftime('%Y-%m-%d %H:%M:%S%z')).merge(msg)
-              spinner.stop
-              puts JSON.pretty_generate(final)
-              spinner.auto_spin
-              File.open(log_file, 'a') { |f| f.puts("#{JSON.generate(final)},") }
-              disp = (msg[:summary] || msg[:raw] || msg.values.compact.first).to_s
-              current_line = disp[0...max_len]
-            end
-
-            loop do
-              raw = iq_q.pop
-              break if raw == :eof || stop
-              next unless raw.is_a?(String)
-
-              iq = unpack_iq(source: src, data: raw)
-              if fm_demod && demod.respond_to?(:feed)
-                audio = PWN::SDR::Decoder::DSP.fm_demod_iq(iq: iq)
-                demod.feed(audio, &emit)
-              elsif demod.respond_to?(:feed_iq)
-                demod.feed_iq(iq, rate: rate, &emit)
-              elsif demod.respond_to?(:feed)
-                # magnitude envelope as last-resort real signal
-                demod.feed(PWN::SDR::Decoder::DSP.mag_sq(iq: iq).map { |v| Math.sqrt(v) }, &emit)
-              else
-                raise 'ERROR: demod must respond to #feed_iq or #feed'
-              end
-            end
-          rescue StandardError => e
-            current_line = "iq-demod: #{e.class}: #{e.message}"
-          end
-
-          wait_for_enter(spinner: spinner, title_ref: -> { current_line })
-          stop = true
-          spinner.success('Air-decode stopped')
+          result.merge(status).merge(capture_complete: result[:reason] == :eof)
         rescue StandardError => e
-          spinner&.error("Air-decode failed: #{e.message}") if defined?(spinner)
+          status = iq_stream_status(source: src).merge(reason: :error, capture_complete: false,
+                                                       error_class: e.class.name, error_message: e.message).freeze
+          e.define_singleton_method(:stream_stats) { status }
           raise
         ensure
-          stop = true if defined?(stop)
-          [reader_thread, decoder_thread].compact.each { |th| th.kill if th&.alive? }
           close_iq_source(source: src) if defined?(src) && src
-          spinner&.stop if defined?(spinner)
+        end
+
+        # Unknown device telemetry stays nil, never a fabricated zero loss count.
+        private_class_method def self.iq_stream_status(opts = {})
+          source = opts[:source]
+          handle = source.is_a?(Hash) && source[:handle].is_a?(Hash) ? source[:handle] : {}
+          overruns = handle[:overruns]
+          dropped = handle[:dropped_bytes]
+          loss = (overruns && overruns.positive?) || (dropped && dropped.positive?)
+          { overruns: overruns, dropped_bytes: dropped,
+            discontinuity: if loss
+                             true
+                           else
+                             (overruns.nil? && dropped.nil? ? nil : false)
+                           end }
+        end
+
+        # A bounded lossless handoff; one consumer serializes demodulation,
+        # rendering, logging and callbacks. The supervisor remains responsive
+        # even while a read, queue push, demodulator or callback is blocked.
+        private_class_method def self.run_stream(opts = {})
+          reader = opts[:reader]
+          output = opts.fetch(:output, $stdout)
+          callback = opts[:on_frame]
+          stop = opts[:stop]
+          size = Integer(opts.fetch(:queue_size, 8))
+          raise ArgumentError, ':queue_size must be positive' unless size.positive?
+          raise ArgumentError, ':on_frame must be callable' if callback && !callback.respond_to?(:call)
+          raise ArgumentError, ':stop must be callable' if stop && !stop.respond_to?(:call)
+
+          duration = opts[:duration] && Float(opts[:duration])
+          raise ArgumentError, ':duration must be finite and nonnegative' if duration && (!duration.finite? || duration.negative?)
+
+          deadline = duration && (Process.clock_gettime(Process::CLOCK_MONOTONIC) + duration)
+          log_file = opts[:log_file]
+          log_file = log_path(protocol: opts[:protocol] || 'SIGNAL') if log_file.nil?
+          # Run-owned handle: closed in ensure after both workers terminate.
+          log = File.open(log_file, 'a') unless log_file == false # rubocop:disable Style/FileOpen
+          queue = SizedQueue.new(size)
+          stats = { reason: :eof, bytes_processed: 0, chunks_processed: 0, frames: 0,
+                    queue_high_water: 0, backpressure_waits: 0, queue_size: size }
+          emit = proc do |msg|
+            next unless msg.is_a?(Hash)
+
+            final = opts[:log_obj].merge(decoded_at: Time.now.strftime('%Y-%m-%d %H:%M:%S%z')).merge(msg)
+            line = JSON.generate(final)
+            output.puts(line)
+            output.flush if output.respond_to?(:flush)
+            log&.puts(line)
+            log&.flush
+            callback&.call(final)
+            stats[:frames] += 1
+          end
+          producer = Thread.new do
+            Thread.current.report_on_exception = false
+            loop do
+              raw = reader.call
+              break if raw.nil?
+              next if raw.is_a?(String) && raw.empty?
+
+              begin
+                queue.push(raw, true)
+              rescue ThreadError
+                stats[:backpressure_waits] += 1
+                queue.push(raw)
+              end
+              stats[:queue_high_water] = [stats[:queue_high_water], queue.length].max
+            end
+          ensure
+            queue.close
+          end
+          consumer = Thread.new do
+            Thread.current.report_on_exception = false
+            while (raw = queue.pop)
+              yield raw, emit
+              stats[:bytes_processed] += raw.bytesize if raw.respond_to?(:bytesize)
+              stats[:chunks_processed] += 1
+            end
+            # Queue closure also happens on reader errors and cancellation.
+            # Join the producer before treating a drained queue as clean EOF.
+            producer.value
+            yield nil, emit if stats[:reason] == :eof
+          end
+          loop do
+            producer.value unless producer.alive?
+            unless consumer.alive?
+              consumer.value
+              break
+            end
+            if stop&.call
+              stats[:reason] = :stop
+              break
+            end
+            if deadline && Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+              stats[:reason] = :duration
+              break
+            end
+            if opts.fetch(:interactive, true) && $stdin.respond_to?(:read_nonblock)
+              begin
+                if $stdin.read_nonblock(1, exception: false) == "\n"
+                  stats[:reason] = :enter
+                  break
+                end
+              rescue IOError
+                # A closed/non-interactive stdin is not a stream EOF.
+                nil
+              end
+            end
+            sleep 0.005
+          end
+          stats
+        ensure
+          queue&.close
+          begin
+            opts[:cancel_read]&.call
+          ensure
+            [producer, consumer].compact.each do |thread|
+              thread.kill if thread.alive?
+              thread.join(1)
+            rescue StandardError
+              nil
+            end
+            log&.close
+          end
         end
 
         # Author(s):: 0day Inc. <support@0dayinc.com>
@@ -627,6 +666,24 @@ module PWN
 
         public_class_method def self.help
           puts "USAGE:
+            # Common options for run_native, run_detector and run_iq:
+            # on_frame: callable receiving each metadata-enriched Hash after output/log flush
+            # output: IO (default $stdout), written as JSONL; not closed by the runner
+            # interactive: true by default; ENTER cancels, stdin EOF does not cancel
+            # duration: optional finite nonnegative seconds measured with a monotonic clock
+            # stop: optional quick, nonblocking callable; truthy cancels pending work
+            # queue_size: positive Integer (default 8); full queue blocks the producer
+            # log_file: nil uses /tmp/<protocol>_decoder_<date>.log, false disables, path appends JSONL
+            # source: input IO or source handle; file: raw fixture path; inputs are closed on exit
+            # Audio fixtures: s16le mono; IQ: cu8 (default), cs8 or cs16 via iq_format
+            # EOF drains and exits automatically; worker errors propagate after cleanup
+            # Returns a Hash: reason (:eof/:stop/:duration/:enter), bytes_processed,
+            # chunks_processed, frames, queue_size, queue_high_water, backpressure_waits
+            # IQ also returns overruns/dropped_bytes (nil if unknown), discontinuity,
+            # capture_complete (true only on clean EOF). Loss aborts; never bridge a gap.
+            # IQ exceptions expose stream_stats with telemetry and original error details.
+            # Queue metrics do not measure RF/UDP packet loss or guarantee hardware throughput.
+
             # Run run native and return its result
             #{self}.run_native(
               freq_obj: 'required - freq_obj Hash from PWN::SDR::GQRX.init_freq',
@@ -696,7 +753,7 @@ module PWN
               source: 'optional - :auto|:rtlsdr|:hackrf|:adalm_pluto|:soapy|:file',
               file: 'optional - path to capture',
               fm_demod: 'optional - FM-demod I/Q→audio then #feed (default false)',
-              chunk_bytes: 'optional - bytes per read (default 262144)',
+              chunk_bytes: 'optional - bytes per read (default 16384; audio runners default 4096)',
               fallback: 'optional - :detector|:raise|:silent (default :detector)',
               note: 'optional - shown once when falling back',
               describe: 'optional - Proc for detector fallback',

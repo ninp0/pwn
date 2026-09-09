@@ -12,7 +12,7 @@ metadata:
 
 # PWN::SDR::Decoder::ADSB
 
-ADS-B (1090 MHz Mode-S / 978 MHz UAT) true-air decoder. Prefer PWN::FFI::{RTLSdr,AdalmPluto,HackRF} at ≥2 Msps and run a pure-Ruby Mode-S preamble correlator + 112-bit PPM slicer over magnitude samples. Falls back to Base.run_detector energy mode when no I/Q source is available. Offline SBS-1 CSV → .parse_line.
+ADS-B 1090 MHz Mode-S long-frame decoder. The UAT band selector is retained for compatibility, but UAT demodulation is not implemented. Prefer PWN::FFI::{RTLSdr,AdalmPluto,HackRF} at exactly 2 Msps and run a pure-Ruby Mode-S preamble correlator + 112-bit PPM slicer over magnitude samples. Missing I/Q raises; use .detect for energy only. Offline SBS-1 CSV → .parse_line.
 
 ## When to use
 
@@ -36,8 +36,11 @@ PWN::SDR::Decoder::ADSB.crc24(opts)
 - `crc24`
 - `crc_ok`
 - `decode_modes`
+- `surface_position`
+- `airborne_position`
 - `ais_char`
 - `modes_altitude`
+- `detect`
 - `decode`
 - `parse_line`
 - `authors`

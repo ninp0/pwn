@@ -1,0 +1,20 @@
+# Run: bundle exec ruby -Ilib spec/fixtures/sdr/lora/benchmark.txt
+require 'pwn'
+require 'json'
+require 'zlib'
+root = File.dirname(__FILE__)
+results = JSON.parse(File.read("#{root}/modes.json"), symbolize_names: true).map do |v|
+  iq = Zlib::GzipReader.open("#{root}/#{v[:file]}", &:read).unpack('e*')
+  options = v.slice(:sf, :bw, :implicit_header, :payload_length, :cr, :crc, :ldro, :invert_iq)
+  frames = []
+  demod = PWN::SDR::Decoder::LoRa::PayloadIQ.new(**options, rate: v[:sample_rate])
+  started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+  iq.each_slice(8192) { |chunk| demod.feed_iq(chunk) { |frame| frames << frame } }
+  elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+  raise 'decode mismatch' unless frames.length == 1 && frames.first[:payload_hex] == v[:payload_hex]
+  duration = iq.length.fdiv(2 * v[:sample_rate])
+  { file: v[:file], sf: v[:sf], sample_rate: v[:sample_rate], samples: iq.length / 2,
+    seconds: elapsed.round(6), signal_seconds: duration.round(6),
+    realtime_ratio: (duration / elapsed).round(3), decoded_packets: frames.length }
+end
+puts JSON.pretty_generate(results)

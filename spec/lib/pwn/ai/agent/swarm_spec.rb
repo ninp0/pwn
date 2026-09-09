@@ -198,6 +198,21 @@ describe PWN::AI::Agent::Swarm do
     expect(src).to match(/core_only:\s*empty_tools/)
   end
 
+  it 'does not leak child_filed_nothing honesty from a text_only reviewer into the parent' do
+    described_class.spawn(name: 'pwn_red_team', role: 'review', toolsets: %w[pwn terminal extrospection])
+    Thread.current[:pwn_swarm_honesty] = nil
+    Thread.current[:pwn_swarm_id] = nil
+    allow(PWN::AI::Agent::Loop).to receive(:run).and_return('Step 1 is most likely to fail.')
+    described_class.ask(
+      name: 'pwn_red_team',
+      request: 'GOAL: summarize the conversation of this session.',
+      text_only: true
+    )
+    expect(described_class.honesty_unmet).to eq([])
+    expect(Array(Thread.current[:pwn_swarm_honesty])).to eq([])
+    expect(Thread.current[:pwn_swarm_id]).to be_nil
+  end
+
   it 'maps several ports and returns a merged result set' do
     rows = described_class.map_targets(targets: '127.0.0.1', ports: '1,9,22,80')
     expect(rows.length).to eq(4)

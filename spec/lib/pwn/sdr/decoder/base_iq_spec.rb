@@ -49,17 +49,9 @@ end
 
 describe PWN::SDR::Decoder::ADSB do
   it 'decodes Mode-S DF17 identity fields from a bit vector' do
-    bits = Array.new(112, 0)
-    # DF = 17 (10001)
-    [1, 0, 0, 0, 1].each_with_index { |b, i| bits[i] = b }
-    # ICAO = 0xABC123 → 24 bits starting at bit 8
-    icao = 0xABC123
-    24.times { |i| bits[8 + i] = (icao >> (23 - i)) & 1 }
-    # TC = 4 (identity) at bits 32..36
-    [0, 0, 1, 0, 0].each_with_index { |b, i| bits[32 + i] = b }
+    # Published identification example: https://mode-s.org/1090mhz/content/ads-b/2-identification.html
+    bits = '8D4840D6202CC371C32CE0576098'.chars.flat_map { |c| c.to_i(16).to_s(2).rjust(4, '0').chars.map(&:to_i) }
     h = PWN::SDR::Decoder::ADSB.decode_modes(bits: bits)
-    expect(h[:df]).to eq(17)
-    expect(h[:icao24]).to eq('ABC123')
-    expect(h[:type_code]).to eq(4)
+    expect(h).to include(df: 17, icao24: '4840D6', type_code: 4, callsign: 'KLM1023')
   end
 end

@@ -12,13 +12,15 @@ module PWN
       # 11-block state machine. All four interleaved phases (A/B/C/D) are
       # de-interleaved into 88 × 32-bit BCH(31,21)+parity codewords, error
       # corrected, and walked (BIW → address → vector → message words) to
-      # recover capcode + alphanumeric / numeric / binary payloads.
+      # recover short capcode + alphanumeric / numeric / binary payloads.
+      # Plain alpha fragments have fragment checksums and whole-message
+      # signatures, with bounded per-stream ordered reassembly. Long-address
+      # phases, secure payloads, and enhanced symbolic character modes remain
+      # unsupported. Numeric/binary message-level integrity is not implemented.
       #
-      # Algorithm is a clean-room Ruby port of the reference behavior in
-      # multimon-ng `demod_flex.c` (GPLv2), verified bit-exact against a
-      # live 929.625 MHz 3200/4 capture: sync 0xDEA0, FIW cycle 10 frame
-      # 70, 88/88 BCH-clean words per phase, capcodes 4294949118 /
-      # 002064207 / 002064227 all matching multimon-ng ground truth.
+      # The symbol/framing implementation follows multimon-ng demod_flex.c.
+      # Offline specs cover Sync-1/FIW and a protected short-address alpha
+      # frame. These fixtures do not establish all-mode live-air parity.
       #
       # No `multimon-ng`, no `sox` — 100 % Ruby.
       module Flex
@@ -65,6 +67,7 @@ module PWN
             @cycle    = 0
             @frame    = 0
             @sync_cw  = 0
+            @fragments = {}
             reset_phases
           end
 
@@ -158,10 +161,10 @@ module PWN
             @fiw = ((@fiw >> 1) | (rsym > 1 ? 0x80000000 : 0)) & 0xFFFFFFFF if @fiwcnt >= 16
             return unless @fiwcnt == 48
 
-            fw, = Flex.bch_fix(word: @fiw)
+            fw, errors = Flex.bch_fix(word: @fiw)
             ck = ((fw & 0xF) + ((fw >> 4) & 0xF) + ((fw >> 8) & 0xF) +
                   ((fw >> 12) & 0xF) + ((fw >> 16) & 0xF) + ((fw >> 20) & 1)) & 0xF
-            if ck == 0xF
+            if errors >= 0 && ck == 0xF
               @cycle = (fw >> 4) & 0xF
               @frame = (fw >> 8) & 0x7F
               @baud  = @mode[0]
@@ -217,7 +220,7 @@ module PWN
             phases.each do |ph, words|
               Flex.emit_phase(
                 words: words, phase: ph, cycle: @cycle, frame: @frame,
-                mode: @mode, sync_cw: @sync_cw, &
+                mode: @mode, sync_cw: @sync_cw, fragments: @fragments, &
               )
             end
           end
@@ -315,7 +318,9 @@ module PWN
         # ) { |msg| ... }
 
         public_class_method def self.emit_phase(opts = {})
-          raw   = opts[:words] || []
+          raw = opts[:words] || []
+          return unless raw.length == 88
+
           phase = opts[:phase]
           cycle = opts[:cycle]
           frame = opts[:frame]
@@ -336,13 +341,26 @@ module PWN
             next if aw.nil? || aw.zero? || aw == 0x1FFFFF
 
             long_addr = aw < 0x008001 || aw > 0x1E0000
-            capcode   = (aw - 0x8000) & 0xFFFFFFFF
+            # Long addresses span multiple words; the short-address arithmetic
+            # below cannot recover them. Do not publish wrapped bogus capcodes.
+            break if long_addr
+
+            capcode = (aw - 0x8000) & 0xFFFFFFFF
             j    = v_start + (i - a_start)
             viw  = words[j] || 0
             type = (viw >> 4) & 0x7
+            # Secure payloads have a different layout and are not plain text.
+            next if type.zero?
+
             mw1  = (viw >> 7) & 0x7F
             len  = (viw >> 14) & 0x7F
             mw2  = mw1 + len - 1
+            next if fixed[i][1].negative? || !fixed[j] || fixed[j][1].negative?
+
+            if [0, 3, 4, 5, 6, 7].include?(type)
+              next unless mw1.between?(j + 1, 87) && mw2.between?(mw1, 87)
+              next if fixed[mw1..mw2].any? { |_, errors| errors.negative? }
+            end
             body, frag =
               case type
               when 0, 5 then alpha_decode(words: words, mw1: mw1, mw2: mw2)
@@ -350,6 +368,14 @@ module PWN
               when 6 then [hex_decode(words: words[mw1..mw2]), nil]
               else [nil, nil]
               end
+            next if [0, 5].include?(type) && body.nil?
+
+            if type == 5
+              body = assemble_alpha(words: words, mw1: mw1, body: body,
+                                    key: [phase, capcode, (words[mw1] >> 13) & 63], fragments: opts[:fragments])
+              next unless body
+            end
+
             out = {
               protocol: 'FLEX',
               mode: "#{mode[0]}/#{mode[1]}",
@@ -373,13 +399,57 @@ module PWN
         # Supported Method Parameters::
         # str, frag = PWN::SDR::Decoder::Flex.alpha_decode(words:, mw1:, mw2:)
 
+        # Caller-owned, bounded assembly state; incomplete fragments never emit
+        # as complete messages. Plain ASCII only (enhanced character modes are
+        # not interpreted). The per-message signature excludes ETX padding.
+        private_class_method def self.assemble_alpha(opts = {})
+          words = opts[:words]
+          mw1 = opts[:mw1]
+          body = opts[:body]
+          key = opts[:key]
+          state = opts[:fragments] || {}
+          header = words[mw1]
+          fragment = (header >> 11) & 3
+          continued = header.anybits?(1024)
+          if fragment == 3
+            state.delete(key)
+            return body unless continued
+
+            state[key] = { next: 0, signature: words[mw1 + 1] & 127, body: body }
+            state.shift while state.length > 256
+            return nil
+          end
+          previous = state.delete(key)
+          return nil unless previous && previous[:next] == fragment
+
+          body = previous[:body] + body
+          return nil if body.bytesize > 65_536
+
+          if continued
+            state[key] = previous.merge(next: (fragment + 1) % 3, body: body)
+            return nil
+          end
+          (~body.bytes.sum & 127) == previous[:signature] ? body : nil
+        end
+
         public_class_method def self.alpha_decode(opts = {})
           words = opts[:words] || []
           mw1   = opts[:mw1].to_i
           mw2   = opts[:mw2].to_i
           return [nil, nil] unless mw1.between?(1, 87) && mw2.between?(mw1, 87)
 
-          hdr  = words[mw1].to_i
+          hdr = words[mw1].to_i
+          # TI SPRA193 section 2.4.1: zero K, sum 8/8/5-bit groups,
+          # then compare its one's complement with the ten transmitted bits.
+          fragment = words[mw1..mw2]
+          return [nil, nil] unless fragment && fragment.length == mw2 - mw1 + 1 && fragment.all?(Integer)
+
+          sum = fragment.each_with_index.sum do |word, index|
+            data = index.zero? ? word & ~0x3FF : word
+            (data & 0xFF) + ((data >> 8) & 0xFF) + ((data >> 16) & 0x1F)
+          end
+          return [nil, nil] unless (~sum & 0x3FF) == (hdr & 0x3FF)
+
           frag = (hdr >> 11) & 0x03
           cont = (hdr >> 10) & 0x01
           flag = if cont == 1 then 'F'
@@ -390,10 +460,15 @@ module PWN
           ((mw1 + 1)..mw2).each do |i|
             dw = words[i].to_i
             [0, 7, 14].each do |sh|
+              next if frag == 3 && i == mw1 + 1 && sh.zero?
+
               ch = (dw >> sh) & 0x7F
-              out << ch.chr if ch != 0x03 && ch.between?(0x20, 0x7E)
+              out << ch.chr
             end
           end
+          out = out.sub(/[\x00\x03]+\z/, '')
+          return [nil, nil] if frag == 3 && cont.zero? && (~out.bytes.sum & 0x7F) != (words[mw1 + 1].to_i & 0x7F)
+
           [out, flag]
         end
 
@@ -438,6 +513,20 @@ module PWN
         #   freq_obj: 'required - freq_obj returned from PWN::SDR::GQRX.init_freq'
         # )
 
+        # Realtime options forwarded to Base: on_frame (Hash callback), output
+        # (writable IO), interactive (default true), duration (seconds), stop
+        # (callable), queue_size (bounded chunks), log_file (path or false).
+        # Energy detection only; does not identify or decode Flex payloads.
+        # Supported Method Parameters::
+        # Flex.detect(freq_obj: Hash, threshold: 8.0, on_frame: Proc)
+        public_class_method def self.detect(opts = {})
+          Base.run_detector(opts.merge(
+                              protocol: 'FLEX',
+                              note: 'Energy detection only; no protocol payload decoding.',
+                              describe: proc { |_burst| { event: 'detection', capability: 'energy-detection', decoded: false } }
+                            ))
+        end
+
         public_class_method def self.decode(opts = {})
           freq_obj = opts[:freq_obj]
           # Prefer true-air I/Q (FM-demod → native audio demod) when the
@@ -446,9 +535,11 @@ module PWN
           want_iq = opts[:source] || opts[:file] || freq_obj[:iq_source] || freq_obj[:iq_file]
           if want_iq
             PWN::SDR::Decoder::Base.run_iq(
+              **opts,
+              fallback: :raise,
               freq_obj: freq_obj,
               protocol: 'FLEX',
-              demod: Demod.new,
+              demod: Demod.new(rate: (opts[:sample_rate] || freq_obj[:iq_rate] || 240_000).to_i),
               sample_rate: (opts[:sample_rate] || freq_obj[:iq_rate] || 240_000).to_i,
               source: opts[:source],
               file: opts[:file],
@@ -457,9 +548,10 @@ module PWN
             )
           else
             PWN::SDR::Decoder::Base.run_native(
+              **opts,
               freq_obj: freq_obj,
               protocol: 'FLEX',
-              demod: Demod.new
+              demod: Demod.new(rate: (opts[:rate] || 48_000).to_i)
             )
           end
         end
@@ -474,6 +566,8 @@ module PWN
 
         public_class_method def self.help
           puts "USAGE:
+            # Detect energy only (not protocol payloads); accepts Base runner controls.
+            #{self}.detect(freq_obj: {}, threshold: 8.0, on_frame: nil)
             # Run sync check and return its result
             #{self}.sync_check(
               buf: 'optional - buf value consumed by #sync_check'
@@ -505,7 +599,8 @@ module PWN
               phase: 'optional - phase value consumed by #emit_phase',
               cycle: 'optional - cycle value consumed by #emit_phase',
               frame: 'optional - frame value consumed by #emit_phase',
-              mode: 'optional - mode value consumed by #emit_phase'
+              mode: 'optional - mode value consumed by #emit_phase',
+              fragments: 'optional - caller-owned Hash preserving ordered alpha fragments across phases'
             )
 
             # Run alpha decode and return its result
@@ -530,6 +625,13 @@ module PWN
             # Run decode and return its result
             #{self}.decode(
               freq_obj: 'required - freq_obj returned from PWN::SDR::GQRX.init_freq',
+              on_frame: 'optional - callback receiving each emitted Hash',
+              output: 'optional - writable IO (default stdout)',
+              interactive: 'optional - false disables ENTER input',
+              duration: 'optional - finite seconds to run',
+              stop: 'optional - callable returning true to stop',
+              queue_size: 'optional - bounded pending chunks (default 8)',
+              log_file: 'optional - JSONL path or false to disable logging',
               source: 'optional - source value consumed by #decode',
               file: 'optional - filesystem path',
               sample_rate: 'optional - sample rate value consumed by #decode'

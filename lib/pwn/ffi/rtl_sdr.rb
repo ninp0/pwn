@@ -45,7 +45,7 @@ module PWN
         attach_function :rtlsdr_reset_buffer, [:pointer], :int
         attach_function :rtlsdr_read_sync,
                         %i[pointer pointer int pointer],
-                        :int
+                        :int, blocking: true
         attach_function :rtlsdr_set_agc_mode, %i[pointer int], :int
       end
 
@@ -145,6 +145,10 @@ module PWN
       #   bytes:  'optional - number of raw bytes to read (default 262144)'
       # )
       # Returns a binary String of unsigned 8-bit interleaved I/Q samples.
+      # Short, complete IQ reads are returned intact. Native errors and odd
+      # byte counts raise. librtlsdr sync reads provide no dropped-sample count;
+      # successful reads alone do not establish continuous hardware capture.
+      # Callers must finish an in-flight read before closing the device.
 
       public_class_method def self.read_sync(opts = {})
         dev = opts[:device]
@@ -157,6 +161,8 @@ module PWN
         raise "ERROR: rtlsdr_read_sync rc=#{rc}" unless rc.zero?
 
         got = n_read.read_int
+        raise "ERROR: rtlsdr_read_sync invalid IQ length #{got}/#{nbytes}" if got.negative? || got > nbytes || got.odd?
+
         buf.read_string(got)
       end
 

@@ -38,6 +38,7 @@ module PWN
       autoload :RFID,      'pwn/sdr/decoder/rfid'
       autoload :RTL433,    'pwn/sdr/decoder/rtl433'
       autoload :RTTY,      'pwn/sdr/decoder/rtty'
+      autoload :Tempest,   'pwn/sdr/decoder/tempest'
       autoload :WiFi,      'pwn/sdr/decoder/wifi'
       autoload :ZigBee,    'pwn/sdr/decoder/zigbee'
 
@@ -65,6 +66,7 @@ module PWN
         rfid: :RFID,
         rtl433: :RTL433,
         rtty: :RTTY,
+        tempest: :Tempest,
         wifi: :WiFi,
         zigbee: :ZigBee
       }.freeze

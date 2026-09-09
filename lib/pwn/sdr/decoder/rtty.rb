@@ -27,16 +27,19 @@ module PWN
 
           def feed(samples, &)
             @buf.concat(samples)
-            # keep at most ~2 s of audio buffered
-            @buf.shift(@buf.length - (@rate * 2)) if @buf.length > @rate * 2
             demod_buffer(&)
+          end
+
+          def flush(&)
+            demod_buffer(&)
+            flush_line(&)
           end
 
           private
 
-          def bit_at(offset)
+          def bit_at(offset, width = 1.0)
             a = offset.floor
-            b = (offset + @spb).floor
+            b = (offset + (@spb * width)).floor
             win = @buf[a...b]
             pm = PWN::SDR::Decoder::DSP.goertzel(samples: win, rate: @rate, freq: @mark_hz)
             ps = PWN::SDR::Decoder::DSP.goertzel(samples: win, rate: @rate, freq: @space_hz)
@@ -48,7 +51,7 @@ module PWN
           def demod_buffer(&)
             char_span = (@spb * 7.5).ceil
             pos = 0.0
-            while @buf.length - pos > char_span
+            while @buf.length - pos >= char_span
               if bit_at(pos) == 1
                 pos += @spb
                 @idle_bits += 1
@@ -58,9 +61,9 @@ module PWN
               @idle_bits = 0
               # start bit found — sample 5 data bits at their centers
               data = Array.new(5) { |i| bit_at(pos + (@spb * (i + 1))) }
-              stop = bit_at(pos + (@spb * 6))
+              stop = bit_at(pos + (@spb * 6)) == 1 && bit_at(pos + (@spb * 7), 0.5) == 1
               pos += @spb * 7.5
-              next unless stop == 1
+              next unless stop
 
               handle_code(data.each_with_index.sum { |b, i| b << i }, &)
             end
@@ -104,6 +107,20 @@ module PWN
         #   freq_obj: 'required - freq_obj returned from PWN::SDR::GQRX.init_freq'
         # )
 
+        # Realtime options forwarded to Base: on_frame (Hash callback), output
+        # (writable IO), interactive (default true), duration (seconds), stop
+        # (callable), queue_size (bounded chunks), log_file (path or false).
+        # Energy detection only; does not identify or decode RTTY payloads.
+        # Supported Method Parameters::
+        # RTTY.detect(freq_obj: Hash, threshold: 8.0, on_frame: Proc)
+        public_class_method def self.detect(opts = {})
+          Base.run_detector(opts.merge(
+                              protocol: 'RTTY',
+                              note: 'Energy detection only; no protocol payload decoding.',
+                              describe: proc { |_burst| { event: 'detection', capability: 'energy-detection', decoded: false } }
+                            ))
+        end
+
         public_class_method def self.decode(opts = {})
           freq_obj = opts[:freq_obj]
           # Prefer true-air I/Q (FM-demod → existing audio demod) when the
@@ -112,20 +129,23 @@ module PWN
           want_iq = opts[:source] || opts[:file] || freq_obj[:iq_source] || freq_obj[:iq_file]
           if want_iq
             PWN::SDR::Decoder::Base.run_iq(
+              **opts,
+              fallback: :raise,
               freq_obj: freq_obj,
               protocol: 'RTTY',
-              demod: Demod.new,
+              demod: Demod.new(rate: (opts[:sample_rate] || freq_obj[:iq_rate] || 48_000).to_i),
               sample_rate: (opts[:sample_rate] || freq_obj[:iq_rate] || 48_000).to_i,
               source: opts[:source],
               file: opts[:file],
               fm_demod: true,
-              note: 'RTTY true-air: FM-demod I/Q then native bit recovery; falls back to detector without SDR hardware.'
+              note: 'RTTY true-air: FM-demod I/Q then native bit recovery; missing I/Q raises (use .detect for energy only).'
             )
           else
             PWN::SDR::Decoder::Base.run_native(
+              **opts,
               freq_obj: freq_obj,
               protocol: 'RTTY',
-              demod: Demod.new
+              demod: Demod.new(rate: (opts[:rate] || 48_000).to_i)
             )
           end
         end
@@ -140,9 +160,18 @@ module PWN
 
         public_class_method def self.help
           puts "USAGE:
+            # Detect energy only (not protocol payloads); accepts Base runner controls.
+            #{self}.detect(freq_obj: {}, threshold: 8.0, on_frame: nil)
             # Run decode and return its result
             #{self}.decode(
               freq_obj: 'required - freq_obj returned from PWN::SDR::GQRX.init_freq',
+              on_frame: 'optional - callback receiving each emitted Hash',
+              output: 'optional - writable IO (default stdout)',
+              interactive: 'optional - false disables ENTER input',
+              duration: 'optional - finite seconds to run',
+              stop: 'optional - callable returning true to stop',
+              queue_size: 'optional - bounded pending chunks (default 8)',
+              log_file: 'optional - JSONL path or false to disable logging',
               source: 'optional - source value consumed by #decode',
               file: 'optional - filesystem path',
               sample_rate: 'optional - sample rate value consumed by #decode'

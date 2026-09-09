@@ -2,7 +2,12 @@
 
 ## pwn-capd (P8)
 
-The Python stdlib helper speaks one bounded JSON request per Unix connection.
+The native Ruby helper speaks one bounded JSON request per Unix connection.
+Ruby `Socket` and `pack` implement AF_PACKET send/capture and pcap encoding;
+the existing `ffi` gem calls Linux libc `prctl`, `capget` and `capset`.
+There is no Python runtime or fallback. Read-only ARP/ND queries retain the
+`/usr/sbin/ip` (iproute2) dependency, executed as an argument vector with a
+clean environment, bounded output and a five-second deadline.
 Linux SO_PEERCRED authenticates the configured caller UID; the client also
 checks the daemon UID. The socket is mode 0600. Only explicitly configured
 interfaces are accepted. Operations: `status`, `raw_send` (base64 Ethernet
@@ -11,10 +16,32 @@ neighbor-cache queries). There is no command endpoint, arbitrary privileged
 output path, firewall mutation, or implicit sudo. ARP/ND currently query cache;
 they do not actively solicit neighbors or mutate entries.
 
-Operator installation (NOT executed by the application): install
-`lib/pwn/plugins/capability_broker/daemon.py` (not the Ruby packaging driver)
-root-owned under `/usr/local/libexec/pwn-capd`, mode 0755, in a root-owned
-non-writable directory. Do **not** setcap the system Ruby/Python interpreter
+Requests are limited to 100,000 bytes including the newline; each connection
+has a 35-second total deadline. Ethernet sends accept 14..65,535 decoded bytes.
+Captures accept 1..128 packets, at most 30 seconds, and 4,096 bytes per packet.
+The helper sets `no_new_privs`, intersects effective/permitted capabilities
+with CAP_NET_RAW/CAP_NET_ADMIN, and clears both inheritable words before
+handling requests. It never adds a capability. Existing socket paths (including
+symlinks) and writable or foreign-owned socket directories are refused.
+
+Unprivileged protocol and native-executable smoke (no raw packets or privilege grants):
+
+```
+bundle exec rspec spec/lib/pwn/plugins/capability_broker_spec.rb spec/lib/pwn/plugins/capability_broker/daemon_spec.rb
+```
+
+Operator installation (NOT executed by the application): install the reviewed
+PWN Ruby package and its dependencies root-owned, including `bin/pwn-capd`,
+`lib/pwn/plugins/capability_broker.rb` and
+`lib/pwn/plugins/capability_broker/daemon.rb`. Keep the package's `bin/` and
+`lib/` layout intact; point the service ExecStart at that package's
+`bin/pwn-capd`. A root-managed installed-gem executable may also be exposed
+as `/usr/local/libexec/pwn-capd` (mode 0755). The executable, library tree,
+Ruby interpreter, gems and all ancestor directories must be administrator
+controlled and non-writable by clients. Clear user-controlled `RUBYOPT`,
+`RUBYLIB`, `GEM_HOME`, `GEM_PATH` and Bundler environment settings in the
+service; use only the reviewed installation's dependency paths.
+Do **not** setcap the shared Ruby interpreter
 or this script: Linux ignores script file capabilities, and granting a shared
 interpreter network privileges exposes every script. Use a dedicated systemd
 service with `User=<operator>`,  `AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN`,
@@ -60,7 +87,9 @@ PWN::Plugins::Sandbox.rollback(snapshot: s[:snapshot], backend: 'bwrap')
 ```
 
 Docker is default, image `pwn-sandbox:local`; it must be provisioned locally,
-with `/usr/bin/python3`, strace, GDB, and target runtime libraries. No implicit
+with `/usr/bin/ruby`, strace, GDB, and target runtime libraries. The controller
+and isolated worker use Ruby stdlib only; no Python interpreter is launched by
+the sandbox driver (GDB itself may include Python support). No implicit
 pull, installation, daemon startup or host-execution fallback occurs. Use the
 included `lib/pwn/plugins/sandbox/Dockerfile` to build explicitly. Network none,
 read-only root/artifacts, unprivileged UID, all caps dropped, no-new-privileges,
@@ -84,12 +113,22 @@ Fuzzing is bounded seeded bit-flip stdin mutation, not coverage-guided AFL.
 Tools register via `require 'pwn/ai/agent/tools/sandbox'`: `sandbox_run` and
 `sandbox_fuzz`; normal Registry discovery finds that file.
 
-Verification:
+Sandbox verification (safe bwrap fixtures require working unprivileged namespaces):
 ```
-bundle exec rspec spec/lib/pwn/plugins/{packet,capability_broker,sandbox}_spec.rb
-python3 spec/lib/pwn/plugins/capd_test.py
-python3 spec/lib/pwn/plugins/sandbox_test.py
+bundle exec rspec spec/lib/pwn/plugins/sandbox_spec.rb spec/lib/pwn/plugins/sandbox/driver_spec.rb
 ```
+
+The tests exercise `/bin/true`, read-only mounts, namespace isolation without
+network requests, timeouts, resource limits, SIGSEGV/GDB/strace replay,
+byte-exact stdin mutation and snapshot integrity. Docker command/cleanup unit
+checks are not evidence of a running Docker backend. The GDB fixture requests
+1024 MiB: this host's GDB can exhaust the default 256 MiB address-space budget.
+Instrumentation failures retain raw output and an unknown classification.
+
+Fuzz seeds are reproducible within this Ruby implementation, not bit-for-bit
+compatible with Python's PRNG sequence. Each iteration retains the execution
+and replay budget plus bounded backend startup/cleanup overhead; the minutes
+budget stops starting new iterations, rather than preempting cleanup.
 
 Safe real Docker smoke after explicit provisioning:
 ```

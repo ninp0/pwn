@@ -8,14 +8,19 @@ module PWN
   module Plugins
     # Bounded, peer-authenticated client; never starts or elevates the helper.
     module CapabilityBroker
+      autoload :Daemon, 'pwn/plugins/capability_broker/daemon'
+
       public_class_method def self.request(opts = {})
         path = opts[:socket] || ENV.fetch('PWN_CAPD_SOCKET', '/run/pwn-capd/control.sock')
+        payload = JSON.generate(opts.except(:socket)) << "\n"
+        raise 'broker request too large' if payload.bytesize > 100_000
+
         Timeout.timeout(35) do
           UNIXSocket.open(path) do |socket|
             _pid, uid, = socket.getsockopt(Socket::SOL_SOCKET, Socket::SO_PEERCRED).unpack('iii')
             raise 'untrusted broker peer' unless [0, Process.uid].include?(uid)
 
-            socket.puts(JSON.generate(opts.except(:socket)))
+            socket.write(payload)
             line = socket.gets(2_000_001)
             raise 'invalid broker response' unless line && line.bytesize <= 2_000_000 && line.end_with?("\n")
 

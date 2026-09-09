@@ -12,7 +12,7 @@ metadata:
 
 # PWN::SDR::Decoder::Bluetooth
 
-Bluetooth LE (& BR/EDR sync-trailer) true-air decoder. I/Q → PWN::FFI::Liquid.gmsk_demod (or DSP.fm_demod_iq→NRZ) at 1 Mbit/s → hunt LSB-first Access Address (adv = 0x8E89BED6) → dewhiten (7-bit LFSR seeded ch|0x40) → PDU header (type/len) → AdvA (6 bytes) → CRC-24 (poly 0x65B, init 0x555555). Emits per-PDU {access_addr:, pdu_type:, adv_addr:, crc_ok:} — ubertooth-parity advertising sniff with no external binary.
+Bluetooth LE 1M single-channel advertising/connected PDU decoder. I/Q → continuous Ruby FM/NRZ fallback at 1 Mbit/s → hunt LSB-first Access Address (adv = 0x8E89BED6) → dewhiten (7-bit LFSR seeded ch|0x40) → PDU header (type/len) → AdvA (6 bytes) → CRC-24 (poly 0x65B, init 0x555555). Emits per-PDU {access_addr:, pdu_type:, adv_addr:, crc_ok:}. CRC failures are rejected. Connected packets require explicit AA, CRCInit and encryption state. CTE header is parsed; no direction finding, hopping, L2CAP assembly, 2M/coded PHY or decryption.
 
 ## When to use
 
@@ -28,13 +28,15 @@ Class methods take `(opts = {})` and read `opts`.
 
 ```ruby
 PWN::SDR::Decoder::Bluetooth.help
-PWN::SDR::Decoder::Bluetooth.ble_crc24(opts)
+PWN::SDR::Decoder::Bluetooth.parse(opts)
 ```
 
 ## Public methods
 
+- `parse`
 - `ble_crc24`
 - `decode`
+- `detect`
 - `parse_line`
 - `authors`
 - `help`
@@ -45,5 +47,5 @@ PWN::SDR::Decoder::Bluetooth.ble_crc24(opts)
 
 ## Verification
 
-`PWN::SDR::Decoder::Bluetooth.respond_to?(:ble_crc24)` after the
+`PWN::SDR::Decoder::Bluetooth.respond_to?(:parse)` after the
 module is loaded. Read the source for parameter names.

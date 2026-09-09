@@ -604,15 +604,13 @@ module PWN
           return false unless needs_host_work?(request: request)
 
           live = effects.reject { |fx| %i[recall store].include?(fx) }
-          return true if live.empty?
+          unmet = completion_unmet(request: request, messages: opts[:messages])
+          return true if unmet.any?
+          return true if live.empty? && %i[write browse read].include?(need)
           return true if duration_unsatisfied?(request: request)
-          return true if declared_contract_unsatisfied?(
-            request: request,
-            messages: opts[:messages]
-          )
           return true if need == :write && !write_verified?(effects: effects, request: request, messages: opts[:messages])
           return true if need == :browse && !effects.include?(:browse)
-          return true if need == :any && !effects.intersect?(%i[write browse eval])
+          return true if need == :any && live.any? && !live.intersect?(%i[write browse eval])
 
           false
         rescue StandardError
@@ -1287,10 +1285,10 @@ module PWN
           name = opts[:name].to_s
           sig = payload_sig(opts)
           JSON.generate(
-            success: true,
+            success: false,
             checkpoint: true,
             error: "checkpoint: identical #{name} payload (#{sig}). World unchanged — vary args, target, or tool.",
-            result: { stdout: "checkpoint #{name} #{sig}", stderr: '', exit: 0 }
+            result: { stdout: '', stderr: "checkpoint #{name} #{sig}", exit: 1 }
           )
         end
 
@@ -2906,7 +2904,8 @@ module PWN
           # CORE_TOOLS is the default action space. Extra schemas are
           # opt-in via enabled_toolsets + core_only: false.
           core_only = opts.fetch(:core_only, true)
-          if nested && needs_host_work?(request: request)
+          if nested && needs_host_work?(request: request) &&
+             !(opts.key?(:enabled_toolsets) && Array(opts[:enabled_toolsets]).empty?)
             opts[:enabled_toolsets] = nil
             core_only = true
           end
@@ -3182,9 +3181,12 @@ module PWN
               if Thread.current[:pwn_extinguished].is_a?(Hash) && Thread.current[:pwn_extinguished][sig]
                 raw = no_progress_result(name: name, args: args)
               else
-                raw = Dispatch.call(tool_call: tc)
                 same_n = note_same_payload!(name: name, args: args)
-                raw = checkpoint_result(name: name, args: args) if same_n >= 3
+                raw = if same_n >= 3
+                        checkpoint_result(name: name, args: args)
+                      else
+                        Dispatch.call(tool_call: tc)
+                      end
               end
               tools_called += 1
               if opts[:verification_contract]
