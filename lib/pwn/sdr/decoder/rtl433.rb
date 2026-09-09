@@ -206,10 +206,14 @@ module PWN
             command.push('-R', '0')
             ids.each { |id| command.push('-R', id.to_s) }
           end
+          raise IOError, 'rtl_433 replay cancelled' if opts[:stop]&.call
+
           count = 0
           output = opts.fetch(:output, $stdout)
           deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + duration
+          started = false
           Open3.popen3(*command) do |input, stdout, stderr, worker|
+            started = true
             input.close
             buffers = { stdout => +'', stderr => +'' }
             errors = +''
@@ -269,6 +273,10 @@ module PWN
             end
           end
           { protocol: 'RTL433', mode: :native, backend: 'rtl_433', frames: count, source: path }
+        rescue Errno::ENOENT
+          raise unless started == false
+
+          raise IOError, "rtl_433 executable #{command.first.inspect} not found; install the optional rtl_433 package or set executable: to its path"
         end
 
         public_class_method def self.detect(opts = {})
@@ -333,6 +341,7 @@ module PWN
             # Native mode is finite FILE replay only: file required, no auto RF/config loading.
             # Native options: format: :cu8/:cs16/:cf32, protocols: [positive native IDs],
             # executable: 'rtl_433', duration: 30 seconds (deadline), stop: callable.
+            # Missing executable raises IOError with install/path guidance; already-stopped replay never spawns.
             # Output is per-device native JSON, device_protocol preserves native numeric ID.
             # Individual sensors/integrity depend on installed version; mic absent means not-reported.
             # sample_rate: 250000 default, >=20000; threshold: 0.5 normalized envelope amplitude.

@@ -191,12 +191,19 @@ module PWN
           data = File.read(path)
           raise ArgumentError, 'PM3 file must contain signed integer amplitude samples' unless data.lines.all? { |line| line.strip.match?(/\A-?\d+\z/) }
 
+          raise IOError, 'proxmark3 replay cancelled' if opts[:stop]&.call
+
           Tempfile.create(['pwn-fdxb-', '.pm3']) do |trace|
             Tempfile.create('pwn-fdxb-output-') do |output|
               trace.write(data)
               trace.flush
-              pid = Process.spawn(opts.fetch(:executable, 'proxmark3').to_s, '--incognito', '-c',
-                                  "data load -f #{trace.path}; lf fdxb demod", in: File::NULL, out: output, err: output)
+              executable = opts.fetch(:executable, 'proxmark3').to_s
+              begin
+                pid = Process.spawn(executable, '--incognito', '-c',
+                                    "data load -f #{trace.path}; lf fdxb demod", in: File::NULL, out: output, err: output)
+              rescue Errno::ENOENT
+                raise IOError, "proxmark3 executable #{executable.inspect} not found; install the optional proxmark3 client or set executable: to its path"
+              end
               deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + duration
               begin
                 loop do
@@ -303,6 +310,7 @@ module PWN
             # file: explicit .pm3 signed integer AMPLITUDE trace, not SDR IQ; no hardware access.
             # Valid CRC16 required. Returns national/country ID, animal and data-block flags.
             # executable: 'proxmark3'; duration: 30s deadline; stop: callable; output/on_frame/log_file.
+            # Missing executable raises IOError with install/path guidance; already-stopped replay never spawns.
             # PM3 mode is finite offline replay; no ISO14443/ISO15693/EPC Gen2 coverage.
             # carrier_hz: 125000 default; clocks_per_bit: 64 default, or 32/16.
             # threshold: 0.5 default, normalized envelope amplitude; tune to the received levels.
