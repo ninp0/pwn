@@ -3,6 +3,11 @@
 require 'spec_helper'
 
 describe PWN::FFI::FFTW do
+  it 'handles a missing shared library without native calls' do
+    allow(described_class).to receive(:available?).and_return(false)
+    expect { described_class.rfft(samples: [1.0]) }.to raise_error(RuntimeError, /libfftw3f not available/)
+  end
+
   it 'should display information for authors' do
     expect(PWN::FFI::FFTW).to respond_to :authors
   end
@@ -15,8 +20,8 @@ describe PWN::FFI::FFTW do
     expect(PWN::FFI::FFTW).to respond_to :available?
   end
 
-  it 'should compute an rfft impulse response when libfftw3f is present' do
-    skip 'libfftw3f not installed' unless PWN::FFI::FFTW.available?
+  it 'should compute an rfft impulse response', :fftw_integration do
+    expect(described_class.available?).to be(true), 'Install libfftw3f and make it visible to the dynamic loader (PWN_TEST_FFTW=1).'
 
     spec = PWN::FFI::FFTW.rfft(samples: [1.0, 0, 0, 0, 0, 0, 0, 0])
     expect(spec.length).to eq(5) # n/2+1

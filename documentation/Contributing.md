@@ -60,6 +60,67 @@ An already-true `stop:` callback raises cancellation before spawning either clie
 Invalid inputs still raise `ArgumentError`; native decoding never silently falls
 back to another decoder or a detector.
 
+### Optional Liquid and radare2 integration tests
+
+Native Liquid DSP examples and the real radare2 JSON replay are also explicit
+opt-ins, even when the backends happen to be installed. The default gate excludes
+`liquid_integration` and `radare2_integration` metadata rather than marking tests
+pending. Liquid interface checks, missing-library errors, pure-Ruby DSP fallback,
+radare2 argument validation, and binutils fallback coverage still run by default.
+The binary fallback tests require the existing binutils tools and `/bin/true`.
+
+```bash
+PWN_TEST_LIQUID=1 bundle exec rspec spec/lib/pwn/ffi/liquid_spec.rb
+PWN_TEST_RADARE2=1 bundle exec rspec spec/lib/pwn/plugins/binary_analysis_spec.rb
+# Enable both in the full gate:
+PWN_TEST_LIQUID=1 PWN_TEST_RADARE2=1 bundle exec rake
+```
+
+Liquid opt-in requires the liquid-dsp shared library (`libliquid`) visible to the
+dynamic loader. Radare2 opt-in requires `r2` and a C compiler named `cc` on PATH.
+The radare2 example compiles a small unstripped C fixture in a temporary directory,
+checks real JSON disassembly for its known `main` symbol, and removes the fixture
+afterward. It does not assume the host's stripped `/bin/true` has a discoverable
+`main`. Opt-in runs fail with installation guidance when a prerequisite is absent;
+they never skip or accept a degraded backend as native success. The tests install
+nothing and require no radio hardware or network access.
+
+### Optional FFTW, Volk, and SDR shared-library tests
+
+The default gate also excludes real FFTW/Volk computations and radio-library
+integration checks, regardless of what is installed. Missing-library behavior,
+mocked device inventory and stream lifecycle tests, and Ruby DSP fallbacks run
+without these shared libraries and produce no pending examples.
+
+| Environment opt-in | RSpec metadata | Loader prerequisite / coverage |
+| --- | --- | --- |
+| `PWN_TEST_FFTW=1` | `fftw_integration` | `libfftw3f`; native impulse FFT |
+| `PWN_TEST_VOLK=1` | `volk_integration` | `libvolk`; native conversion, accumulation, DSP dispatch |
+| `PWN_TEST_RTL_SDR=1` | `rtl_sdr_integration` | `librtlsdr`; binding resolution only, no USB scan |
+| `PWN_TEST_ADALM_PLUTO=1` | `adalm_pluto_integration` | Compatible `libiio`; library version only |
+| `PWN_TEST_SOAPY_SDR=1` | `soapy_sdr_integration` | `libSoapySDR`; library/API version only |
+| `PWN_TEST_HACK_RF=1` | `hack_rf_integration` | `libhackrf`; library version only |
+
+For example:
+
+```bash
+PWN_TEST_FFTW=1 bundle exec rspec spec/lib/pwn/ffi/fftw_spec.rb
+PWN_TEST_VOLK=1 bundle exec rspec spec/lib/pwn/ffi/volk_spec.rb spec/lib/pwn/sdr/decoder/dsp_spec.rb
+PWN_TEST_ADALM_PLUTO=1 bundle exec rspec spec/lib/pwn/ffi/adalm_pluto_spec.rb
+PWN_TEST_LIQUID=1 bundle exec rspec spec/lib/pwn/ffi/liquid_spec.rb spec/lib/pwn/sdr/decoder/dsp_spec.rb
+```
+
+Each opt-in fails with installation guidance if its library cannot load. Native
+DSP integration tests assert real backend dispatch, not just a matching fallback.
+None of these library opt-ins opens, tunes, receives from, or transmits through a
+radio. Pluto URI discovery is mocked, including scan cleanup.
+
+Actual RTL-SDR USB enumeration has a separate `rtl_sdr_hardware` tag, enabled
+only by `PWN_TEST_RTL_SDR_HARDWARE=1`. It requires a connected RTL-SDR and USB
+permissions, and fails on an empty inventory. Do not enable it in unattended
+upgrade gates; library opt-ins do not enable hardware tests. It performs inventory
+only, not tuning or reception. The test suite installs no dependencies.
+
 ## Adding a plugin
 
 1. `lib/pwn/plugins/my_thing.rb` following the conventions above.

@@ -3,6 +3,12 @@
 require 'spec_helper'
 
 describe PWN::FFI::Volk do
+  it 'handles a missing shared library without native calls' do
+    allow(described_class).to receive(:available?).and_return(false)
+    expect { described_class.unpack_s16le(data: '') }.to raise_error(RuntimeError, /libvolk not available/)
+    expect { described_class.accumulate(samples: []) }.to raise_error(RuntimeError, /libvolk not available/)
+  end
+
   it 'should display information for authors' do
     expect(PWN::FFI::Volk).to respond_to :authors
   end
@@ -15,8 +21,8 @@ describe PWN::FFI::Volk do
     expect(PWN::FFI::Volk).to respond_to :available?
   end
 
-  it 'should unpack s16le to unit-range floats when libvolk is present' do
-    skip 'libvolk not installed' unless PWN::FFI::Volk.available?
+  it 'should unpack s16le to unit-range floats', :volk_integration do
+    expect(described_class.available?).to be(true), 'Install libvolk and make it visible to the dynamic loader (PWN_TEST_VOLK=1).'
 
     raw = [0, 16_384, -16_384, 32_767].pack('s<*')
     out = PWN::FFI::Volk.unpack_s16le(data: raw)
@@ -27,8 +33,8 @@ describe PWN::FFI::Volk do
     expect(out[3]).to be_within(1e-3).of(1.0)
   end
 
-  it 'should accumulate floats when libvolk is present' do
-    skip 'libvolk not installed' unless PWN::FFI::Volk.available?
+  it 'should accumulate floats', :volk_integration do
+    expect(described_class.available?).to be(true), 'Install libvolk and make it visible to the dynamic loader (PWN_TEST_VOLK=1).'
 
     sum = PWN::FFI::Volk.accumulate(samples: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
     expect(sum).to be_within(1e-4).of(36.0)
