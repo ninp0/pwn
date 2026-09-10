@@ -13,6 +13,7 @@ toolsets; the JSON-Schema for each tool is what the model actually sees.
 | `http` | `http_proxy_start` · `http_proxy_stop` · `http_proxy_entries` · `http_proxy_rules` · `http_replay` | `PWN::Plugins::MitmProxy`: native HTTP HAR capture/replay; opaque CONNECT tunnels |
 | `terminal` | `shell` | `Open3.capture3` on the host, after `PWN::AI::Agent::ToolGuard` |
 | `pwn` | `pwn_eval` | `TOPLEVEL_BINDING.eval` in the live REPL process, after `ToolGuard` |
+| `mcp` | `mcp` | `PWN::AI::MCP` session broker → any `PWN::AI::MCP::*` stdio client |
 | `memory` | `memory_remember` · `memory_recall` · `memory_forget` · `memory_clear` · **`memory_lean`** | `PWN::Memory` → `~/.pwn/memory.json` |
 | `skills` | `skills_consolidate` · **`skills_recall`** · `skill_list` · `skill_view` · `skill_create` · `skill_add_reference` · `skill_delete` · `skill_migrate_legacy` | `~/.pwn/skills/<name>/SKILL.md` (**[agentskills.io](https://agentskills.io) spec**; legacy flat `*.md` auto-migrated) |
 | `sessions` | **`session_recall`** · `sessions_list` · `sessions_view` · `sessions_current` · `sessions_delete` · `sessions_stats` · **`sessions_lean`** | `PWN::Sessions` → `~/.pwn/sessions/` |

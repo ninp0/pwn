@@ -164,3 +164,17 @@ When you change code under `/opt/pwn`:
    filler, no internal agent backlog codes).
 
 Do not commit doc refreshes while lint or tests are still red.
+
+### Optional combo.nation MCP integration tests
+
+The default `bundle exec rake` does not launch `/opt/combo.nation/combo.nation`.
+Protocol, menu-ID, and hardware-gate coverage uses an in-process fake MCP server.
+The real stdio binary is excluded with `combo_nation_mcp` metadata unless:
+
+```bash
+PWN_TEST_COMBO_NATION_MCP=1 bundle exec rspec spec/lib/pwn/ai/mcp/combo_nation_spec.rb
+```
+
+That opt-in never passes `--mcp-allow-hardware` and never opens devices. It fails
+if the executable is missing rather than skipping pending.
+

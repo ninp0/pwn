@@ -1,0 +1,15 @@
+- name: mcp
+  description: Drive any PWN::AI::MCP::* stdio client.
+  risk_level: high
+  params:
+    type: object
+    required: [action]
+    properties:
+      action: {type: string}
+      backend: {type: string}
+      session_id: {type: string}
+      name: {type: string}
+      arguments: {type: object}
+      allow_hardware: {type: boolean}
+      command: {type: string}
+      timeout: {type: integer, minimum: 1, maximum: 10800}

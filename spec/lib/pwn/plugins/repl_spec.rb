@@ -190,7 +190,7 @@ describe PWN::Plugins::REPL do
       hits = described_class.pwn_ai_complete(target: '/sk', line: '/sk')
       expect(hits).to include('/skills')
       hits = described_class.pwn_ai_complete(target: '/', line: '/')
-      %w[/cron /skills /sessions /memory /debug /trace /back /help /model /learning].each do |cmd|
+      %w[/cron /skills /sessions /memory /debug /trace /back /help /model /learning /mcp].each do |cmd|
         expect(hits).to include(cmd)
       end
       hits = described_class.pwn_ai_complete(target: 'li', line: '/cron li')
@@ -199,6 +199,16 @@ describe PWN::Plugins::REPL do
       expect(hits).to include('list')
       hits = described_class.pwn_ai_complete(target: 'll', line: '/model list ll')
       expect(hits).to include('llms')
+      hits = described_class.pwn_ai_complete(target: '/m', line: '/m')
+      expect(hits).to include('/mcp')
+      hits = described_class.pwn_ai_complete(target: 'co', line: '/mcp co')
+      expect(hits).to include('connect')
+      hits = described_class.pwn_ai_complete(target: 'to', line: '/mcp list to')
+      expect(hits).to include('tools')
+      hits = described_class.pwn_ai_complete(target: 'com', line: '/mcp connect com')
+      expect(hits).to include('combo_nation')
+      hits = described_class.pwn_ai_complete(target: 'use', line: '/mcp us')
+      expect(hits).to include('use')
     end
 
     it 'completes host-native paths when slash is not the first character' do
@@ -272,6 +282,50 @@ describe PWN::Plugins::REPL do
       expect(ids).to eq(%w[gpt-5.5 gpt-6-astra])
     ensure
       PWN::Env[:ai][:active] = prev_active if PWN::Env.is_a?(Hash) && PWN::Env[:ai].is_a?(Hash)
+    end
+
+    it 'lists MCP backends via /mcp without Loop.run or hardware' do
+      expect(described_class.pwn_ai_dispatch_slash!(request: '/mcp backends', pry: :fixture)).to eq(true)
+      result = described_class.pwn_ai_run_mcp(args: %w[list])
+      expect(result[:backends].map { |row| row[:name] }).to include('combo_nation')
+      call = described_class.send(:pwn_ai_mcp_call_args, tokens: %w[msg=hi option=5.10])
+      expect(call[:arguments]).to include('msg' => 'hi', 'option' => '5.10')
+      expect(call[:option]).to be_nil
+    end
+
+    it 'routes /mcp use and /mcp <backend> call to a non-ComboNation client' do
+      probe = Module.new do
+        def self.connect(opts = {})
+          { connected: true, allow_hardware: opts[:allow_hardware] }
+        end
+
+        def self.disconnect(opts = {})
+          opts[:session]
+          { disconnected: true }
+        end
+
+        def self.list_tools(opts = {})
+          opts[:session]
+          [{ 'name' => 'echo' }]
+        end
+
+        def self.call_tool(opts = {})
+          { parsed: { 'name' => opts[:name], 'arguments' => opts[:arguments] }, is_error: false }
+        end
+      end
+      probe.const_set(:TOOLS, %w[echo])
+      PWN::AI::MCP.const_set(:Probe, probe)
+      PWN::AI::MCP.reset!
+      expect(described_class.pwn_ai_run_mcp(args: %w[use probe])).to include(backend: 'probe')
+      hits = described_class.pwn_ai_complete(target: 'e', line: '/mcp call e')
+      expect(hits).to include('echo')
+      expect(hits).not_to include('menu_catalog')
+      result = described_class.pwn_ai_run_mcp(args: %w[probe call echo msg=hi])
+      expect(result[:backend]).to eq('probe')
+      expect(result[:parsed]).to include('name' => 'echo', 'arguments' => { 'msg' => 'hi' })
+    ensure
+      PWN::AI::MCP.send(:remove_const, :Probe) if PWN::AI::MCP.const_defined?(:Probe, false)
+      PWN::AI::MCP.reset!
     end
   end
 end

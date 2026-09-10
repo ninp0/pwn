@@ -27,6 +27,7 @@ RSpec.configure do |config|
     config.filter_run_excluding :"#{backend}_integration" unless ENV["PWN_TEST_#{backend.upcase}"] == '1'
   end
   config.filter_run_excluding :rtl_sdr_hardware unless ENV['PWN_TEST_RTL_SDR_HARDWARE'] == '1'
+  config.filter_run_excluding :combo_nation_mcp unless ENV['PWN_TEST_COMBO_NATION_MCP'] == '1'
 
   next if ENV['PWN_SPEC_VERBOSE']
 

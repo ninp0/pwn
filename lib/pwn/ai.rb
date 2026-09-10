@@ -12,6 +12,7 @@ module PWN
     autoload :Gemini, 'pwn/ai/gemini'
     autoload :Grok, 'pwn/ai/grok'
     autoload :HttpRetry, 'pwn/ai/http_retry'
+    autoload :MCP, 'pwn/ai/mcp'
     autoload :Ollama, 'pwn/ai/ollama'
     autoload :OpenAI, 'pwn/ai/open_ai'
     autoload :OpenWebUI, 'pwn/ai/open_web_ui'
