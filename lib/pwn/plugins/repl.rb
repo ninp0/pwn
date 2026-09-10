@@ -7,6 +7,7 @@ require 'tty-cursor'
 require 'tty-prompt'
 require 'unicode/display_width'
 require 'yaml'
+require 'json'
 
 module PWN
   module Plugins
@@ -1560,7 +1561,7 @@ module PWN
       end
 
       PWN_AI_SLASH_COMMANDS = %w[
-        /back /cron /debug /delegate /help /learning /memory /model /sessions /skills /trace
+        /back /cron /debug /delegate /help /learning /memory /mcp /model /sessions /skills /trace
       ].freeze
 
       PWN_AI_SLASH_SUBCOMMANDS = {
@@ -1570,6 +1571,7 @@ module PWN
         '/delegate' => [],
         '/help' => [],
         '/memory' => %w[list recall remember forget clear],
+        '/mcp' => %w[list backends use current connect disconnect ping tools call status help],
         '/model' => %w[list],
         '/sessions' => %w[list resume delete stats],
         '/skills' => %w[list recall],
@@ -1636,6 +1638,37 @@ module PWN
             current = pwn_ai_engine_model(engine: tokens[1]).to_s
             hits = [current].reject(&:empty?).select { |s| sub_prefix.empty? || s.start_with?(sub_prefix) }
             return hits unless hits.empty?
+          end
+        end
+        if cmd == '/mcp'
+          backends = begin
+            PWN::AI::MCP.backends.map { |row| row[:name].to_s }
+          rescue StandardError
+            []
+          end
+          if tokens.length == 2
+            pool = (Array(PWN_AI_SLASH_SUBCOMMANDS['/mcp']) + backends).uniq
+            return pool.select { |s| sub_prefix.empty? || s.start_with?(sub_prefix) }
+          end
+          return %w[tools].select { |s| sub_prefix.empty? || s.start_with?(sub_prefix) } if tokens.length == 3 && tokens[1] == 'list'
+
+          named = backends.include?(tokens[1])
+          action = named ? tokens[2] : tokens[1]
+          return Array(PWN_AI_SLASH_SUBCOMMANDS['/mcp']).select { |s| sub_prefix.empty? || s.start_with?(sub_prefix) } if named && tokens.length == 3
+          return backends.select { |s| sub_prefix.empty? || s.start_with?(sub_prefix) } if tokens.length >= 3 && %w[use connect disconnect ping tools status].include?(tokens[1])
+
+          if action == 'call' && ((named && tokens.length == 4) || (!named && tokens.length == 3))
+            selected = named ? tokens[1] : PWN::AI::MCP.current.to_s
+            tools = if selected.empty?
+                      backends.flat_map do |name|
+                        row = PWN::AI::MCP.backends.find { |backend| backend[:name] == name }
+                        Array(row && row[:tools])
+                      end
+                    else
+                      row = PWN::AI::MCP.backends.find { |backend| backend[:name] == selected }
+                      Array(row && row[:tools])
+                    end
+            return tools.uniq.map(&:to_s).select { |s| sub_prefix.empty? || s.start_with?(sub_prefix) }
           end
         end
         subs = Array(PWN_AI_SLASH_SUBCOMMANDS[cmd])
@@ -1875,6 +1908,8 @@ module PWN
           puts '    Use agent_list / agent_debate from pwn-ai, or pwn-ai-delegate in the pwn REPL.'
         when '/model'
           pwn_ai_run_model(args: args)
+        when '/mcp'
+          pwn_ai_run_mcp(args: args)
         when '/learning'
           pwn_ai_run_learning(args: args)
         end
@@ -2143,6 +2178,105 @@ module PWN
         end
       end
 
+      # Run pwn-ai /mcp locally without sending the line through Loop.run.
+
+      public_class_method def self.pwn_ai_run_mcp(opts = {})
+        args = Array(opts[:args]).map(&:to_s)
+        backends = begin
+          PWN::AI::MCP.backends.map { |row| row[:name].to_s }
+        rescue StandardError
+          []
+        end
+        backend = nil
+        if backends.include?(args[0].to_s)
+          backend = args[0]
+          args = args[1..]
+        end
+        sub = args[0].to_s
+        rest = args[1..]
+        sub = 'use' if backend && sub.empty?
+        if sub.empty? || sub == 'help'
+          puts 'pwn-ai /mcp — local MCP session broker for every PWN::AI::MCP::* client'
+          puts '  usage: /mcp [list|backends|use|current|connect|disconnect|ping|tools|call|status|help]'
+          puts '         /mcp <backend> [connect|disconnect|ping|tools|call|status]'
+          puts '         /mcp use <backend>'
+          puts '         /mcp call <tool> [key=value|{"k":"v"}]'
+          result = PWN::AI::MCP.invoke(action: 'backends')
+          current = PWN::AI::MCP.current
+          Array(result[:backends]).each do |row|
+            mark = row[:name] == current ? '*' : ' '
+            puts "  #{mark} #{row[:name]}  #{row[:constant]}"
+          end
+          return result.merge(current: current)
+        end
+
+        hardware = rest.intersect?(%w[hardware --hardware --mcp-allow-hardware])
+        rest = rest.reject { |tok| %w[hardware --hardware --mcp-allow-hardware].include?(tok) }
+        payload =
+          case sub
+          when 'list'
+            rest[0].to_s == 'tools' ? { action: 'list_tools', backend: rest[1] || backend } : { action: 'backends' }
+          when 'backends'
+            { action: 'backends' }
+          when 'use'
+            { action: 'use', backend: rest[0] || backend }
+          when 'current'
+            { action: 'current' }
+          when 'connect'
+            { action: 'connect', backend: rest[0] || backend, allow_hardware: hardware }
+          when 'disconnect', 'close'
+            { action: 'disconnect', backend: rest[0] || backend }
+          when 'ping'
+            { action: 'ping', backend: rest[0] || backend }
+          when 'tools'
+            { action: 'list_tools', backend: rest[0] || backend }
+          when 'status'
+            { action: 'status', backend: rest[0] || backend }
+          when 'call'
+            name = rest[0].to_s
+            raise ArgumentError, 'usage: /mcp call <tool> [key=value]' if name.empty?
+
+            { action: 'call_tool', backend: backend, name: name }.merge(pwn_ai_mcp_call_args(tokens: rest[1..]))
+          else
+            raise ArgumentError, "unknown /mcp #{sub.inspect}"
+          end
+        payload[:backend] = payload[:backend].to_s
+        payload.delete(:backend) if payload[:backend].empty?
+        result = PWN::AI::MCP.invoke(payload)
+        puts result.inspect
+        result
+      end
+
+      private_class_method def self.pwn_ai_mcp_call_args(opts = {})
+        tokens = Array(opts[:tokens]).map(&:to_s)
+        joined = tokens.join(' ').strip
+        if joined.start_with?('{')
+          parsed = JSON.parse(joined)
+          raise ArgumentError, 'JSON call args must be an object' unless parsed.is_a?(Hash)
+
+          return { arguments: parsed }
+        end
+
+        arguments = {}
+        tokens.each do |tok|
+          next unless tok.include?('=')
+
+          key, value = tok.split('=', 2)
+          arguments[key] = pwn_ai_mcp_coerce(value: value)
+        end
+        arguments.empty? ? {} : { arguments: arguments }
+      end
+
+      private_class_method def self.pwn_ai_mcp_coerce(opts = {})
+        value = opts[:value].to_s
+        return value if value.match?(/\A\d+\.\d+\z/)
+        return true if value == 'true'
+        return false if value == 'false'
+        return Integer(value) if value.match?(/\A-?\d+\z/)
+
+        value
+      end
+
       # Supported Method Parameters::
       # PWN::Plugins::REPL.enable_autocomplete(
       #   enabled: 'optional - Boolean (default true). false reverts to single-line cycling.'
@@ -2376,6 +2510,11 @@ module PWN
           # Run pwn ai run skills and return its result
           #{self}.pwn_ai_run_skills(
             args: 'optional - Array args value consumed by #pwn_ai_run_skills'
+          )
+
+          # Run pwn-ai /mcp locally without Loop.run
+          #{self}.pwn_ai_run_mcp(
+            args: 'optional - slash tokens after /mcp such as list tools or call menu_catalog'
           )
 
           # IRB-style suggest-as-you-type for the pwn REPL
