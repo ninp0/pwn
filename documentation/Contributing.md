@@ -30,6 +30,36 @@ rake            # rubocop + rspec - must be zero offenses
 
 (`rvmsudo rake` on multi-user RVM installs.)
 
+### Optional native decoder integration tests
+
+The default `bundle exec rake` does not require `proxmark3` or `rtl_433`.
+Ruby EM4100/Acurite decoding, native input validation, missing-executable errors,
+and cancellation-before-spawn tests always run. Only real native file replays
+are excluded with RSpec metadata (`proxmark3_integration`, `rtl433_integration`),
+not marked pending or silently passed inside examples.
+
+After installing the optional clients, explicitly enable their fixture tests:
+
+```bash
+PWN_TEST_PROXMARK3=1 bundle exec rspec spec/lib/pwn/sdr/decoder/rfid_spec.rb
+PWN_TEST_RTL433=1 bundle exec rspec spec/lib/pwn/sdr/decoder/rtl433_spec.rb
+# Enable both in the full gate:
+PWN_TEST_PROXMARK3=1 PWN_TEST_RTL433=1 bundle exec rake
+```
+
+These tests use committed offline amplitude/IQ captures, not RF hardware.
+Opt-in runs fail if their client is unavailable or cannot decode the reference;
+installed versions can differ in supported protocols and output. Fixture provenance
+and tested versions are recorded in `spec/fixtures/sdr/rfid/README.md` and
+`spec/fixtures/sdr/rtl433/README.md`. Neither client is installed by the test suite.
+
+At runtime, `RFID.decode(mode: :fdxb_pm3, ...)` and
+`RTL433.decode(mode: :native, ...)` raise an actionable `IOError` when their
+executable is missing, suggesting installation or an explicit `executable:` path.
+An already-true `stop:` callback raises cancellation before spawning either client.
+Invalid inputs still raise `ArgumentError`; native decoding never silently falls
+back to another decoder or a detector.
+
 ## Adding a plugin
 
 1. `lib/pwn/plugins/my_thing.rb` following the conventions above.

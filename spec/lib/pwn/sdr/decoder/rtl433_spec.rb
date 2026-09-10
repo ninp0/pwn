@@ -3,6 +3,27 @@
 require 'spec_helper'
 
 describe PWN::SDR::Decoder::RTL433 do
+  it 'reports an actionable missing native executable without emitting frames' do
+    Dir.mktmpdir('pwn-missing-backend-') do |dir|
+      executable = File.join(dir, 'rtl_433')
+      frames = []
+      output = StringIO.new
+      expect do
+        described_class.decode(mode: :native, file: 'spec/fixtures/sdr/rtl433/toyota.cu8',
+                               executable: executable, output: output, on_frame: ->(frame) { frames << frame })
+      end.to raise_error(IOError, /rtl_433.*not found.*install.*executable:/i)
+      expect(frames).to be_empty
+      expect(output.string).to be_empty
+    end
+  end
+
+  it 'cancels an already stopped native replay before spawning' do
+    expect(Open3).not_to receive(:popen3)
+    expect do
+      described_class.decode(mode: :native, file: 'spec/fixtures/sdr/rtl433/toyota.cu8', stop: -> { true })
+    end.to raise_error(IOError, /cancelled/)
+  end
+
   it 'decodes six real over-air Acurite packets with payloads matching the upstream reference' do
     demod = described_class::AcuriteIQ.new(rate: 250_000)
     frames = []
@@ -30,7 +51,7 @@ describe PWN::SDR::Decoder::RTL433 do
     expect { described_class.decode(mode: :all) }.to raise_error(ArgumentError, /mode/)
   end
 
-  it 'replays OOK and FSK native catalogue decoders against published captures' do
+  it 'replays OOK and FSK native catalogue decoders against published captures', :rtl433_integration do
     %w[acurite_th_609_001 wh31 toyota].each do |name|
       frames = []
       result = described_class.decode(mode: :native, file: "spec/fixtures/sdr/rtl433/#{name}.cu8",
@@ -44,7 +65,7 @@ describe PWN::SDR::Decoder::RTL433 do
     end
   end
 
-  it 'requires explicit native files, validates formats and supports native protocol selection' do
+  it 'requires explicit native files and validates formats and protocol selection without the native client' do
     allow(PWN::SDR::Decoder::Base).to receive(:run_iq).and_raise('unexpected automatic RF')
     expect { described_class.decode(mode: :native) }.to raise_error(ArgumentError, /explicit file/)
     path = 'spec/fixtures/sdr/rtl433/toyota.cu8'
@@ -52,6 +73,10 @@ describe PWN::SDR::Decoder::RTL433 do
     expect { described_class.decode(mode: :native, file: path, source: :rtl_sdr) }.to raise_error(ArgumentError, /live source/)
     expect { described_class.decode(mode: :native, file: path, protocols: [0]) }.to raise_error(ArgumentError, /protocol/)
     expect { described_class.decode(mode: :native, file: path, stop: -> { true }) }.to raise_error(IOError, /cancelled/)
+  end
+
+  it 'supports native protocol selection', :rtl433_integration do
+    path = 'spec/fixtures/sdr/rtl433/toyota.cu8'
     expect(described_class.decode(mode: :native, file: path, protocols: [11], output: StringIO.new)[:frames]).to eq(0)
     expect(described_class.decode(mode: :native, file: path, protocols: [88], output: StringIO.new)[:frames]).to eq(1)
   end

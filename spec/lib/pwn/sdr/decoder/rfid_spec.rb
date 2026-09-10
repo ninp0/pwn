@@ -3,7 +3,28 @@
 require 'spec_helper'
 
 describe PWN::SDR::Decoder::RFID do
-  it 'decodes independent ISO11784/11785 FDX-B amplitude captures with the native offline client' do
+  it 'reports an actionable missing native executable without emitting frames' do
+    Dir.mktmpdir('pwn-missing-backend-') do |dir|
+      executable = File.join(dir, 'proxmark3')
+      frames = []
+      output = StringIO.new
+      expect do
+        described_class.decode(mode: :fdxb_pm3, file: 'spec/fixtures/sdr/rfid/fdxb_animal.pm3',
+                               executable: executable, output: output, on_frame: ->(frame) { frames << frame })
+      end.to raise_error(IOError, /proxmark3.*not found.*install.*executable:/i)
+      expect(frames).to be_empty
+      expect(output.string).to be_empty
+    end
+  end
+
+  it 'cancels an already stopped native replay before spawning' do
+    expect(Process).not_to receive(:spawn)
+    expect do
+      described_class.decode(mode: :fdxb_pm3, file: 'spec/fixtures/sdr/rfid/fdxb_animal.pm3', stop: -> { true })
+    end.to raise_error(IOError, /cancelled/)
+  end
+
+  it 'decodes independent ISO11784/11785 FDX-B amplitude captures with the native offline client', :proxmark3_integration do
     %w[animal extended].each do |variant|
       frames = []
       result = described_class.decode(mode: :fdxb_pm3, file: "spec/fixtures/sdr/rfid/fdxb_#{variant}.pm3",
@@ -17,12 +38,16 @@ describe PWN::SDR::Decoder::RFID do
     end
   end
 
-  it 'rejects automatic RF and emits no identity for an incomplete native amplitude trace' do
+  it 'rejects automatic RF and supports cancellation without the native client' do
     allow(PWN::SDR::Decoder::Base).to receive(:run_iq).and_raise('unexpected automatic RF')
     expect { described_class.decode(mode: :fdxb_pm3) }.to raise_error(ArgumentError, /explicit/)
     path = 'spec/fixtures/sdr/rfid/fdxb_animal.pm3'
     expect { described_class.decode(mode: :fdxb_pm3, file: path, source: :rtl_sdr) }.to raise_error(ArgumentError, /live/)
     expect { described_class.decode(mode: :fdxb_pm3, file: path, stop: -> { true }) }.to raise_error(IOError, /cancelled/)
+  end
+
+  it 'emits no identity for an incomplete native amplitude trace', :proxmark3_integration do
+    path = 'spec/fixtures/sdr/rfid/fdxb_animal.pm3'
     Tempfile.create(['fdxb-short-', '.pm3']) do |file|
       file.write(File.readlines(path).first(100).join)
       file.flush
