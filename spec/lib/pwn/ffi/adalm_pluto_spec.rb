@@ -3,6 +3,12 @@
 require 'spec_helper'
 
 describe PWN::FFI::AdalmPluto do
+  it 'handles a missing shared library without native calls' do
+    allow(described_class).to receive(:available?).and_return(false)
+    expect(described_class.info).to include(available: false)
+    expect(described_class.list_uris).to eq([])
+  end
+
   it 'waits for a cancelled refill to return before destroying its buffer' do
     handle = { buffer: FFI::MemoryPointer.new(:char, 4) }
     entered = Queue.new
@@ -62,8 +68,8 @@ describe PWN::FFI::AdalmPluto do
     expect(PWN::FFI::AdalmPluto).to respond_to :available?
   end
 
-  it 'should report library info when libiio is present' do
-    skip 'libiio not installed' unless PWN::FFI::AdalmPluto.available?
+  it 'should report library info', :adalm_pluto_integration do
+    expect(described_class.available?).to be(true), 'Install compatible libiio and make it visible to the dynamic loader (PWN_TEST_ADALM_PLUTO=1).'
 
     info = PWN::FFI::AdalmPluto.info
     expect(info[:available]).to eq(true)
@@ -71,15 +77,23 @@ describe PWN::FFI::AdalmPluto do
     expect(info[:minor]).to be_a(Integer)
   end
 
-  it 'should list URIs (possibly empty) when libiio is present' do
-    skip 'libiio not installed' unless PWN::FFI::AdalmPluto.available?
-
-    # Restrict to usb,local so libiio does not attempt mDNS/DNS-SD (avahi)
-    # discovery during the test suite — avoids the noisy
-    #   "ERROR: Unable to create Avahi DNS-SD client :Daemon not running"
-    # C-level stderr write on hosts where avahi-daemon is not running.
-    list = PWN::FFI::AdalmPluto.list_uris(backends: 'usb,local')
-    expect(list).to be_a(Array)
+  it 'maps URIs and releases the mocked scan without hardware discovery' do
+    allow(described_class).to receive(:available?).and_return(true)
+    scan = FFI::MemoryPointer.new(:char)
+    entry = FFI::MemoryPointer.new(:char)
+    entries = FFI::MemoryPointer.new(:pointer)
+    entries.write_pointer(entry)
+    expect(described_class).to receive(:iio_create_scan_context).with('usb,local', 0).and_return(scan)
+    expect(described_class).to receive(:iio_scan_context_get_info_list) do |context, output|
+      expect(context).to eq(scan)
+      output.write_pointer(entries)
+      1
+    end
+    allow(described_class).to receive(:iio_context_info_get_uri).with(entry).and_return('usb:mock')
+    allow(described_class).to receive(:iio_context_info_get_description).with(entry).and_return('Mock Pluto')
+    expect(described_class).to receive(:iio_context_info_list_free).with(entries)
+    expect(described_class).to receive(:iio_scan_context_destroy).with(scan)
+    expect(described_class.list_uris(backends: 'usb,local')).to eq([{ uri: 'usb:mock', description: 'Mock Pluto' }])
   end
 
   it 'should appear in PWN::FFI.backends' do

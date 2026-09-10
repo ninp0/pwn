@@ -101,15 +101,57 @@ RSpec.describe 'PWN::AI::Agent::Verification' do
     expect(report[:status]).to eq(:fail)
   end
 
-  it 'executes opt-in test commands with bounded duration and treats timeouts as unknown' do
-    opts = { request: 'Run tests', requirements: ['Run tests'], root: @root, allow_commands: true, timeout: 0.2 }
-    check = { requirement: 'Run tests', kind: :command, argv: [RbConfig.ruby, '-e', 'puts "verified"'], expected: "verified\n" }
-    expect(PWN::AI::Agent::Verification.run(opts.merge(checks: [check]))[:status]).to eq(:pass)
-    check[:argv] = [RbConfig.ruby, '-e', 'exit 1']
-    expect(PWN::AI::Agent::Verification.run(opts.merge(checks: [check]))[:status]).to eq(:fail)
-    check[:argv] = [RbConfig.ruby, '-e', 'sleep 10']
-    expect(PWN::AI::Agent::Verification.run(opts.merge(checks: [check]))[:status]).to eq(:unknown)
-    expect(PWN::AI::Agent::Verification.run(opts.merge(allow_commands: false, checks: [check]))[:status]).to eq(:unknown)
+  it 'executes opt-in test commands with a bounded budget that allows interpreter startup' do
+    report = PWN::AI::Agent::Verification.run(
+      request: 'Run tests', requirements: ['Run tests'], root: @root, allow_commands: true, timeout: 10,
+      checks: [{ requirement: 'Run tests', kind: :command, argv: [RbConfig.ruby, '-e', 'puts "verified"'], expected: "verified\n" }]
+    )
+    expect(report[:status]).to eq(:pass)
+    expect(report[:checks].first).to include(passed: true, exit_code: 0, evidence: Digest::SHA256.hexdigest("verified\n"))
+  end
+
+  it 'allows simulated slow interpreter startup within the successful command budget' do
+    # Loading a startup file before -e models a slower host without mocking the runner.
+    startup = File.join(@root, 'startup.rb')
+    File.write(startup, 'sleep 0.3')
+    report = PWN::AI::Agent::Verification.run(
+      request: 'Run tests', requirements: ['Run tests'], root: @root, allow_commands: true, timeout: 10,
+      checks: [{ requirement: 'Run tests', kind: :command, argv: [RbConfig.ruby, '-r', startup, '-e', 'puts "verified"'], expected: "verified\n" }]
+    )
+    expect(report[:status]).to eq(:pass)
+    expect(report[:checks].first).to include(passed: true, exit_code: 0, evidence: Digest::SHA256.hexdigest("verified\n"))
+  end
+
+  it 'reports an actual unsuccessful command exit as failure' do
+    report = PWN::AI::Agent::Verification.run(
+      request: 'Run tests', requirements: ['Run tests'], root: @root, allow_commands: true, timeout: 10,
+      checks: [{ requirement: 'Run tests', kind: :command, argv: [RbConfig.ruby, '-e', 'exit 1'] }]
+    )
+    expect(report[:status]).to eq(:fail)
+    expect(report[:checks].first).to include(passed: false, exit_code: 1)
+  end
+
+  it 'bounds an unfinished command and reports a timeout as unknown, not failure or success' do
+    # This command cannot finish within the deadline, regardless of startup speed.
+    report = Timeout.timeout(5) do
+      PWN::AI::Agent::Verification.run(
+        request: 'Run tests', requirements: ['Run tests'], root: @root, allow_commands: true, timeout: 0.2,
+        checks: [{ requirement: 'Run tests', kind: :command, argv: [RbConfig.ruby, '-e', 'sleep 60'] }]
+      )
+    end
+    expect(report[:status]).to eq(:unknown)
+    expect(report[:checks].first).to include(passed: nil, evidence: 'unavailable', error: 'Timeout::Error')
+    expect(report[:checks].first).not_to have_key(:exit_code)
+  end
+
+  it 'does not spawn test commands without explicit opt-in' do
+    expect(Open3).not_to receive(:popen3)
+    report = PWN::AI::Agent::Verification.run(
+      request: 'Run tests', requirements: ['Run tests'], root: @root, allow_commands: false,
+      checks: [{ requirement: 'Run tests', kind: :command, argv: [RbConfig.ruby, '-e', 'puts "verified"'] }]
+    )
+    expect(report[:status]).to eq(:unknown)
+    expect(report[:checks].first).to include(passed: nil, error: 'ArgumentError')
   end
 
   it 'attributes a checked artifact only to its last observed writer rather than a later noop' do

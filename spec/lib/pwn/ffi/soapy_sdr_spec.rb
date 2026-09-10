@@ -3,6 +3,12 @@
 require 'spec_helper'
 
 describe PWN::FFI::SoapySDR do
+  it 'handles a missing shared library without native calls' do
+    allow(described_class).to receive(:available?).and_return(false)
+    expect(described_class.info).to include(available: false)
+    expect { described_class.make(args: 'driver=mock') }.to raise_error(RuntimeError, /libSoapySDR not available/)
+  end
+
   it 'reports close failure and retains the stream for cleanup retry' do
     handle = { device: :device, stream: :stream }
     allow(described_class).to receive(:SoapySDRDevice_deactivateStream).and_return(0)
@@ -39,8 +45,8 @@ describe PWN::FFI::SoapySDR do
     expect(PWN::FFI::SoapySDR).to respond_to :available?
   end
 
-  it 'should report API info when libSoapySDR is present' do
-    skip 'libSoapySDR not installed' unless PWN::FFI::SoapySDR.available?
+  it 'should report API info', :soapy_sdr_integration do
+    expect(described_class.available?).to be(true), 'Install libSoapySDR and make it visible to the dynamic loader (PWN_TEST_SOAPY_SDR=1).'
 
     info = PWN::FFI::SoapySDR.info
     expect(info[:available]).to eq(true)

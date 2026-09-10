@@ -21,6 +21,12 @@ RSpec.configure do |config|
   config.filter_run_excluding :local_embeddings unless ENV['PWN_TEST_EMBED_ENDPOINT'] && ENV['PWN_SQLITE_VEC_EXTENSION']
   config.filter_run_excluding :proxmark3_integration unless ENV['PWN_TEST_PROXMARK3'] == '1'
   config.filter_run_excluding :rtl433_integration unless ENV['PWN_TEST_RTL433'] == '1'
+  config.filter_run_excluding :liquid_integration unless ENV['PWN_TEST_LIQUID'] == '1'
+  config.filter_run_excluding :radare2_integration unless ENV['PWN_TEST_RADARE2'] == '1'
+  %w[fftw volk rtl_sdr adalm_pluto soapy_sdr hack_rf].each do |backend|
+    config.filter_run_excluding :"#{backend}_integration" unless ENV["PWN_TEST_#{backend.upcase}"] == '1'
+  end
+  config.filter_run_excluding :rtl_sdr_hardware unless ENV['PWN_TEST_RTL_SDR_HARDWARE'] == '1'
 
   next if ENV['PWN_SPEC_VERBOSE']
 

@@ -3,6 +3,12 @@
 require 'spec_helper'
 
 describe PWN::FFI::HackRF do
+  it 'handles a missing shared library without native calls' do
+    allow(described_class).to receive(:available?).and_return(false)
+    expect(described_class.info).to include(available: false)
+    expect { described_class.open }.to raise_error(RuntimeError, /libhackrf not available/)
+  end
+
   it 'releases the GVL while native stop waits for callbacks' do
     source = File.read(File.expand_path('../../../../lib/pwn/ffi/hack_rf.rb', __dir__))
     expect(source).to match(/attach_function :hackrf_stop_rx, \[:pointer\], :int, blocking: true/)
@@ -51,8 +57,8 @@ describe PWN::FFI::HackRF do
     expect(PWN::FFI::HackRF).to respond_to :available?
   end
 
-  it 'should report library info when libhackrf is present' do
-    skip 'libhackrf not installed' unless PWN::FFI::HackRF.available?
+  it 'should report library info', :hack_rf_integration do
+    expect(described_class.available?).to be(true), 'Install libhackrf and make it visible to the dynamic loader (PWN_TEST_HACK_RF=1).'
 
     info = PWN::FFI::HackRF.info
     expect(info[:available]).to eq(true)
